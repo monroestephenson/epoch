@@ -69,6 +69,8 @@ The planner reuses a query result only when its complete declared dependencies r
 
 Flyway's PostgreSQL transactional lock is disabled to avoid holding the snapshot that can block `CREATE INDEX CONCURRENTLY`. Put `executeInTransaction=false` in that migration's `.sql.conf` file. Per-migration and global deadlines default to 120 and 1800 seconds. A database disconnection, migration SQL/validation failure, or deadline expiry throws a runtime failure and exits 3 with the stage/migration; it does not produce a completed `UNKNOWN` report.
 
+`RuntimeCliPostgresTest` exercises actual PostgreSQL container termination during a pending migration and malformed SQL (`42601`) through the CLI. Both retain `MIGRATION_EXECUTION_FAILED` and the migration filename and return exit 3. `VerificationOperationsTest` separately verifies concurrent index completion and timeout cancellation. These are execution diagnostics, not compatibility findings or evidence that an old contract is broken.
+
 The optional baseline cache explains `MISS`, `HIT`, and `REBUILT` through `baseline.cacheReason`. Its schema digest uses logical live-column order, so PostgreSQL restore's removal of historical dropped-column slots does not repeatedly invalidate equivalent dumps.
 
 See [rollout and rollback workflows](feedback-round2.md#rollout-and-rollback-workflows) for `--new-contract` and `verify-release`. Reverse verification uses a retained copy of the old schema; it does not execute down migrations.
