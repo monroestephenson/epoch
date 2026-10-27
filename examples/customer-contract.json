@@ -1,0 +1,146 @@
+{
+  "schemaVersion": 1,
+  "applicationVersion": "example-1.0",
+  "dialect": "PostgreSQL",
+  "scope": "STRUCTURAL_CONTRACT",
+  "entities": [],
+  "queries": [
+    {
+      "tables": [
+        "public.customers"
+      ],
+      "source": "STATIC",
+      "verificationStatus": "EXTRACTED",
+      "dependenciesComplete": true,
+      "explicitColumnList": true,
+      "id": "Customer.find",
+      "operation": "SELECT",
+      "sql": "select id, email from customers where id = ?",
+      "columns": [
+        {
+          "table": "public.customers",
+          "column": "id"
+        },
+        {
+          "table": "public.customers",
+          "column": "email"
+        }
+      ],
+      "parameterTypes": [
+        "bigint"
+      ],
+      "resultColumns": [
+        {
+          "name": "id",
+          "typeName": "bigint"
+        },
+        {
+          "name": "email",
+          "typeName": "text"
+        }
+      ]
+    },
+    {
+      "tables": [
+        "public.customers"
+      ],
+      "source": "STATIC",
+      "verificationStatus": "EXTRACTED",
+      "dependenciesComplete": true,
+      "explicitColumnList": true,
+      "id": "Customer.insert",
+      "operation": "INSERT",
+      "sql": "insert into customers (id, email) values (?, ?)",
+      "columns": [
+        {
+          "table": "public.customers",
+          "column": "id"
+        },
+        {
+          "table": "public.customers",
+          "column": "email"
+        }
+      ],
+      "writeColumns": [
+        {
+          "table": "public.customers",
+          "column": "id"
+        },
+        {
+          "table": "public.customers",
+          "column": "email"
+        }
+      ],
+      "parameterTypes": [
+        "bigint",
+        "text"
+      ],
+      "targetTable": "public.customers"
+    },
+    {
+      "tables": [
+        "public.customers"
+      ],
+      "source": "STATIC",
+      "verificationStatus": "EXTRACTED",
+      "dependenciesComplete": true,
+      "explicitColumnList": true,
+      "id": "Customer.update",
+      "operation": "UPDATE",
+      "sql": "update customers set email = ? where id = ?",
+      "columns": [
+        {
+          "table": "public.customers",
+          "column": "id"
+        },
+        {
+          "table": "public.customers",
+          "column": "email"
+        }
+      ],
+      "writeColumns": [
+        {
+          "table": "public.customers",
+          "column": "email"
+        }
+      ],
+      "parameterTypes": [
+        "text",
+        "bigint"
+      ],
+      "targetTable": "public.customers"
+    },
+    {
+      "tables": [
+        "public.customers"
+      ],
+      "source": "STATIC",
+      "verificationStatus": "EXTRACTED",
+      "dependenciesComplete": true,
+      "explicitColumnList": true,
+      "id": "Customer.delete",
+      "operation": "DELETE",
+      "sql": "delete from customers where id = ?",
+      "columns": [
+        {
+          "table": "public.customers",
+          "column": "id"
+        }
+      ],
+      "parameterTypes": [
+        "bigint"
+      ],
+      "targetTable": "public.customers"
+    }
+  ],
+  "coverage": {
+    "complete": true,
+    "mechanisms": [
+      "Explicit finite SQL contract"
+    ],
+    "notes": [
+      "Only these four SQL templates are in scope. This is not whole-application behavioral verification."
+    ]
+  },
+  "unresolvedQueries": []
+}

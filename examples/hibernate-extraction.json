@@ -1,0 +1,11 @@
+{
+  "applicationVersion": "1.0.0",
+  "entityClasses": ["com.example.Customer"],
+  "classpath": ["/absolute/path/to/application.jar"],
+  "hqlQueries": {},
+  "nativeQueries": {},
+  "finiteHqlVariants": {},
+  "unresolvedDynamicQueries": {
+    "example.unsurveyedQueries": "Replace this entry only after explicitly inventorying the scoped database-access paths. Entity discovery does not prove whole-application coverage."
+  }
+}
