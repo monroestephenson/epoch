@@ -75,6 +75,6 @@ Planning uses a bounded connection pool for independent baseline checks and comm
 
 Progress snapshots carry `complete=false` until verification finishes. An interrupted checkpoint is execution evidence for completed work, not a completed compatibility verdict. Reading it through `report` exits 3, and baseline acceptance cannot be generated from it. The CLI preserves checkpoints on timeouts and termination signals; it does not certify an interrupted migration's final state.
 
-The optional baseline cache explains `MISS`, `HIT`, and `REBUILT` through `baseline.cacheReason`. Its schema digest uses logical live-column order, so PostgreSQL restore's removal of historical dropped-column slots does not repeatedly invalidate equivalent dumps.
+The optional baseline cache records `MISS`, `HIT`, and `REBUILT`; every miss or rebuild includes `baseline.cacheReason`, emitted immediately under `--verbose`. Immutable archive generations and an atomic manifest let valid warm readers restore without acquiring the writer lock. A hit still verifies archive integrity, the restored catalog, and Flyway history. Its schema digest uses logical live-column order, so PostgreSQL restore's removal of historical dropped-column slots does not repeatedly invalidate equivalent dumps.
 
 See [rollout and rollback workflows](feedback-round2.md#rollout-and-rollback-workflows) for `--new-contract` and `verify-release`. Reverse verification uses a retained copy of the old schema; it does not execute down migrations.

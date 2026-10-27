@@ -115,6 +115,9 @@ class PostgresVerifier {
                             }
                         }
                     }
+                    org.slf4j.LoggerFactory.getLogger(PostgresVerifier::class.java).info("Baseline cache {}: {}",
+                        cacheResult.status, cacheResult.reason ?: if (cacheResult.status == "HIT")
+                            "Validated immutable archive and restored baseline catalog." else "Baseline archive caching is disabled.")
                     try { configuration().locations(baselineLocation).load().validate() }
                     catch (failure: Throwable) { throw executionFailure("BASELINE_VALIDATION_FAILED", null, failure) }
                     val catalog = PostgresCatalog()

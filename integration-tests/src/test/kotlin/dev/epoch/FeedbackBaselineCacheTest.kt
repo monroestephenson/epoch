@@ -1,5 +1,7 @@
 package dev.epoch
 
+import com.fasterxml.jackson.databind.node.ObjectNode
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import dev.epoch.core.*
 import dev.epoch.postgres.PostgresVerifier
 import dev.epoch.postgres.VerificationOptions
@@ -21,6 +23,10 @@ class FeedbackBaselineCacheTest {
         val contract = PostgresCompatibilityTest.customerContract()
         val cache = directory.resolve("cache")
         val options = VerificationOptions(baselineCache = cache)
+        fun archiveFor(key: String): Path {
+            val manifest = jacksonObjectMapper().readTree(cache.resolve("$key.manifest.json").toFile())
+            return cache.resolve(manifest.path("archive").asText())
+        }
         fun writeBaseline(email: String) {
             // pg_dump/restore compacts attnum gaps. Logical visible column order must
             // produce the same catalog fingerprint after restoring real migration history.
@@ -53,6 +59,7 @@ class FeedbackBaselineCacheTest {
             pending("delete", "DELETE FROM customers; ALTER TABLE customers ADD COLUMN changed_by_pending text;"), options)
         assertHealthyExecution(first)
         assertEquals("MISS", requireNotNull(first.baseline).cacheStatus)
+        assertFalse(requireNotNull(first.baseline).cacheReason.isNullOrBlank(), "Cache misses must explain their cause")
         val firstKey = requireNotNull(first.baseline).cacheKey
         assertFalse(firstKey.isNullOrBlank())
 
@@ -74,9 +81,7 @@ class FeedbackBaselineCacheTest {
         assertNotEquals(firstKey, changedHealth.cacheKey)
         assertNotEquals(requireNotNull(first.baseline).fingerprint, changedHealth.fingerprint)
 
-        val archive = Files.walk(cache).use { paths ->
-            paths.filter { Files.isRegularFile(it) && it.fileName.toString() == "${changedHealth.cacheKey}.dump" }.findFirst().orElseThrow()
-        }
+        val archive = archiveFor(requireNotNull(changedHealth.cacheKey))
         archive.writeText("intentionally corrupted archive fixture")
         val rebuilt = PostgresVerifier().verify(contract, baseline,
             pending("rebuilt", ensureSeed("new@example.test")), options)
@@ -84,6 +89,27 @@ class FeedbackBaselineCacheTest {
         assertEquals("REBUILT", requireNotNull(rebuilt.baseline).cacheStatus)
         assertFalse(requireNotNull(rebuilt.baseline).cacheReason.isNullOrBlank(), "Cache rebuild must explain its cause")
         assertEquals(changedHealth.cacheKey, requireNotNull(rebuilt.baseline).cacheKey)
-        assertTrue(Files.size(archive) > 100)
+        assertTrue(Files.size(archiveFor(requireNotNull(changedHealth.cacheKey))) > 100,
+            "The published manifest must reference a repaired immutable archive generation")
+
+        // The archive still authenticates and restores successfully; only its claimed
+        // catalog digest is wrong. Rebuilding must reset the partially restored owned
+        // database before replaying the baseline, including its seed and Flyway history.
+        val manifestFile = cache.resolve("${changedHealth.cacheKey}.manifest.json")
+        val mapper = jacksonObjectMapper()
+        val manifest = mapper.readTree(manifestFile.toFile()) as ObjectNode
+        manifest.put("schemaSha256", "0".repeat(64))
+        mapper.writeValue(manifestFile.toFile(), manifest)
+        val catalogRebuilt = PostgresVerifier().verify(contract, baseline,
+            pending("catalog-rebuilt", ensureSeed("new@example.test")), options)
+        assertHealthyExecution(catalogRebuilt)
+        val catalogHealth = requireNotNull(catalogRebuilt.baseline)
+        assertEquals("REBUILT", catalogHealth.cacheStatus)
+        assertTrue(catalogHealth.cacheReason.orEmpty().contains("Restored catalog fingerprint differs"),
+            catalogHealth.toString())
+        assertEquals(changedHealth.cacheKey, catalogHealth.cacheKey)
+        assertEquals(changedHealth.fingerprint, catalogHealth.fingerprint)
+        assertNotEquals("0".repeat(64), mapper.readTree(manifestFile.toFile()).path("schemaSha256").asText())
+        assertTrue(Files.size(archiveFor(requireNotNull(catalogHealth.cacheKey))) > 100)
     }
 }
