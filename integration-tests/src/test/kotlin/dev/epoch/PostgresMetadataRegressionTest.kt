@@ -58,7 +58,10 @@ class PostgresMetadataRegressionTest {
             it.ruleId == "EXISTING_DATABASE_BEHAVIOR" && "user_hash" in it.evidence && it.migration == null
         }, report.toString())
         assertTrue(report.migrations.flatMap { it.findings }.none { it.ruleId == "EXISTING_DATABASE_BEHAVIOR" }, report.toString())
-        assertEquals(Verdict.SAFE, report.migrations.single().verdict, report.toString())
+        assertEquals(Verdict.UNKNOWN, report.migrations.single().verdict, report.toString())
+        assertTrue(report.migrations.single().findings.any {
+            it.ruleId == "DATABASE_BEHAVIOR_DEPENDENCY_UNPROVEN"
+        }, "New schema/behavior interactions cannot be accepted merely by suppressing baseline debt: $report")
     }
 
     @Test fun `JDBC double tinyint and OTHER UUID JSON types resolve against PostgreSQL`() {
@@ -78,7 +81,7 @@ class PostgresMetadataRegressionTest {
             "CREATE INDEX typed_id_lookup ON typed(id);",
             readContract(select("typed.find", "SELECT id FROM typed WHERE state = ?", listOf("OTHER"), listOf("id", "state"))),
         )
-        // Index semantics are conservatively UNKNOWN; SQL must still validate with the custom enum type.
+        // Parameter inference must retain the PostgreSQL enum type independently of index analysis.
         assertTrue(report.migrations.flatMap { it.findings }.none { it.ruleId == "BASELINE_SQL_UNVERIFIED" }, report.toString())
         assertTrue(report.baseline?.findings.orEmpty().none { it.ruleId == "BASELINE_SQL_UNVERIFIED" }, report.toString())
     }
@@ -101,6 +104,28 @@ class PostgresMetadataRegressionTest {
         assertEquals(Verdict.UNKNOWN, report.verdict, report.toString())
         assertTrue(report.baseline?.findings.orEmpty().any {
             it.ruleId == "BASELINE_SQL_UNVERIFIED" && "ambiguous" in it.evidence && it.migration == null
+        }, report.toString())
+    }
+
+    @Test fun `omitted native parameter declarations infer actual UUID text and enum column types`() {
+        val query = select("typed.native", "SELECT id FROM typed WHERE token = ? AND label = ? AND state = ?",
+            emptyList(), listOf("id", "token", "label", "state")).copy(source = QuerySource.NAMED_NATIVE)
+        val report = verify(
+            "CREATE TYPE public.state AS ENUM ('ready', 'done'); CREATE TABLE typed (id bigint PRIMARY KEY, token uuid, label text, state public.state);",
+            "ALTER TABLE typed ADD COLUMN metadata text;",
+            readContract(query),
+        )
+        assertEquals(Verdict.SAFE, report.verdict, report.toString())
+        assertTrue(report.baseline?.findings.orEmpty().none { it.ruleId == "BASELINE_SQL_UNVERIFIED" }, report.toString())
+    }
+
+    @Test fun `omitted parameter declaration without a SQL type context remains unknown`() {
+        val query = QueryContract("untyped.native", Operation.SELECT, "SELECT ?", source = QuerySource.NAMED_NATIVE,
+            dependenciesComplete = true)
+        val report = verify("CREATE TABLE typed (id bigint);", "ALTER TABLE typed ADD COLUMN metadata text;", readContract(query))
+        assertEquals(Verdict.UNKNOWN, report.verdict, report.toString())
+        assertTrue(report.baseline?.findings.orEmpty().any {
+            it.ruleId == "BASELINE_SQL_UNVERIFIED" && "ambiguous" in it.evidence
         }, report.toString())
     }
 }

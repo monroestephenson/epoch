@@ -10,6 +10,7 @@ data class DatabaseContract(
     val queries: List<QueryContract> = emptyList(),
     val coverage: Coverage = Coverage(),
     val unresolvedQueries: List<UnresolvedQuery> = emptyList(),
+    val accessPaths: List<AccessPathCoverage> = emptyList(),
 )
 
 enum class VerificationScope { STRUCTURAL_CONTRACT, WHOLE_APPLICATION }
@@ -33,6 +34,8 @@ data class EntityContract(
     val columns: List<ColumnContract>,
     val operations: Set<Operation> = Operation.entries.toSet(),
     val generatedIdentifier: String? = null,
+    val identifierSequence: String? = null,
+    val identifierAllocationSize: Int? = null,
 )
 
 data class ColumnContract(
@@ -42,6 +45,13 @@ data class ColumnContract(
     val insertable: Boolean = true,
     val updatable: Boolean = true,
     val generated: Boolean = false,
+    val length: Long? = null,
+    val precision: Int? = null,
+    val scale: Int? = null,
+    /** Database values produced by a supported enum mapping, not Java enum names guessed from reflection. */
+    val enumValues: List<String> = emptyList(),
+    val logicalJavaType: String? = null,
+    val inputDomainComplete: Boolean = true,
 )
 
 data class ColumnReference(val table: String, val column: String)
@@ -64,6 +74,8 @@ data class QueryContract(
     val variant: String? = null,
     /** Explicit DML target; table dependencies may also include SELECT sources or joins. */
     val targetTable: String? = null,
+    val accessPathIds: List<String> = emptyList(),
+    val observationFrames: List<String> = emptyList(),
 )
 
 data class SchemaSnapshot(
@@ -73,12 +85,19 @@ data class SchemaSnapshot(
     val sequences: Map<String, String> = emptyMap(),
     /** Extension name -> installed version; member objects are excluded from behaviors. */
     val extensions: Map<String, String> = emptyMap(),
+    val sequenceOwners: Map<String, ColumnReference> = emptyMap(),
+    val enumTypes: Map<String, List<String>> = emptyMap(),
 )
 
 data class TableSchema(
     val columns: Map<String, ColumnSchema> = emptyMap(),
     val constraints: Map<String, ConstraintSchema> = emptyMap(),
     val indexes: Map<String, String> = emptyMap(),
+    val kind: String = "table",
+    val uniqueIndexes: Map<String, Boolean> = emptyMap(),
+    val plainIndexes: Set<String> = emptySet(),
+    val indexColumns: Map<String, List<String>> = emptyMap(),
+    val indexMethods: Map<String, String> = emptyMap(),
 )
 
 data class ColumnSchema(
@@ -90,7 +109,17 @@ data class ColumnSchema(
     val ordinal: Int = 0,
 )
 
-data class ConstraintSchema(val type: String, val definition: String)
+data class ConstraintSchema(
+    val type: String,
+    val definition: String,
+    val columns: List<String> = emptyList(),
+    val referencedTable: String? = null,
+    val referencedColumns: List<String> = emptyList(),
+    val onDelete: String? = null,
+    val onUpdate: String? = null,
+    val checkExpression: String? = null,
+    val validated: Boolean = true,
+)
 data class MigrationInfo(val version: String, val filename: String)
 
 data class Finding(
@@ -108,6 +137,8 @@ data class MigrationReport(
     val migration: MigrationInfo,
     val verdict: Verdict,
     val findings: List<Finding>,
+    val replannedQueries: Int? = null,
+    val reusedQueries: Int? = null,
 )
 
 data class CompatibilityReport(
@@ -125,6 +156,7 @@ data class CompatibilityReport(
     val gateVerdict: Verdict? = null,
     val acceptedBaseline: List<AcceptedBaselineFinding> = emptyList(),
     val ruleSummary: List<RuleSummary> = emptyList(),
+    val accessPaths: List<AccessPathCoverage> = emptyList(),
 )
 
 /** A baseline fingerprint binds acceptance to the contract, catalog and baseline migration input. */
@@ -134,6 +166,7 @@ data class BaselineReport(
     val fingerprint: String,
     val cacheStatus: String? = null,
     val cacheKey: String? = null,
+    val cacheReason: String? = null,
 )
 
 data class AcceptedBaseline(
@@ -150,4 +183,25 @@ data class RuleSummary(
     val baselineCount: Int = 0,
     val migrationCount: Int = 0,
     val acceptedBaselineCount: Int = 0,
+)
+
+/** Scientific verdicts for both rollout directions, independently reported. */
+data class BidirectionalReport(
+    val schemaVersion: Int = 1,
+    val oldOnNew: CompatibilityReport,
+    val newOnOld: CompatibilityReport,
+    val verdict: Verdict,
+    val gateVerdict: Verdict? = null,
+)
+
+enum class AccessPathStatus { STATIC, OBSERVED, DECLARED, UNRESOLVED }
+data class AccessPathCoverage(
+    val id: String,
+    val className: String,
+    val method: String,
+    val status: AccessPathStatus,
+    val queryIds: List<String> = emptyList(),
+    val reason: String? = null,
+    val mechanism: String? = null,
+    val line: Int? = null,
 )

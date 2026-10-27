@@ -15,40 +15,36 @@ internal object ClasspathInspection {
         "META-INF/maven/org.hibernate/hibernate-core/pom.properties",
     )
 
-    /** Reject an incompatible runtime before parent-first loading can silently substitute the bundled Hibernate. */
-    fun checkHibernateVersion(classpath: List<String>) {
-        val supported = org.hibernate.Version.getVersionString()
+    fun hibernateVersions(classpath: List<String>): Map<String, String> = buildMap {
         for (entry in classpath.distinct().sorted()) {
             val path = Path.of(entry)
-            require(Files.exists(path)) { "Classpath entry does not exist: $path" }
-            val version: String?
+            if (!Files.exists(path)) continue
             if (Files.isDirectory(path)) {
                 if (!Files.exists(path.resolve(HIBERNATE_CLASS))) continue
-                version = versionProperties.firstNotNullOfOrNull { resource ->
+                val version = versionProperties.firstNotNullOfOrNull { resource ->
                     path.resolve(resource).takeIf(Files::isRegularFile)?.let { file ->
                         Files.newInputStream(file).use { Properties().apply { load(it) }.getProperty("version") }
                     }
                 } ?: path.resolve("META-INF/MANIFEST.MF").takeIf(Files::isRegularFile)?.let { file ->
                     Files.newInputStream(file).use { Manifest(it).mainAttributes.getValue("Implementation-Version") }
                 }
-            } else {
-                JarFile(path.toFile()).use { jar ->
-                    if (jar.getJarEntry(HIBERNATE_CLASS) == null) return@use
-                    val found = versionProperties.firstNotNullOfOrNull { resource -> jar.getJarEntry(resource)?.let { e ->
+                put(entry, version ?: "unidentifiable")
+            } else JarFile(path.toFile()).use { jar ->
+                if (jar.getJarEntry(HIBERNATE_CLASS) != null) {
+                    val version = versionProperties.firstNotNullOfOrNull { resource -> jar.getJarEntry(resource)?.let { e ->
                         jar.getInputStream(e).use { Properties().apply { load(it) }.getProperty("version") }
                     } } ?: jar.manifest?.mainAttributes?.getValue("Implementation-Version")
-                    require(found == supported) {
-                        "Hibernate version mismatch in $path: application supplies ${found ?: "an unidentifiable version"}; " +
-                            "this extractor supports $supported. Hibernate 7 is not supported by this adapter. " +
-                            "Use a matching application runtime or a compatible extraction adapter; do not remove the application's Hibernate to bypass this check."
-                    }
+                    put(entry, version ?: "unidentifiable")
                 }
-                continue
             }
-            require(version == supported) {
-                "Hibernate version mismatch in $path: application supplies ${version ?: "an unidentifiable version"}; " +
-                    "this extractor supports $supported. Use a matching application runtime or compatible extraction adapter."
-            }
+        }
+    }
+
+    /** Inside the isolated worker, prove the resolved runtime is exactly the supplied one. */
+    fun checkHibernateVersion(classpath: List<String>) {
+        val loaded = org.hibernate.Version.getVersionString()
+        hibernateVersions(classpath).forEach { (path, version) ->
+            require(version == loaded) { "Hibernate version mismatch in $path: application supplies $version; loaded runtime is $loaded" }
         }
     }
 
@@ -63,6 +59,7 @@ internal object ClasspathInspection {
         val indexer = Indexer()
         for (entry in classpath.distinct().sorted()) {
             val path = Path.of(entry)
+            if (!Files.exists(path)) continue
             if (Files.isDirectory(path)) {
                 val files = sortedSetOf<Path>()
                 for (prefix in prefixes) {

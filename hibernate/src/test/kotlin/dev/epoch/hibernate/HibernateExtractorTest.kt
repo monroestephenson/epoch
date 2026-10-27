@@ -17,7 +17,7 @@ import kotlin.test.*
 
 class HibernateExtractorTest {
     @Test fun `actual persister plans contain physical table and column names`() {
-        val c = HibernateExtractor().extract(ExtractionRequest(listOf(Customer::class.java.name)))
+        val c = HibernateExtractor().extract(ExtractionRequest(listOf(Customer::class.java.name), discoverRepositories = false))
         assertTrue(c.unresolvedQueries.isEmpty(), c.unresolvedQueries.toString())
         assertTrue(c.coverage.complete)
         assertEquals("public.customers", c.entities.single().table)
@@ -30,26 +30,26 @@ class HibernateExtractorTest {
 
     @Test fun `configured physical naming strategy is applied by Hibernate`() {
         val c = HibernateExtractor().extract(ExtractionRequest(listOf(Customer::class.java.name),
-            physicalNamingStrategy = PrefixNamingStrategy::class.java.name))
+            physicalNamingStrategy = PrefixNamingStrategy::class.java.name, discoverRepositories = false))
         assertEquals("public.pref_customers", c.entities.single().table)
         assertTrue(c.queries.all { it.sql.contains("pref_customers") })
     }
 
     @Test fun `custom transformer remains unresolved while standard question-mark writes are supported`() {
-        val c = HibernateExtractor().extract(ExtractionRequest(listOf(TransformedCustomer::class.java.name)))
+        val c = HibernateExtractor().extract(ExtractionRequest(listOf(TransformedCustomer::class.java.name), discoverRepositories = false))
         assertFalse(c.coverage.complete)
         assertTrue(c.unresolvedQueries.any { it.reason.contains("Custom column transformer") })
     }
 
     @Test fun `dynamic generated mutations explicitly remain unresolved`() {
-        val c = HibernateExtractor().extract(ExtractionRequest(listOf(DynamicCustomer::class.java.name)))
+        val c = HibernateExtractor().extract(ExtractionRequest(listOf(DynamicCustomer::class.java.name), discoverRepositories = false))
         assertFalse(c.coverage.complete)
         assertTrue(c.unresolvedQueries.any { it.reason.contains("Dynamic insert/update") })
     }
 
     @Test fun `fixed HQL is translated through Hibernate with parameter and physical column dependencies`() {
         val c = HibernateExtractor().extract(ExtractionRequest(listOf(Customer::class.java.name),
-            hqlQueries = mapOf("lookup" to "select c from Customer c where c.email = :email")))
+            hqlQueries = mapOf("lookup" to "select c from Customer c where c.email = :email"), discoverRepositories = false))
         val q = c.queries.single { it.id == "lookup" }
         assertTrue(q.dependenciesComplete, c.unresolvedQueries.toString())
         assertTrue(q.columns.any { it.table == "public.customers" && it.column == "email_address" })
@@ -60,7 +60,7 @@ class HibernateExtractorTest {
 
     @Test fun `unsupported native statements become unresolved without losing the rest of extraction`() {
         val c = HibernateExtractor().extract(ExtractionRequest(listOf(Customer::class.java.name),
-            nativeQueries = mapOf("schemaChange" to "create table unexpected (id integer)")))
+            nativeQueries = mapOf("schemaChange" to "create table unexpected (id integer)"), discoverRepositories = false))
         assertFalse(c.coverage.complete)
         assertTrue(c.unresolvedQueries.any { it.id == "schemaChange" })
         assertTrue(c.queries.any { it.source == QuerySource.HIBERNATE_MAPPING })

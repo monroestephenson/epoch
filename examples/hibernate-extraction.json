@@ -2,6 +2,8 @@
   "applicationVersion": "1.0.0",
   "entityClasses": [],
   "scanPackages": ["com.example.entity"],
+  "repositoryPackages": ["com.example.repository", "com.example.dao"],
+  "discoverRepositories": true,
   "classpath": ["/absolute/path/to/application.jar"],
   "hibernateProperties": {
     "hibernate.default_schema": "public"
@@ -10,6 +12,7 @@
   "hqlQueries": {},
   "nativeQueries": {},
   "nativeQueryParameterTypes": {},
+  "runtimeSqlFiles": [],
   "finiteHqlVariants": {},
   "keepGoing": false,
   "unresolvedDynamicQueries": {

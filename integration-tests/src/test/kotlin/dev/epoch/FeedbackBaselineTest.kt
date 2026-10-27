@@ -32,7 +32,7 @@ class FeedbackBaselineTest {
         val contract = original.copy(
             entities = original.entities + EntityContract("LegacyProjection", "public.nonexistent_projection",
                 listOf(ColumnContract("id", "bigint")), setOf(Operation.SELECT)),
-            queries = original.queries.map { if (it.id == "Customer.find") it.copy(parameterTypes = emptyList()) else it },
+            queries = original.queries.map { if (it.id == "Customer.find") it.copy(parameterTypes = listOf("bigint", "text")) else it },
         )
         val report = PostgresVerifier().verify(contract, baseline(), pending("pending",
             "V2__metadata.sql" to "ALTER TABLE customers ADD COLUMN metadata text;",

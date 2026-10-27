@@ -80,7 +80,7 @@ internal fun summarizeFindings(
     val original = baseline?.findings.orEmpty()
     val pending = migrations.flatMap { it.findings }
     return (original + pending).map { it.ruleId to it.verdict }.distinct()
-        .sortedWith(compareBy({ it.first }, { it.second.name })).map { (rule, verdict) ->
+        .sortedWith(compareBy({ when (it.second) { Verdict.BREAKING -> 0; Verdict.UNKNOWN -> 1; Verdict.SAFE -> 2 } }, { it.first })).map { (rule, verdict) ->
             val existing = original.filter { it.ruleId == rule && it.verdict == verdict }
             RuleSummary(rule, verdict, existing.size,
                 pending.count { it.ruleId == rule && it.verdict == verdict },

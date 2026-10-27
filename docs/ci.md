@@ -80,7 +80,7 @@ Preserve this directory between trusted CI runs if desired. The cache must be ou
 
 ## Logging and offline use
 
-The CLI logs warnings/errors by default. Add `--verbose` (or `-v`) for library INFO logs and full exception traces. Failures always include their underlying cause chain. Default reports group findings by rule and print at most 20 details, prioritizing migrations. `report --summary` omits detail; `--details` prints everything retained in JSON.
+The CLI logs concise CLI failures by default. Add `--verbose` (or `-v`) for library INFO logs and full exception traces. Failures always include their underlying cause chain. Default reports group findings by rule and print at most 20 details, prioritizing migrations. `report --summary` omits detail; `--details` prints everything retained in JSON.
 
 Initial setup downloads Gradle, dependencies, and Docker images. Once all dependencies for the selected tasks and the required images are cached:
 
@@ -95,7 +95,7 @@ Initial setup downloads Gradle, dependencies, and Docker images. Once all depend
 | Symptom | Next check |
 | --- | --- |
 | Exit `3` with `NoClassDefFoundError` | Inspect the reported missing dependency and descriptor classpath. Bean Validation is disabled during extraction. |
-| Hibernate version mismatch | Use this adapter with Hibernate 6.6.13.Final or use a compatible adapter for the application's version. Hibernate 7 extraction is not implemented. |
+| Hibernate runtime/classpath mismatch | Include the application's actual Hibernate 6.6/7.x runtime and all dependencies. Epoch isolates that runtime; tested versions are 6.6.13, 7.0.10, and 7.1.4. Incomplete runtimes and unsupported SPI paths fail clearly instead of falling back to bundled Hibernate. |
 | Entity list too large | Use `scanPackages` over compiled class directories/JARs. |
 | A mapping group fails bootstrap | Use `--keep-going` to preserve independent results; failed groups remain unresolved. |
 | Container or Ryuk cannot start | Read the cause chain, check Docker access, both required images, and runner cleanup/permission requirements. |
@@ -104,3 +104,20 @@ Initial setup downloads Gradle, dependencies, and Docker images. Once all depend
 | Migration returns `UNKNOWN` | Inspect new findings and retained baseline debt separately; acceptance does not prove missing behavior. |
 
 There is no production JDBC URL or production credential configuration step.
+
+## Release refs, reverse compatibility, and SARIF
+
+Retain the N-1 and N contracts as build artifacts. With both Git refs fetched locally, `verify-release` reads immutable migration blobs without changing the checkout:
+
+```bash
+db-compat verify-release --repository . --base-ref v1.4.0 --target-ref HEAD \
+  --migration-path src/main/resources/db/migration \
+  --contract artifacts/old-contract.json --new-contract artifacts/new-contract.json \
+  --report build/release-report.json --sarif build/epoch.sarif
+```
+
+Existing SQL and `.sql.conf` files must be unchanged between refs. Flyway determines pending migration order. The JSON records both commit IDs; `report --input build/release-report.json` renders both directions. `new-on-old` checks deploy-before-migrate or rollback schema compatibility, not the correctness of down migrations.
+
+`verify --sarif build/epoch.sarif --migration-source-prefix src/main/resources/db/migration` and `report --sarif ...` also export SARIF 2.1.0. Upload that file through your CI provider's normal code-scanning integration. Baseline findings have no pending-file location. Catalog findings use line 1 as a migration-wide anchor, not an invented exact source line.
+
+`lint --migrations db/pending --report build/operations.json` is optional and separate. Its hints do not affect the compatibility exit code. Configure `--migration-timeout-seconds` and `--global-timeout-seconds` for your runner; a failed migration or infrastructure failure exits 3. No PostgreSQL NOTICE or library stack trace is emitted in default CLI logging; `--verbose` enables library diagnostics.

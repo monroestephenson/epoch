@@ -115,9 +115,9 @@ class CompatibilityEngineTest {
         assertRule(verify(target), Verdict.UNKNOWN, "NEW_COLUMN_EXPRESSION")
     }
 
-    @Test fun `changed defaults and nullability remain unknown`() {
+    @Test fun `defaults remain unknown but nullable writable mapping proves tightened nullability breaking`() {
         assertRule(verify(table.copy(columns = table.columns + ("email" to table.columns.getValue("email").copy(defaultExpression = "'unknown'::text")))), Verdict.UNKNOWN, "DEFAULT_CHANGED")
-        assertRule(verify(table.copy(columns = table.columns + ("email" to table.columns.getValue("email").copy(nullable = false)))), Verdict.UNKNOWN, "NULLABILITY_CHANGED")
+        assertRule(verify(table.copy(columns = table.columns + ("email" to table.columns.getValue("email").copy(nullable = false)))), Verdict.BREAKING, "MAPPED_NULL_REJECTED")
     }
 
     @Test fun `missing baseline mapping is unknown instead of fabricated regression`() {
@@ -155,7 +155,7 @@ class CompatibilityEngineTest {
     @Test fun `existing trigger behavior may depend on newly added columns`() {
         val old = baseline.copy(behaviors = mapOf("trigger:public.customers.audit" to "EXECUTE FUNCTION audit_row()"))
         val target = old.copy(tables = mapOf("public.customers" to table.copy(columns = table.columns + ("extra" to ColumnSchema("text", true)))))
-        assertRule(engine.verifyStep(contract, old, target, migration), Verdict.UNKNOWN, "EXISTING_DATABASE_BEHAVIOR")
+        assertRule(engine.verifyStep(contract, old, target, migration), Verdict.UNKNOWN, "DATABASE_BEHAVIOR_DEPENDENCY_UNPROVEN")
     }
 
     @Test fun `adapter unknown data effects prevent safe`() {

@@ -151,13 +151,13 @@ class PostgresCompatibilityTest {
     @Test fun `incorrect parameter count cannot establish a valid baseline`() {
         val original = customerContract()
         val contract = original.copy(queries = original.queries.map { query ->
-            if (query.id == "Customer.find") query.copy(parameterTypes = emptyList()) else query
+            if (query.id == "Customer.find") query.copy(parameterTypes = listOf("bigint", "text")) else query
         })
         val report = verify("V2__metadata.sql" to "ALTER TABLE customers ADD COLUMN metadata text;", contract = contract)
         assertEquals(Verdict.UNKNOWN, report.verdict, report.toString())
         assertTrue(requireNotNull(report.baseline).findings.any {
             it.ruleId == "BASELINE_SQL_UNVERIFIED" && it.migration == null && "Customer.find" in it.affectedContractIds &&
-                it.evidence.contains("1 parameters but 0 declared")
+                it.evidence.contains("1 parameters but 2 declared")
         }, report.toString())
     }
 

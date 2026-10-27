@@ -25,11 +25,11 @@ cli/build/install/db-compat/bin/db-compat --help
 ./gradlew :core:test :hibernate:test :cli:test
 ```
 
-The project targets Kotlin/JVM, Hibernate **6.6.13.Final**, Flyway 11, PostgreSQL **16.8**, and Testcontainers **2.0.5**. Extraction rejects mismatched supplied Hibernate versions before bootstrap; Hibernate 7 extraction is not implemented. The required container images are `postgres:16.8` and `testcontainers/ryuk:0.14.0`.
+The project targets Kotlin/JVM, Hibernate **6.6 and 7**, Flyway 11, PostgreSQL **16.8**, and Testcontainers **2.0.5**. Hibernate 7 extraction uses the application’s supplied runtime in an isolated classloader; see the tested versions and adapter boundaries in [the contract guide](docs/contracts.md). The required container images are `postgres:16.8` and `testcontainers/ryuk:0.14.0`.
 
 ## Check an old application release
 
-Build the **old** application's entity classes first. Supply those compiled classes and their mapping dependencies to an extraction descriptor. Classpath entries are directories or JARs, resolved relative to the descriptor file. Use `scanPackages` to discover entities in compiled artifacts instead of listing every class. The descriptor also supports Hibernate properties, entity operation/scope overrides, and explicit native-query parameter types.
+Build the **old** application's entity classes first. Supply those compiled classes and their mapping dependencies to an extraction descriptor. Classpath entries are directories or JARs, resolved relative to the descriptor file. Use `scanPackages` to discover entities in compiled artifacts instead of listing every class. Repository and DAO bytecode discovery is enabled by default. Set `repositoryPackages` to your application’s repository/DAO packages. The descriptor also supports Hibernate properties, entity overrides, and native-query parameter declarations or PostgreSQL inference. [Repository coverage](docs/repository-coverage.md) explains the method inventory and unresolved variants.
 
 ```sh
 cli/build/install/db-compat/bin/db-compat extract \
@@ -57,11 +57,11 @@ Verification starts its own PostgreSQL container. There is no target JDBC URL op
 | `UNKNOWN` | 2 |
 | Invalid arguments or runtime failure | 3 |
 
-`report` returns the verdict's exit code too. By default, `UNKNOWN` is a failing CI gate. With an explicitly reviewed accepted-baseline file, `verify` and `report` use the separate `gateVerdict` for their exit code; the overall compatibility verdict remains unchanged. A pending migration execution or validation failure is recorded as `UNKNOWN` when a report can be produced; a failure to start PostgreSQL or establish the baseline is a runtime failure. Extraction success means a contract was written; inspect `coverage` and `unresolvedQueries` before treating it as complete.
+`report` returns the verdict's exit code too. By default, `UNKNOWN` is a failing CI gate. With an explicitly reviewed accepted-baseline file, `verify` and `report` use the separate `gateVerdict` for their exit code; the overall compatibility verdict remains unchanged. Migration execution/validation failures, lost database connections, and verification timeouts return runtime exit `3` with their stage and migration; they are not completed compatibility verdicts. Extraction success means a contract was written; inspect `coverage` and `unresolvedQueries` before treating it as complete.
 
-Unexpected errors, including `NoClassDefFoundError`, return `3` and print the underlying cause. Library logging defaults to warnings/errors; use `--verbose` for INFO logs and full traces.
+Unexpected errors, including `NoClassDefFoundError`, return `3` and print the underlying cause. Library logging is quiet by default; the CLI prints concise failure causes. Use `--verbose` for INFO logs and full traces.
 
-Read [the descriptor and contract format](docs/contracts.md), [verification boundaries](docs/verification.md), and [CI usage](docs/ci.md) before integrating the result into a deployment workflow. [Feedback changes and remaining boundaries](docs/feedback.md) maps the reported adoption issues to this revision.
+Read [the descriptor and contract format](docs/contracts.md), [verification boundaries](docs/verification.md), and [CI usage](docs/ci.md) before integrating the result into a deployment workflow. [Current verification refinements](docs/feedback-round2.md) and [repository coverage](docs/repository-coverage.md) document the latest changes; [the earlier feedback record](docs/feedback.md) describes the previous revision.
 
 ## Baseline health, scale, and multiple persistence units
 
@@ -79,7 +79,24 @@ cli/build/install/db-compat/bin/db-compat verify \
 
 A justified accepted-baseline file can make the CI gate measure new migration findings while retaining baseline debt and the original compatibility verdict. It cannot suppress new migration findings, and stale input fingerprints are rejected. See [the review workflow](docs/ci.md#review-existing-baseline-debt) before enabling it.
 
-Use `extract --keep-going` to retain independent mapping groups when another group cannot bootstrap. Failures become unresolved evidence; partial results never imply complete coverage.
+Use `extract --keep-going` to recover usable mappings after bootstrap failures, with excluded entities and association paths recorded as unresolved. Failures become unresolved evidence; partial results never imply complete coverage.
+
+## Rollout checks, release history, and CI
+
+Add `--new-contract release-n.json` to `verify` to check both old code on migrated schemas and new code on the retained old schema. `verify-release` can assemble baseline and pending migrations directly from immutable Git refs:
+
+```sh
+db-compat verify-release --repository . --base-ref v1.4.0 --target-ref v1.5.0 \
+  --migration-path src/main/resources/db/migration \
+  --contract release-1.4.0.json --new-contract release-1.5.0.json \
+  --report release-report.json --sarif release-report.sarif
+```
+
+Existing migration files and their Flyway sidecars must remain unchanged. Contracts are retained release artifacts; Epoch does not rebuild applications from Git refs automatically. See [the release workflow](docs/feedback-round2.md#rollout-and-rollback-workflows).
+
+Verification has per-migration and global deadlines (`--migration-timeout-seconds`, default 120; `--global-timeout-seconds`, default 1800). `CREATE INDEX CONCURRENTLY` uses Flyway’s session-level advisory lock and requires `executeInTransaction=false` in the migration’s `.sql.conf` sidecar. Reports expose reused/replanned query counts and baseline cache rebuild reasons.
+
+`--execute-boundaries` optionally tries supported rolled-back INSERT counterexamples. A value accepted before a migration and rejected afterward proves a break; successful samples never establish safety. `lint --migrations DIR --report lint.json` provides separate operational review hints without changing compatibility verdicts.
 
 ## Run the examples
 
@@ -112,7 +129,7 @@ For your own application, copy and adapt [the application descriptor template](e
 | --- | --- |
 | `core/` | Versioned contract/report model, deterministic compatibility rules, PostgreSQL catalog inspection, and Flyway verification. |
 | `hibernate/` | Hibernate metadata and SQL extraction; optional SQL observation through `StatementInspector`. |
-| `cli/` | `extract`, `verify`, and `report` commands and their exit codes. |
+| `cli/` | Extraction, verification, Git release workflows, reporting/SARIF, and separate operational lint. |
 | `integration-tests/` | Compiled entity fixtures and real PostgreSQL migration scenarios. |
 
 Extraction and verification are separate so an old release's JSON contract can be retained and checked against later migrations. Findings identify the migration, rule, affected contract entries, and evidence. Human-readable rendering uses the same saved JSON report as CI.

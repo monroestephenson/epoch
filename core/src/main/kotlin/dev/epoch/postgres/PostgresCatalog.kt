@@ -9,20 +9,20 @@ class PostgresCatalog {
     fun inspect(connection: Connection): SchemaSnapshot {
         val tables = sortedMapOf<String, TableSchema>()
         connection.rows("""
-            SELECT n.nspname || '.' || c.relname AS name
+            SELECT n.nspname || '.' || c.relname AS name, c.relkind
             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE c.relkind IN ('r','p') AND n.nspname NOT LIKE 'pg_%'
+            WHERE c.relkind IN ('r','p','v','m') AND n.nspname NOT LIKE 'pg_%'
               AND n.nspname <> 'information_schema' AND c.relname <> 'flyway_schema_history'
             ORDER BY 1
-        """) { tables[it.getString("name")] = TableSchema() }
+        """) { tables[it.getString("name")] = TableSchema(kind = when (it.getString("relkind")) { "v" -> "view"; "m" -> "materialized_view"; else -> "table" }) }
         connection.rows("""
             SELECT n.nspname || '.' || c.relname AS table_name, a.attname,
-                   format_type(a.atttypid,a.atttypmod) AS type, a.attnotnull, a.attnum,
+                   format_type(a.atttypid,a.atttypmod) AS type, a.attnotnull, row_number() OVER (PARTITION BY c.oid ORDER BY a.attnum) AS attnum,
                    pg_get_expr(d.adbin,d.adrelid) AS default_expr, a.attidentity, a.attgenerated
             FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
             JOIN pg_attribute a ON a.attrelid=c.oid
             LEFT JOIN pg_attrdef d ON d.adrelid=c.oid AND d.adnum=a.attnum
-            WHERE c.relkind IN ('r','p') AND a.attnum > 0 AND NOT a.attisdropped
+            WHERE c.relkind IN ('r','p','v','m') AND a.attnum > 0 AND NOT a.attisdropped
               AND n.nspname NOT LIKE 'pg_%' AND n.nspname <> 'information_schema'
             ORDER BY 1,a.attnum
         """) { row ->
@@ -38,28 +38,53 @@ class PostgresCatalog {
         connection.rows("""
             SELECT n.nspname || '.' || c.relname AS table_name, co.conname, co.contype,
                    pg_get_constraintdef(co.oid,true) || '; validated=' || co.convalidated
-                   || '; deferrable=' || co.condeferrable || '; deferred=' || co.condeferred AS definition
+                   || '; deferrable=' || co.condeferrable || '; deferred=' || co.condeferred AS definition,
+                   ARRAY(SELECT a.attname FROM unnest(co.conkey) WITH ORDINALITY k(num, position)
+                         JOIN pg_attribute a ON a.attrelid=co.conrelid AND a.attnum=k.num ORDER BY k.position) AS columns,
+                   CASE WHEN co.confrelid <> 0 THEN rn.nspname || '.' || rc.relname END AS referenced_table,
+                   ARRAY(SELECT a.attname FROM unnest(co.confkey) WITH ORDINALITY k(num, position)
+                         JOIN pg_attribute a ON a.attrelid=co.confrelid AND a.attnum=k.num ORDER BY k.position) AS referenced_columns,
+                   co.confdeltype, co.confupdtype, pg_get_expr(co.conbin,co.conrelid) AS check_expression, co.convalidated
             FROM pg_constraint co JOIN pg_class c ON c.oid=co.conrelid
             JOIN pg_namespace n ON n.oid=c.relnamespace
+            LEFT JOIN pg_class rc ON rc.oid=co.confrelid
+            LEFT JOIN pg_namespace rn ON rn.oid=rc.relnamespace
             WHERE n.nspname NOT LIKE 'pg_%' AND n.nspname <> 'information_schema'
             ORDER BY 1,co.conname
         """) { row ->
             val name = row.getString("table_name")
             val table = tables[name] ?: return@rows
             tables[name] = table.copy(constraints = table.constraints + (row.getString("conname") to
-                ConstraintSchema(row.getString("contype"), row.getString("definition"))))
+                ConstraintSchema(row.getString("contype"), row.getString("definition"),
+                    columns = row.strings("columns"), referencedTable = row.getString("referenced_table"),
+                    referencedColumns = row.strings("referenced_columns"), onDelete = row.getString("confdeltype"),
+                    onUpdate = row.getString("confupdtype"), checkExpression = row.getString("check_expression"),
+                    validated = row.getBoolean("convalidated"))))
         }
         connection.rows("""
             SELECT n.nspname || '.' || c.relname AS table_name, i.relname AS index_name,
-                   pg_get_indexdef(ix.indexrelid) || '; valid=' || ix.indisvalid AS definition
+                   pg_get_indexdef(ix.indexrelid) || '; valid=' || ix.indisvalid AS definition, ix.indisunique,
+                   am.amname AS method,
+                   ARRAY(SELECT a.attname FROM unnest(ix.indkey) WITH ORDINALITY k(num, position)
+                         JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum=k.num ORDER BY k.position) AS columns,
+                   ix.indexprs IS NULL AND ix.indpred IS NULL AND NOT EXISTS (
+                       SELECT 1 FROM unnest(ix.indclass) op(oid) JOIN pg_opclass oc ON oc.oid=op.oid
+                       JOIN pg_namespace ons ON ons.oid=oc.opcnamespace WHERE ons.nspname <> 'pg_catalog'
+                   ) AS plain_index
             FROM pg_index ix JOIN pg_class c ON c.oid=ix.indrelid
             JOIN pg_class i ON i.oid=ix.indexrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+            JOIN pg_am am ON am.oid=i.relam
             WHERE n.nspname NOT LIKE 'pg_%' AND n.nspname <> 'information_schema'
             ORDER BY 1,2
         """) { row ->
             val name = row.getString("table_name")
             val table = tables[name] ?: return@rows
-            tables[name] = table.copy(indexes = table.indexes + (row.getString("index_name") to row.getString("definition")))
+            val index = row.getString("index_name")
+            tables[name] = table.copy(indexes = table.indexes + (index to row.getString("definition")),
+                uniqueIndexes = table.uniqueIndexes + (index to row.getBoolean("indisunique")),
+                plainIndexes = table.plainIndexes + (if (row.getBoolean("plain_index")) setOf(index) else emptySet()),
+                indexColumns = table.indexColumns + (index to row.strings("columns")),
+                indexMethods = table.indexMethods + (index to row.getString("method")))
         }
         val behaviors = sortedMapOf<String, String>()
         fun behavior(sql: String) = connection.rows(sql) { behaviors[it.getString(1)] = it.getString(2) }
@@ -117,12 +142,13 @@ class PostgresCatalog {
             FROM pg_inherits i JOIN pg_class child ON child.oid=i.inhrelid JOIN pg_class parent ON parent.oid=i.inhparent
             WHERE ${notExtensionOwned("pg_class", "child.oid")}
         """)
-        behavior("""
-            SELECT 'enum:' || n.nspname || '.' || t.typname, jsonb_agg(e.enumlabel ORDER BY e.enumsortorder)::text
+        val enumTypes = sortedMapOf<String, List<String>>()
+        connection.rows("""
+            SELECT n.nspname || '.' || t.typname AS name, array_agg(e.enumlabel ORDER BY e.enumsortorder) AS labels
             FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace JOIN pg_enum e ON e.enumtypid=t.oid
             WHERE n.nspname NOT LIKE 'pg_%' AND ${notExtensionOwned("pg_type", "t.oid")}
             GROUP BY n.nspname,t.typname
-        """)
+        """) { enumTypes[it.getString("name")] = it.strings("labels") }
         behavior("""
             SELECT 'domain:' || n.nspname || '.' || t.typname,
                    format_type(t.typbasetype,t.typtypmod) || ':' || t.typnotnull || ':' || coalesce(t.typdefault,'') || ':' ||
@@ -148,11 +174,24 @@ class PostgresCatalog {
                    max_value || ':' || increment_by || ':' || cycle || ':' || cache_size
             FROM pg_sequences WHERE schemaname NOT LIKE 'pg_%' ORDER BY 1
         """) { sequences[it.getString(1)] = it.getString(2) }
+        val sequenceOwners = sortedMapOf<String, ColumnReference>()
+        connection.rows("""
+            SELECT sn.nspname || '.' || seq.relname AS name,
+                   tn.nspname || '.' || tab.relname AS table_name, a.attname
+            FROM pg_class seq JOIN pg_namespace sn ON sn.oid=seq.relnamespace
+            JOIN pg_depend d ON d.classid='pg_class'::regclass AND d.objid=seq.oid
+              AND d.refclassid='pg_class'::regclass AND d.deptype IN ('a','i')
+            JOIN pg_class tab ON tab.oid=d.refobjid JOIN pg_namespace tn ON tn.oid=tab.relnamespace
+            JOIN pg_attribute a ON a.attrelid=tab.oid AND a.attnum=d.refobjsubid
+            WHERE seq.relkind='S' AND sn.nspname NOT LIKE 'pg_%'
+            ORDER BY 1
+        """) { sequenceOwners[it.getString("name")] = ColumnReference(it.getString("table_name"), it.getString("attname")) }
         val extensions = sortedMapOf<String, String>()
         connection.rows("SELECT extname, extversion FROM pg_extension ORDER BY extname") {
             extensions[it.getString(1)] = it.getString(2)
         }
-        return SchemaSnapshot(tables = tables, behaviors = behaviors, sequences = sequences, extensions = extensions)
+        return SchemaSnapshot(tables = tables, behaviors = behaviors, sequences = sequences, extensions = extensions,
+            sequenceOwners = sequenceOwners, enumTypes = enumTypes)
     }
 }
 
@@ -163,4 +202,9 @@ private fun notExtensionOwned(catalog: String, objectId: String) =
 
 private fun Connection.rows(sql: String, consume: (ResultSet) -> Unit) = createStatement().use { statement ->
     statement.executeQuery(sql).use { result -> while (result.next()) consume(result) }
+}
+
+private fun ResultSet.strings(column: String): List<String> {
+    val value = getArray(column) ?: return emptyList()
+    return try { (value.array as Array<*>).map { it.toString() } } finally { value.free() }
 }

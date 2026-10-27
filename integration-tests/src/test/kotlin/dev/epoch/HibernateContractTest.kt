@@ -17,6 +17,7 @@ class HibernateContractTest {
 
     @Test fun `actual Hibernate generated CRUD contract verifies against nullable addition`() {
         val contract = HibernateExtractor().extract(ExtractionRequest(
+            discoverRepositories = false,
             entityClasses = listOf(PlainCustomer::class.java.name), applicationVersion = "hibernate-fixture-1.0"))
         assertTrue(contract.entities.any { it.table == "public.customers" && it.columns.any { c -> c.name == "email" } })
         assertTrue(contract.queries.any { it.source == QuerySource.HIBERNATE_MAPPING && it.operation == Operation.INSERT })
@@ -57,6 +58,7 @@ class HibernateContractTest {
 
     @Test fun `declared finite HQL query variants are enumerated and labeled`() {
         val contract = HibernateExtractor().extract(ExtractionRequest(
+            discoverRepositories = false,
             entityClasses = listOf(PlainCustomer::class.java.name),
             finiteHqlVariants = mapOf("Customer.sort" to listOf(
                 "select c from PlainCustomer c order by c.id",
@@ -70,6 +72,7 @@ class HibernateContractTest {
 
     @Test fun `unbounded dynamic query remains explicitly unresolved`() {
         val contract = HibernateExtractor().extract(ExtractionRequest(
+            discoverRepositories = false,
             entityClasses = listOf(PlainCustomer::class.java.name),
             unresolvedDynamicQueries = mapOf("Customer.search" to "User-controlled predicates produce an unbounded query space"),
         ))
@@ -78,6 +81,7 @@ class HibernateContractTest {
     }
 
     private fun extractQueries() = HibernateExtractor().extract(ExtractionRequest(
+        discoverRepositories = false,
         entityClasses = listOf(Customer::class.java.name, Purchase::class.java.name),
     ))
 }

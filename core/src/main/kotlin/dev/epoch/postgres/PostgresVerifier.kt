@@ -2,7 +2,6 @@ package dev.epoch.postgres
 
 import dev.epoch.core.*
 import org.flywaydb.core.Flyway
-import org.flywaydb.core.api.FlywayException
 import org.flywaydb.core.api.callback.Callback
 import org.flywaydb.core.api.callback.Context
 import org.flywaydb.core.api.callback.Event
@@ -11,11 +10,17 @@ import org.testcontainers.utility.DockerImageName
 import java.nio.file.Files
 import java.nio.file.Path
 import java.sql.DriverManager
+import java.sql.SQLException
+import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** Reusable policy and cache configuration, never a target database connection. */
 data class VerificationOptions(
     val baselineCache: Path? = null,
     val acceptedBaseline: AcceptedBaseline? = null,
+    val migrationTimeoutSeconds: Long = 120,
+    val globalTimeoutSeconds: Long = 1800,
+    val executeBoundaries: Boolean = false,
 )
 
 /** The only public verification target is a newly created, disposable PostgreSQL container. */
@@ -33,102 +38,193 @@ class PostgresVerifier {
         baselineDirectory: Path,
         migrationsDirectory: Path,
         options: VerificationOptions = VerificationOptions(),
-    ): CompatibilityReport {
+    ): CompatibilityReport = runVerification(contracts, null, baselineDirectory, migrationsDirectory, options).first
+
+    /** Checks old code on each migrated schema and new code on the retained original schema. */
+    fun verifyBidirectional(
+        oldContracts: List<DatabaseContract>,
+        newContracts: List<DatabaseContract>,
+        baselineDirectory: Path,
+        migrationsDirectory: Path,
+        options: VerificationOptions = VerificationOptions(),
+    ): BidirectionalReport {
+        val (forward, reverse) = runVerification(oldContracts, newContracts, baselineDirectory, migrationsDirectory, options)
+        val backward = requireNotNull(reverse)
+        return BidirectionalReport(oldOnNew = forward, newOnOld = backward,
+            verdict = CompatibilityEngine.aggregate(listOf(forward.verdict, backward.verdict)),
+            gateVerdict = forward.gateVerdict?.let { CompatibilityEngine.aggregate(listOf(it, backward.verdict)) })
+    }
+
+    private fun runVerification(
+        contracts: List<DatabaseContract>, newContracts: List<DatabaseContract>?,
+        baselineDirectory: Path, migrationsDirectory: Path, options: VerificationOptions,
+    ): Pair<CompatibilityReport, CompatibilityReport?> {
+        validateContracts(contracts)
+        newContracts?.let(::validateContracts)
+        require(options.migrationTimeoutSeconds in 1..86400) { "migrationTimeoutSeconds must be between 1 and 86400" }
+        require(options.globalTimeoutSeconds in 1..604800) { "globalTimeoutSeconds must be between 1 and 604800" }
+        require(Files.isDirectory(baselineDirectory)) { "Baseline migration directory does not exist: $baselineDirectory" }
+        require(Files.isDirectory(migrationsDirectory)) { "Pending migration directory does not exist: $migrationsDirectory" }
+        validateDirectoryIsolation(baselineDirectory, migrationsDirectory, options.baselineCache)
+        val owned = AtomicReference<PostgreSQLContainer?>()
+        val cancelled = AtomicBoolean(false)
+        return VerificationDeadline(options.globalTimeoutSeconds).run(cleanup = { cancelled.set(true); owned.get()?.stop() }) {
+            val contract = mergeContracts(contracts)
+            val newContract = newContracts?.let(::mergeContracts)
+            val baselineCallbacks = callbackFiles(baselineDirectory)
+            val pendingCallbacks = callbackFiles(migrationsDirectory)
+            PostgreSQLContainer(DockerImageName.parse(POSTGRES_IMAGE))
+                .withDatabaseName("epoch")
+                .withUsername("epoch")
+                .withPassword("epoch-isolated-test-only")
+                .withUrlParam("options", "-c statement_timeout=${options.migrationTimeoutSeconds * 1000} -c lock_timeout=${minOf(30, options.migrationTimeoutSeconds) * 1000}")
+                .withUrlParam("connectTimeout", "10")
+                .withUrlParam("socketTimeout", (options.migrationTimeoutSeconds + 10).toString())
+                .use { database ->
+                    owned.set(database)
+                    try { database.start() }
+                    catch (failure: Throwable) {
+                        throw VerificationException("DATABASE_START", message = "Cannot start isolated PostgreSQL. Docker must be available with images $POSTGRES_IMAGE and $RYUK_IMAGE. See the underlying cause; TESTCONTAINERS_RYUK_DISABLED=true is supported when your CI manages container cleanup.", cause = failure)
+                    }
+                    if (cancelled.get()) throw VerificationException("GLOBAL_TIMEOUT", message = "Verification timed out while PostgreSQL was starting.")
+                    val baselineLocation = "filesystem:${baselineDirectory.toAbsolutePath()}"
+                    val pendingLocation = "filesystem:${migrationsDirectory.toAbsolutePath()}"
+                    fun configuration() = Flyway.configure()
+                        .dataSource(database.jdbcUrl, database.username, database.password)
+                        .configuration(mapOf("flyway.postgresql.transactional.lock" to "false"))
+                        .cleanDisabled(true)
+                        .validateMigrationNaming(true)
+                        .validateOnMigrate(true)
+                        .placeholderReplacement(false)
+                        .skipDefaultCallbacks(true)
+                        .lockRetryCount(10)
+                        .loggers("slf4j")
+
+                    val cache = BaselineCache(options.baselineCache)
+                    val cacheKey = cache.key(baselineDirectory, database.containerInfo.imageId)
+                    val cacheResult = cache.prepare(database, cacheKey) {
+                        MigrationDeadline(options.migrationTimeoutSeconds).use { deadline ->
+                            try { configuration().locations(baselineLocation).callbacks(deadline).load().migrate() }
+                            catch (failure: Throwable) {
+                                deadline.checkExpired()
+                                throw executionFailure("BASELINE_EXECUTION_FAILED", deadline.activeMigration, failure)
+                            }
+                        }
+                    }
+                    try { configuration().locations(baselineLocation).load().validate() }
+                    catch (failure: Throwable) { throw executionFailure("BASELINE_VALIDATION_FAILED", null, failure) }
+                    val catalog = PostgresCatalog()
+                    val planner = PostgresQueryPlanner()
+                    val boundaryCollector = if (options.executeBoundaries) PostgresBoundaryProbes() else null
+                    val engine = CompatibilityEngine()
+                    val baseline: SchemaSnapshot
+                    val baselinePlans: Map<String, QueryPlan>
+                    val boundaryBaseline: BoundaryProbeBaseline?
+                    DriverManager.getConnection(database.jdbcUrl, database.username, database.password).use { connection ->
+                        baseline = catalog.inspect(connection)
+                        baselinePlans = planner.inspectAll(connection, contract.queries)
+                        boundaryBaseline = boundaryCollector?.collectBaseline(connection, contract, baseline, baselinePlans)
+                        // Preserve the exact old schema and seed data once, without replaying migrations.
+                        // PostgreSQL clones only this verifier-owned database into another owned database.
+                        if (newContract != null) connection.createStatement().use {
+                            it.execute("CREATE DATABASE epoch_rollback TEMPLATE epoch")
+                        }
+                    }
+                    val baselineFindings = planner.baselineFindings(contract.queries, baselinePlans) +
+                        baselineCallbacks.map { callbackFinding(it, null) }
+                    val baselineHealth = engine.inspectBaseline(contract, baseline, baselineFindings, cacheKey)
+                        .copy(cacheStatus = cacheResult.status, cacheKey = cacheKey, cacheReason = cacheResult.reason)
+                    val steps = pendingCallbacks.map { filename ->
+                        val migration = MigrationInfo("callback", filename)
+                        MigrationReport(migration, Verdict.UNKNOWN, listOf(callbackFinding(filename, migration)))
+                    }.toMutableList()
+                    var priorSchema = baseline
+                    var currentPlans = baselinePlans
+                    MigrationDeadline(options.migrationTimeoutSeconds).use { deadline ->
+                        val callback = object : Callback {
+                            override fun getCallbackName() = "epoch-intermediate-schema-verification"
+                            override fun supports(event: Event, context: Context?) = event == Event.AFTER_EACH_MIGRATE
+                            override fun canHandleInTransaction(event: Event, context: Context?) = true
+                            override fun handle(event: Event, context: Context) {
+                                val info = context.migrationInfo
+                                val migration = MigrationInfo(info.version?.toString() ?: "repeatable", info.script)
+                                val after = catalog.inspect(context.connection)
+                                val effects = try {
+                                    MigrationClassifier().findings(Files.readString(Path.of(info.physicalLocation)), migration, priorSchema, after)
+                                } catch (failure: java.io.IOException) {
+                                    listOf(Finding(Verdict.UNKNOWN, "MIGRATION_EFFECTS_UNAVAILABLE", migration.filename,
+                                        "Could not read the exact migration resource for effect classification.",
+                                        failure.javaClass.simpleName, migration = migration))
+                                }
+                                val planning = planner.planStep(context.connection, contract.queries, baselinePlans,
+                                    migration, priorSchema, after, currentPlans)
+                                val witnesses = boundaryBaseline?.let { boundaryCollector?.findings(context.connection, it, after, migration) }.orEmpty()
+                                steps += engine.verifyStep(contract, baseline, after, migration,
+                                    baselineHealth.findings + effects + planning.findings + witnesses)
+                                    .copy(replannedQueries = planning.replannedQueries, reusedQueries = planning.reusedQueries)
+                                priorSchema = after
+                                currentPlans = planning.plans
+                            }
+                        }
+                        try {
+                            configuration().locations(baselineLocation, pendingLocation).callbacks(deadline, callback).load().migrate()
+                            deadline.checkExpired()
+                        } catch (failure: Throwable) {
+                            deadline.checkExpired()
+                            throw executionFailure("MIGRATION_EXECUTION_FAILED", deadline.activeMigration, failure)
+                        }
+                    }
+                    val forward = engine.report(contract, steps, baselineHealth, options.acceptedBaseline).let { report ->
+                        if (boundaryBaseline == null) report else report.copy(limitations = report.limitations + boundaryBaseline.summary +
+                            boundaryBaseline.skipped.entries.groupBy { it.value }.map { (reason, entries) ->
+                                "Boundary execution skipped ${entries.size} INSERT templates: $reason"
+                            }.sorted())
+                    }
+                    val reverse = newContract?.let { next ->
+                        val finalSchema: SchemaSnapshot
+                        val finalPlans: Map<String, QueryPlan>
+                        DriverManager.getConnection(database.jdbcUrl, database.username, database.password).use { connection ->
+                            finalSchema = catalog.inspect(connection)
+                            finalPlans = planner.inspectAll(connection, next.queries)
+                        }
+                        val finalHealth = engine.inspectBaseline(next, finalSchema,
+                            planner.baselineFindings(next.queries, finalPlans), "new-application-final-schema:$cacheKey")
+                        val queryPart = database.jdbcUrl.substringAfter('?', "")
+                        val oldUrl = database.jdbcUrl.substringBefore('?').substringBeforeLast('/') + "/epoch_rollback" +
+                            if (queryPart.isNotEmpty()) "?$queryPart" else ""
+                        val reverseStep = DriverManager.getConnection(oldUrl, database.username, database.password).use { connection ->
+                            val migration = MigrationInfo("rollback", "<old-schema>")
+                            val planning = planner.planStep(connection, next.queries, finalPlans, migration, finalSchema, baseline)
+                            engine.verifyStep(next, finalSchema, baseline, migration, finalHealth.findings + planning.findings)
+                                .copy(replannedQueries = planning.replannedQueries, reusedQueries = planning.reusedQueries)
+                        }
+                        engine.report(next, listOf(reverseStep), finalHealth).let {
+                            it.copy(limitations = it.limitations + "New-on-old verifies the new contract against the retained original schema; it does not execute or prove down-migration behavior." +
+                                if (options.executeBoundaries) listOf("Optional boundary execution applies only to old-on-new verification; reverse compatibility uses catalog and SQL planning evidence.") else emptyList())
+                        }
+                    }
+                    forward to reverse
+                }
+        }
+    }
+
+    private fun validateContracts(contracts: List<DatabaseContract>) {
         require(contracts.isNotEmpty()) { "At least one database contract is required" }
         contracts.forEach { contract ->
             require(contract.schemaVersion == 1) { "Unsupported contract schemaVersion: ${contract.schemaVersion}" }
             require(contract.dialect == "PostgreSQL") { "Only PostgreSQL contracts are supported" }
             require(contract.queries.map { it.id }.distinct().size == contract.queries.size) { "Query IDs must be unique within each contract" }
         }
-        require(Files.isDirectory(baselineDirectory)) { "Baseline migration directory does not exist: $baselineDirectory" }
-        require(Files.isDirectory(migrationsDirectory)) { "Pending migration directory does not exist: $migrationsDirectory" }
-        validateDirectoryIsolation(baselineDirectory, migrationsDirectory, options.baselineCache)
-        val contract = mergeContracts(contracts)
-        val baselineCallbacks = callbackFiles(baselineDirectory)
-        val pendingCallbacks = callbackFiles(migrationsDirectory)
+    }
 
-        PostgreSQLContainer(DockerImageName.parse(POSTGRES_IMAGE))
-            .withDatabaseName("epoch")
-            .withUsername("epoch")
-            .withPassword("epoch-isolated-test-only")
-            .use { database ->
-                try { database.start() }
-                catch (failure: Throwable) {
-                    throw IllegalStateException("Cannot start isolated PostgreSQL. Docker must be available with images $POSTGRES_IMAGE and $RYUK_IMAGE. See the underlying cause; TESTCONTAINERS_RYUK_DISABLED=true is supported when your CI manages container cleanup.", failure)
-                }
-                val baselineLocation = "filesystem:${baselineDirectory.toAbsolutePath()}"
-                val pendingLocation = "filesystem:${migrationsDirectory.toAbsolutePath()}"
-                fun configuration() = Flyway.configure()
-                    .dataSource(database.jdbcUrl, database.username, database.password)
-                    .cleanDisabled(true)
-                    .validateMigrationNaming(true)
-                    .validateOnMigrate(true)
-                    .placeholderReplacement(false)
-                    .skipDefaultCallbacks(true)
-
-                val cache = BaselineCache(options.baselineCache)
-                val cacheKey = cache.key(baselineDirectory, database.containerInfo.imageId)
-                val cacheStatus = cache.prepare(database, cacheKey) {
-                    // Flyway owns migration ordering, checksums, version validation, and execution.
-                    configuration().locations(baselineLocation).load().migrate()
-                }
-                // Restore retains Flyway's history; still validate the exact current baseline files.
-                configuration().locations(baselineLocation).load().validate()
-                val catalog = PostgresCatalog()
-                val planner = PostgresQueryPlanner()
-                val engine = CompatibilityEngine()
-                val baseline: SchemaSnapshot
-                val baselinePlans: Map<String, QueryPlan>
-                DriverManager.getConnection(database.jdbcUrl, database.username, database.password).use { connection ->
-                    baseline = catalog.inspect(connection)
-                    baselinePlans = contract.queries.associate { it.id to planner.inspect(connection, it) }
-                }
-                val baselineFindings = planner.baselineFindings(contract.queries, baselinePlans) +
-                    baselineCallbacks.map { callbackFinding(it, null) }
-                val baselineHealth = engine.inspectBaseline(contract, baseline, baselineFindings, cacheKey)
-                    .copy(cacheStatus = cacheStatus, cacheKey = cacheKey)
-                val steps = pendingCallbacks.map { filename ->
-                    val migration = MigrationInfo("callback", filename)
-                    MigrationReport(migration, Verdict.UNKNOWN, listOf(callbackFinding(filename, migration)))
-                }.toMutableList()
-                var activeMigration: MigrationInfo? = null
-                val callback = object : Callback {
-                    override fun getCallbackName() = "epoch-intermediate-schema-verification"
-                    override fun supports(event: Event, context: Context?) = event in setOf(Event.BEFORE_EACH_MIGRATE, Event.AFTER_EACH_MIGRATE)
-                    override fun canHandleInTransaction(event: Event, context: Context?) = true
-                    override fun handle(event: Event, context: Context) {
-                        val info = context.migrationInfo
-                        val migration = MigrationInfo(info.version?.toString() ?: "repeatable", info.script)
-                        activeMigration = migration
-                        if (event != Event.AFTER_EACH_MIGRATE) return
-                        val effects = try {
-                            MigrationClassifier().findings(Files.readString(Path.of(info.physicalLocation)), migration)
-                        } catch (exception: Exception) {
-                            listOf(Finding(Verdict.UNKNOWN, "MIGRATION_EFFECTS_UNAVAILABLE", migration.filename,
-                                "Could not read the exact migration resource for effect classification.",
-                                exception.javaClass.simpleName, migration = migration))
-                        }
-                        val after = catalog.inspect(context.connection)
-                        val plans = planner.findings(context.connection, contract.queries, baselinePlans, migration)
-                        // Retain invalid-baseline IDs for rule protections; report removes their
-                        // duplicated findings from the pending-migration section afterward.
-                        steps += engine.verifyStep(contract, baseline, after, migration,
-                            baselineHealth.findings + effects + plans)
-                    }
-                }
-                try {
-                    configuration().locations(baselineLocation, pendingLocation).callbacks(callback).load().migrate()
-                } catch (exception: FlywayException) {
-                    val failed = activeMigration ?: MigrationInfo("unresolved", "Flyway validation")
-                    steps += MigrationReport(failed, Verdict.UNKNOWN, listOf(Finding(
-                        Verdict.UNKNOWN, "MIGRATION_EXECUTION_FAILED", failed.filename,
-                        "Flyway could not complete migration execution or validation in the isolated database.",
-                        causeMessages(exception), migration = failed,
-                        mitigation = "Correct the migration/Flyway validation error and rerun verification.",
-                    )))
-                }
-                return engine.report(contract, steps, baselineHealth, options.acceptedBaseline)
-            }
+    private fun executionFailure(stage: String, migration: MigrationInfo?, failure: Throwable): VerificationException {
+        if (failure is VerificationException) return failure
+        val location = migration?.let { " ${it.version} ${it.filename}" }.orEmpty()
+        val timedOut = generateSequence(failure) { it.cause }.take(20).filterIsInstance<SQLException>()
+            .any { it.sqlState == "57014" && it.message.orEmpty().contains("timeout", ignoreCase = true) }
+        val effectiveStage = if (timedOut) "MIGRATION_TIMEOUT" else stage
+        return VerificationException(effectiveStage, migration,
+            "$effectiveStage$location: verification did not complete. ${causeMessages(failure)}", failure)
     }
 
     private fun validateDirectoryIsolation(baselineDirectory: Path, migrationsDirectory: Path, cacheDirectory: Path?) {
@@ -169,8 +265,9 @@ class PostgresVerifier {
             val prefix = "contract[${index + 1}]/"
             item.copy(
                 entities = item.entities.map { it.copy(id = prefix + it.id) },
-                queries = item.queries.map { it.copy(id = prefix + it.id) },
+                queries = item.queries.map { it.copy(id = prefix + it.id, accessPathIds = it.accessPathIds.map { path -> prefix + path }) },
                 unresolvedQueries = item.unresolvedQueries.map { it.copy(id = prefix + it.id) },
+                accessPaths = item.accessPaths.map { it.copy(id = prefix + it.id, queryIds = it.queryIds.map { query -> prefix + query }) },
             )
         }
         return DatabaseContract(
@@ -187,6 +284,7 @@ class PostgresVerifier {
                 },
             ),
             unresolvedQueries = prefixed.flatMap { it.unresolvedQueries },
+            accessPaths = prefixed.flatMap { it.accessPaths },
         )
     }
 

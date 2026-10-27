@@ -19,6 +19,8 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
+internal data class CachePreparation(val status: String, val reason: String? = null)
+
 /** Cache only the fully migrated baseline, never a database touched by pending migrations.
  * Every restore targets a fresh database owned by the current verification container.
  */
@@ -29,7 +31,7 @@ internal class BaselineCache(private val directory: Path?) {
             digest.update(ByteBuffer.allocate(8).putLong(bytes.size.toLong()).array())
             digest.update(bytes)
         }
-        field("epoch-baseline-cache-v1;flyway=11.8.2;postgres=${PostgresVerifier.POSTGRES_IMAGE};image=$imageIdentity;placeholders=false;callbacks=false;encoding=UTF-8".toByteArray())
+        field("epoch-baseline-cache-v2;transactionalLock=false;flyway=11.8.2;postgres=${PostgresVerifier.POSTGRES_IMAGE};image=$imageIdentity;placeholders=false;callbacks=false;encoding=UTF-8".toByteArray())
         Files.walk(baselineDirectory).use { paths ->
             paths.filter { Files.isRegularFile(it) }.sorted().forEach { path ->
                 field(baselineDirectory.relativize(path).toString().replace('\\', '/').toByteArray())
@@ -39,8 +41,8 @@ internal class BaselineCache(private val directory: Path?) {
         return digest.digest().hex()
     }
 
-    fun prepare(database: PostgreSQLContainer, key: String, migrateBaseline: () -> Unit): String {
-        val directory = directory ?: run { migrateBaseline(); return "DISABLED" }
+    fun prepare(database: PostgreSQLContainer, key: String, migrateBaseline: () -> Unit): CachePreparation {
+        val directory = directory ?: run { migrateBaseline(); return CachePreparation("DISABLED") }
         Files.createDirectories(directory)
         val root = directory.toRealPath()
         val lockPath = root.resolve("$key.lock")
@@ -54,13 +56,27 @@ internal class BaselineCache(private val directory: Path?) {
                     val hadEntry = Files.exists(dump) || Files.exists(checksum) || Files.exists(schemaChecksum)
                     val expectedArchive = checksumValue(checksum)
                     val expectedSchema = checksumValue(schemaChecksum)
-                    val valid = Files.isRegularFile(dump) && expectedArchive != null && expectedSchema != null &&
-                        sha256(dump) == expectedArchive
+                    val actualArchive = if (Files.isRegularFile(dump)) sha256(dump) else null
+                    var reason = when {
+                        !hadEntry -> "No baseline archive exists for this migration/configuration/image fingerprint."
+                        !Files.isRegularFile(dump) -> "Cached dump is missing or is not a regular file."
+                        expectedArchive == null -> "Cached archive checksum is missing or malformed."
+                        expectedSchema == null -> "Cached schema checksum is missing or malformed."
+                        actualArchive != expectedArchive -> "Cached archive checksum mismatch; the archive is incomplete or corrupted."
+                        else -> null
+                    }
+                    val valid = reason == null
                     if (valid) {
                         database.copyFileToContainer(MountableFile.forHostPath(dump), CONTAINER_DUMP)
                         val restored = database.execInContainer("pg_restore", "--exit-on-error",
                             "--username", database.username, "--dbname", database.databaseName, CONTAINER_DUMP)
-                        if (restored.exitCode == 0 && schemaDigest(database) == expectedSchema) return@withLock "HIT"
+                        val actualSchema = if (restored.exitCode == 0) schemaDigest(database) else null
+                        if (restored.exitCode == 0 && actualSchema == expectedSchema) return@withLock CachePreparation("HIT")
+                        reason = if (restored.exitCode != 0) {
+                            "pg_restore rejected the cached archive (exit ${restored.exitCode}): ${restored.stderr.trim().take(2000)}"
+                        } else {
+                            "Restored catalog fingerprint differs from the saved baseline (expected=$expectedSchema; actual=$actualSchema)."
+                        }
                         // An authenticated but unusable archive may have partially restored objects.
                         // Recreate only this verifier-owned database before rebuilding it.
                         command(database, "dropdb", "--force", "--username", database.username, database.databaseName)
@@ -84,7 +100,7 @@ internal class BaselineCache(private val directory: Path?) {
                         Files.deleteIfExists(temporaryChecksum)
                         Files.deleteIfExists(temporarySchemaChecksum)
                     }
-                    if (hadEntry) "REBUILT" else "MISS"
+                    CachePreparation(if (hadEntry) "REBUILT" else "MISS", reason)
                 }
             }
         }

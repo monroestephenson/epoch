@@ -1,3 +1,5 @@
+> Historical record for the first feedback revision. For current Hibernate 7 support, repository discovery, and verification changes, see [verification refinements](feedback-round2.md) and [repository coverage](repository-coverage.md).
+
 # Feedback changes and remaining boundaries
 
 This table maps the reported issues to the implementation and documents the limits that still apply. It is not a claim that every real-application mapping or migration is supported.

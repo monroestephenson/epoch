@@ -17,14 +17,14 @@ import java.util.concurrent.Callable
 import kotlin.system.exitProcess
 
 // Laziness keeps linkage/initialization failures inside runCli's Throwable boundary.
-private val json by lazy { jacksonObjectMapper().enable(SerializationFeature.INDENT_OUTPUT) }
+internal val json by lazy { jacksonObjectMapper().enable(SerializationFeature.INDENT_OUTPUT) }
 
-@Command(name = "db-compat", mixinStandardHelpOptions = true, version = ["epoch 0.2.0-SNAPSHOT"],
+@Command(name = "db-compat", mixinStandardHelpOptions = true, version = ["epoch 0.3.0-SNAPSHOT"],
     description = ["Deterministic PostgreSQL compatibility checks for an explicit Hibernate SQL contract."],
-    subcommands = [Extract::class, Verify::class, Report::class])
+    subcommands = [Extract::class, Verify::class, VerifyRelease::class, Report::class, Lint::class])
 class Main : Runnable {
     @Option(names = ["-v", "--verbose"], scope = CommandLine.ScopeType.INHERIT,
-        description = ["Enable library INFO logs and full error stack traces (default: warnings/errors only)"])
+        description = ["Enable library INFO logs and full error stack traces (default: quiet libraries, concise failures)"])
     var verbose = false
     override fun run() { CommandLine(this).usage(System.out) }
 }
@@ -39,16 +39,22 @@ class Extract : Callable<Int> {
     lateinit var output: Path
     @Option(names = ["--keep-going"], description = ["Record failed mapping groups as unresolved and continue independent groups"])
     var keepGoing = false
+    @Option(names = ["--runtime-sql"], description = ["Captured SqlCollector JSONL input; repeat to merge test observations"])
+    var runtimeSqlPaths: List<Path> = emptyList()
 
     override fun call(): Int {
         val request: ExtractionRequest = json.readValue(descriptor.toFile())
         val base = descriptor.toAbsolutePath().parent
         val resolved = request.copy(classpath = request.classpath.map { base.resolve(it).normalize().toString() },
-            keepGoing = keepGoing || request.keepGoing)
+            keepGoing = keepGoing || request.keepGoing,
+            runtimeSqlFiles = request.runtimeSqlFiles.map { base.resolve(it).normalize().toString() } +
+                runtimeSqlPaths.map { it.toAbsolutePath().normalize().toString() })
         val contract = HibernateExtractor().extract(resolved)
         writeJson(output, contract)
+        contract.coverage.notes.filter { it.startsWith("Warning:") }.forEach(System.err::println)
         println("Extracted ${contract.entities.size} entity mappings and ${contract.queries.size} SQL templates to $output")
         println("Scope: ${contract.scope}; unresolved sources: ${contract.unresolvedQueries.size}")
+        println(renderCoverage(contract))
         println("Entity discovery does not establish whole-application coverage.")
         return 0
     }
@@ -74,14 +80,38 @@ class Verify : Callable<Int> {
     var baselineCache: Path? = null
     @Option(names = ["--details"], description = ["Print every finding; default output groups rules and limits detail"])
     var details = false
+    @Option(names = ["--new-contract"], description = ["New application contract; repeat to additionally check new application on old schema"])
+    var newContractPaths: List<Path> = emptyList()
+    @Option(names = ["--migration-timeout-seconds"], defaultValue = "120", description = ["Maximum seconds per migration (default: 120)"])
+    var migrationTimeoutSeconds: Long = 120
+    @Option(names = ["--global-timeout-seconds"], defaultValue = "1800", description = ["Maximum seconds for verification (default: 1800)"])
+    var globalTimeoutSeconds: Long = 1800
+    @Option(names = ["--sarif"], description = ["Optional SARIF 2.1.0 output for CI code scanning"])
+    var sarifPath: Path? = null
+    @Option(names = ["--migration-source-prefix"], description = ["Repository-relative path prepended to migration filenames in SARIF"])
+    var migrationSourcePrefix = ""
+    @Option(names = ["--execute-boundaries"], description = ["Try supported rolled-back INSERT boundary witnesses; successful samples never prove SAFE"])
+    var executeBoundaries = false
 
     override fun call(): Int {
         val contracts = contractPaths.map { json.readValue<DatabaseContract>(it.toFile()) }
         require(Files.isDirectory(baseline)) { "Baseline directory does not exist: $baseline" }
         require(Files.isDirectory(migrations)) { "Migration directory does not exist: $migrations" }
         val accepted = acceptedBaseline?.let { json.readValue<AcceptedBaseline>(it.toFile()) }
-        val report = PostgresVerifier().verify(contracts, baseline, migrations, VerificationOptions(baselineCache, accepted))
+        val options = VerificationOptions(baselineCache, accepted, migrationTimeoutSeconds, globalTimeoutSeconds, executeBoundaries)
+        val verifier = PostgresVerifier()
+        if (newContractPaths.isNotEmpty()) {
+            val newContracts = newContractPaths.map { json.readValue<DatabaseContract>(it.toFile()) }
+            val report = verifier.verifyBidirectional(contracts, newContracts, baseline, migrations, options)
+            writeJson(reportPath, report)
+            val directions = listOf("old-on-new" to report.oldOnNew, "new-on-old" to report.newOnOld)
+            sarifPath?.let { writeJson(it, sarifReport(directions, migrationSourcePrefix)) }
+            directions.forEach { (name, result) -> println("Direction: $name\n${renderReport(result, allDetails = details)}") }
+            return exitCode(CompatibilityEngine.aggregate(directions.map { it.second.gateVerdict ?: it.second.verdict }))
+        }
+        val report = verifier.verify(contracts, baseline, migrations, options)
         writeJson(reportPath, report)
+        sarifPath?.let { writeJson(it, sarifReport(listOf("old-on-new" to report), migrationSourcePrefix)) }
         println(renderReport(report, allDetails = details))
         return exitCode(report.gateVerdict ?: report.verdict)
     }
@@ -100,12 +130,33 @@ class Report : Callable<Int> {
     var acceptedOutput: Path? = null
     @Option(names = ["--justification"], description = ["Required nonempty explanation when writing a baseline acceptance file"])
     var justification: String? = null
+    @Option(names = ["--sarif"], description = ["Write SARIF 2.1.0 findings from this saved report"])
+    var sarifPath: Path? = null
+    @Option(names = ["--migration-source-prefix"], description = ["Repository-relative migration path for SARIF locations"])
+    var migrationSourcePrefix = ""
 
     override fun call(): Int {
         require(!(summaryOnly && details)) { "Choose either --summary or --details" }
-        val report: CompatibilityReport = json.readValue(input.toFile())
+        val tree = json.readTree(input.toFile())
+        require(tree.path("schemaVersion").asInt(-1) == 1) { "Unsupported report schemaVersion: ${tree.path("schemaVersion")}" }
+        val payload = tree.get("verification") ?: tree
+        require(payload.path("schemaVersion").asInt(-1) == 1) { "Unsupported verification schemaVersion: ${payload.path("schemaVersion")}" }
+        val sourcePrefix = migrationSourcePrefix.ifEmpty { tree.path("release").path("migrationPath").asText("") }
+        if (payload.has("oldOnNew")) {
+            require(acceptedOutput == null && justification == null) { "Export baseline acceptance from a single-direction report" }
+            val directions = listOf("old-on-new" to json.treeToValue(payload.get("oldOnNew"), CompatibilityReport::class.java),
+                "new-on-old" to json.treeToValue(payload.get("newOnOld"), CompatibilityReport::class.java))
+            directions.forEach { (name, result) ->
+                require(result.schemaVersion == 1) { "Unsupported report schemaVersion: ${result.schemaVersion}" }
+                println("Direction: $name\n${renderReport(result, summaryOnly, details)}")
+            }
+            sarifPath?.let { writeJson(it, sarifReport(directions, sourcePrefix)) }
+            return exitCode(CompatibilityEngine.aggregate(directions.map { it.second.gateVerdict ?: it.second.verdict }))
+        }
+        val report = json.treeToValue(payload, CompatibilityReport::class.java)
         require(report.schemaVersion == 1) { "Unsupported report schemaVersion: ${report.schemaVersion}" }
         println(renderReport(report, summaryOnly, details))
+        sarifPath?.let { writeJson(it, sarifReport(listOf("old-on-new" to report), sourcePrefix)) }
         acceptedOutput?.let {
             writeJson(it, BaselineAcceptance.fromReport(report, requireNotNull(justification) {
                 "--justification is required with --write-accepted-baseline"
@@ -118,7 +169,7 @@ class Report : Callable<Int> {
     }
 }
 
-private fun writeJson(path: Path, value: Any) {
+internal fun writeJson(path: Path, value: Any) {
     path.toAbsolutePath().parent?.let(Files::createDirectories)
     json.writeValue(path.toFile(), value)
 }
@@ -133,9 +184,12 @@ fun renderReport(report: CompatibilityReport, summaryOnly: Boolean = false, allD
     appendLine("Database Compatibility Report")
     appendLine("Application: ${report.applicationVersion}")
     appendLine("Scope: ${report.scope}")
+    if (report.accessPaths.isNotEmpty()) appendLine(renderCoverage(report.accessPaths, details = allDetails,
+        maxClasses = if (allDetails) Int.MAX_VALUE else 20))
     report.baseline?.let { baseline ->
         appendLine("Baseline health: ${baseline.verdict} (${baseline.findings.size} findings)")
         baseline.cacheStatus?.let { appendLine("Baseline cache: $it") }
+        baseline.cacheReason?.let { appendLine("Baseline cache reason: $it") }
         if (report.acceptedBaseline.isNotEmpty()) appendLine("Accepted baseline findings: ${report.acceptedBaseline.size} (justifications retained in JSON)")
     }
     val ruleRows = report.ruleSummary.ifEmpty {
@@ -149,7 +203,7 @@ fun renderReport(report: CompatibilityReport, summaryOnly: Boolean = false, allD
     }
     if (ruleRows.isNotEmpty()) {
         appendLine("Rule summary (baseline / migrations / accepted baseline):")
-        ruleRows.forEach { row ->
+        ruleRows.sortedWith(compareBy({ severity(it.verdict) }, { it.ruleId })).forEach { row ->
             appendLine("  ${row.verdict} ${row.ruleId}: ${row.baselineCount} / ${row.migrationCount} / ${row.acceptedBaselineCount}")
         }
     }
@@ -161,18 +215,19 @@ fun renderReport(report: CompatibilityReport, summaryOnly: Boolean = false, allD
         appendLine("  ${f.verdict} [${f.ruleId}] ${f.objectName}: ${f.message}")
         if (f.affectedContractIds.isNotEmpty()) appendLine("    Affected: ${f.affectedContractIds.joinToString()}")
         appendLine("    Evidence: ${f.evidence}")
-        f.mitigation?.let { appendLine("    Mitigation: $it") }
+        if (f.verdict == Verdict.UNKNOWN) appendLine("    Next evidence: ${f.mitigation ?: unknownEvidence(f)}")
+        else f.mitigation?.let { appendLine("    Mitigation: $it") }
     }
     // Prioritize migration detail so a large baseline cannot bury new findings.
-    for (step in report.migrations) {
+    for (step in report.migrations.sortedBy { severity(it.verdict) }) {
         appendLine()
         appendLine("${step.migration.version} ${step.migration.filename}: ${step.verdict} (${step.findings.size} findings)")
-        step.findings.forEach(::finding)
+        step.findings.sortedBy { severity(it.verdict) }.forEach(::finding)
     }
     report.baseline?.takeIf { it.findings.isNotEmpty() }?.let {
         appendLine()
         appendLine("Baseline findings (predate pending migrations):")
-        it.findings.forEach(::finding)
+        it.findings.sortedBy { f -> severity(f.verdict) }.forEach(::finding)
     }
     if (omitted > 0 && !summaryOnly) appendLine("$omitted findings omitted from terminal output; use report --details or inspect JSON.")
     appendLine()
@@ -186,7 +241,9 @@ fun runCli(args: Array<String>, commandFactory: () -> CommandLine = { CommandLin
     val verbose = args.any { it == "--verbose" || it == "-v" }
     return try {
         System.setProperty("org.jboss.logging.provider", "slf4j")
-        System.setProperty("org.slf4j.simpleLogger.defaultLogLevel", if (verbose) "info" else "warn")
+        // The command owns concise diagnostics. Library errors often include full traces and
+        // Flyway logs PostgreSQL NOTICE as WARN, so opt into library output only with --verbose.
+        System.setProperty("org.slf4j.simpleLogger.defaultLogLevel", if (verbose) "info" else "off")
         val command = commandFactory()
         command.setExecutionExceptionHandler { error, _, _ -> printFailure(error, verbose); 3 }
         fun configure(cli: CommandLine) {

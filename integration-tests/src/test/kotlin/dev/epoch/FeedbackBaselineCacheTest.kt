@@ -22,7 +22,15 @@ class FeedbackBaselineCacheTest {
         val cache = directory.resolve("cache")
         val options = VerificationOptions(baselineCache = cache)
         fun writeBaseline(email: String) {
-            baselineFile.writeText(PostgresCompatibilityTest.BASELINE + "\nINSERT INTO customers (id, email) VALUES (1, '$email');\n")
+            // pg_dump/restore compacts attnum gaps. Logical visible column order must
+            // produce the same catalog fingerprint after restoring real migration history.
+            baselineFile.writeText(PostgresCompatibilityTest.BASELINE + """
+
+                ALTER TABLE audit_log ADD COLUMN historical_gap text;
+                ALTER TABLE audit_log ADD COLUMN preserved text;
+                ALTER TABLE audit_log DROP COLUMN historical_gap;
+                INSERT INTO customers (id, email) VALUES (1, '$email');
+            """.trimIndent())
         }
         fun pending(name: String, sql: String) = directory.resolve(name).createDirectories().also {
             it.resolve("V2__pending.sql").writeText(sql)
@@ -74,6 +82,7 @@ class FeedbackBaselineCacheTest {
             pending("rebuilt", ensureSeed("new@example.test")), options)
         assertHealthyExecution(rebuilt)
         assertEquals("REBUILT", requireNotNull(rebuilt.baseline).cacheStatus)
+        assertFalse(requireNotNull(rebuilt.baseline).cacheReason.isNullOrBlank(), "Cache rebuild must explain its cause")
         assertEquals(changedHealth.cacheKey, requireNotNull(rebuilt.baseline).cacheKey)
         assertTrue(Files.size(archive) > 100)
     }

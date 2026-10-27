@@ -6,8 +6,10 @@ import java.lang.reflect.*
 /** Bounded divide-and-conquer over complete association/inheritance components. */
 internal object BootstrapRecovery {
     fun recover(classes: List<Class<*>>, request: ExtractionRequest, initialFailure: Throwable,
-                bootstrap: (List<Class<*>>) -> DatabaseContract): DatabaseContract {
+                bootstrap: (List<Class<*>>) -> DatabaseContract,
+                bootstrapPruned: ((List<Class<*>>, Map<String, Set<String>>) -> DatabaseContract)? = null): DatabaseContract {
         rethrowFatal(initialFailure)
+        if (bootstrapPruned != null) recoverWithinGraph(classes, initialFailure, bootstrapPruned)?.let { return it }
         val components = components(classes)
         val completed = mutableListOf<Pair<List<Class<*>>, DatabaseContract>>()
         val unresolved = mutableListOf<UnresolvedQuery>()
@@ -60,6 +62,69 @@ internal object BootstrapRecovery {
                 contracts.flatMap { it.coverage.notes }.distinct() + "Partial extraction: failed dependency components are unresolved; associations/inheritance were not pruned to manufacture completeness."),
             unresolvedQueries = allUnresolved)
     }
+
+    /** XML transient overrides apply only to this extraction bootstrap; every removed access path is unresolved. */
+    private fun recoverWithinGraph(classes: List<Class<*>>, failure: Throwable,
+                                   bootstrap: (List<Class<*>>, Map<String, Set<String>>) -> DatabaseContract): DatabaseContract? {
+        var budget = 32
+        val attempted = mutableSetOf<Set<String>>()
+        fun referencedTypes(type: Type): Set<Class<*>> = when (type) {
+            is Class<*> -> setOf(type)
+            is ParameterizedType -> type.actualTypeArguments.flatMap { referencedTypes(it) }.toSet()
+            is WildcardType -> (type.upperBounds + type.lowerBounds).flatMap { referencedTypes(it) }.toSet()
+            else -> emptySet()
+        }
+        fun prune(remaining: List<Class<*>>, removed: Set<Class<*>>): Map<String, Set<String>> {
+            val result = linkedMapOf<String, Set<String>>()
+            for (entity in remaining) {
+                val attributes = linkedSetOf<String>()
+                for (field in entity.declaredFields) if (field.annotations.any { it.annotationClass.java.name in ASSOCIATIONS } &&
+                    referencedTypes(field.genericType).any { it in removed }) attributes += field.name
+                for (method in entity.declaredMethods) if (method.parameterCount == 0 &&
+                    method.annotations.any { it.annotationClass.java.name in ASSOCIATIONS } &&
+                    referencedTypes(method.genericReturnType).any { it in removed }) {
+                    val name = method.name.removePrefix("get").removePrefix("is").replaceFirstChar { it.lowercase() }
+                    attributes += name
+                }
+                if (attributes.isNotEmpty()) result[entity.name] = attributes
+            }
+            return result
+        }
+        fun tryWithout(removed: Set<Class<*>>, previous: Throwable): DatabaseContract? {
+            if (budget <= 0 || removed.size >= classes.size || removed.size > 8) return null
+            val messages = generateSequence(previous) { it.cause }.take(12).mapNotNull { it.message }.joinToString("; ")
+            val remaining = classes.filter { it !in removed }
+            val named = remaining.filter { messages.contains(it.name) }.sortedBy { it.name }
+            val candidates = named.ifEmpty { if (removed.isEmpty()) remaining.sortedBy { it.name } else emptyList() }
+            for (candidate in candidates) {
+                if (budget-- <= 0) break
+                // Inheritance cannot be detached safely by making an association transient.
+                val omitted = removed + classes.filter { candidate.isAssignableFrom(it) }
+                if (!attempted.add(omitted.map { it.name }.toSet())) continue
+                val retained = classes.filter { it !in omitted }
+                if (retained.isEmpty()) continue
+                try {
+                    val associations = prune(retained, omitted)
+                    val contract = bootstrap(retained, associations)
+                    val issues = omitted.sortedBy { it.name }.map { UnresolvedQuery(it.name,
+                        "Entity excluded after failed bootstrap: ${describe(previous)}") } +
+                        associations.toSortedMap().flatMap { (owner, properties) -> properties.sorted().map { property ->
+                            UnresolvedQuery("$owner.$property", "Association to an excluded entity was omitted only in partial extraction; its SQL and behavior remain unresolved")
+                        } }
+                    return contract.copy(coverage = contract.coverage.copy(complete = false,
+                        notes = contract.coverage.notes + "Partial graph extraction: excluded entities and association XML overrides are explicitly unresolved; original application classes were not modified."),
+                        unresolvedQueries = (contract.unresolvedQueries + issues).distinct().sortedWith(compareBy({ it.id }, { it.reason })))
+                } catch (next: Throwable) {
+                    rethrowFatal(next)
+                    tryWithout(omitted, next)?.let { return it }
+                }
+            }
+            return null
+        }
+        return tryWithout(emptySet(), failure)
+    }
+
+    private val ASSOCIATIONS = setOf("jakarta.persistence.ManyToOne", "jakarta.persistence.OneToOne", "jakarta.persistence.OneToMany", "jakarta.persistence.ManyToMany")
 
     private fun components(classes: List<Class<*>>): List<List<Class<*>>> {
         val byName = classes.associateBy { it.name }

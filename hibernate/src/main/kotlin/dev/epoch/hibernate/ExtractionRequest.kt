@@ -19,6 +19,12 @@ data class ExtractionRequest(
     val entityOverrides: Map<String, EntityOverride> = emptyMap(),
     /** Ordered JDBC placeholder types, keyed by named-query name or nativeQueries entry ID. */
     val nativeQueryParameterTypes: Map<String, List<String>> = emptyMap(),
+    /** Optional scope for bytecode repository/query discovery; empty scans the supplied application classpath. */
+    val repositoryPackages: List<String> = emptyList(),
+    /** Disable only for an intentionally limited entity/descriptor contract. */
+    val discoverRepositories: Boolean = true,
+    /** JSONL files written by SqlCollector during application integration tests. */
+    val runtimeSqlFiles: List<String> = emptyList(),
 )
 
 data class EntityOverride(

@@ -2,6 +2,7 @@
   "applicationVersion": "hibernate-fixture-1.0",
   "entityClasses": ["dev.epoch.fixtures.PlainCustomer"],
   "classpath": ["../integration-tests/build/classes/kotlin/test"],
+  "discoverRepositories": false,
   "hqlQueries": {
     "PlainCustomer.byEmail": "select c from PlainCustomer c where c.email = :email"
   },

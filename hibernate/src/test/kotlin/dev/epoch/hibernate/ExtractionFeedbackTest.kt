@@ -20,7 +20,7 @@ class ExtractionFeedbackTest {
     @TempDir lateinit var directory: Path
 
     @Test fun `joined inheritance does not declare synthetic discriminator as a physical column`() {
-        val contract = HibernateExtractor().extract(ExtractionRequest(listOf(JoinedParent::class.java.name, JoinedChild::class.java.name)))
+        val contract = HibernateExtractor().extract(ExtractionRequest(listOf(JoinedParent::class.java.name, JoinedChild::class.java.name), discoverRepositories = false))
         assertTrue(contract.entities.isNotEmpty())
         assertFalse(contract.entities.any { entity -> entity.columns.any { it.name.contains("discriminator") || it.name.startsWith("{") } }, contract.toString())
         assertTrue(contract.entities.any { it.table == "public.joined_parent" })
@@ -28,7 +28,7 @@ class ExtractionFeedbackTest {
     }
 
     @Test fun `real formula remains unresolved but never becomes a physical column`() {
-        val contract = HibernateExtractor().extract(ExtractionRequest(listOf(FormulaProjection::class.java.name)))
+        val contract = HibernateExtractor().extract(ExtractionRequest(listOf(FormulaProjection::class.java.name), discoverRepositories = false))
         assertFalse(contract.entities.flatMap { it.columns }.any { it.name.contains("length") })
         assertTrue(contract.unresolvedQueries.any { it.reason.contains("Formula dependency") }, contract.toString())
     }
@@ -45,7 +45,7 @@ class ExtractionFeedbackTest {
             output.closeEntry()
         }
         val failure = assertFailsWith<IllegalArgumentException> {
-            HibernateExtractor().extract(ExtractionRequest(listOf("missing.ApplicationEntity"), classpath = listOf(jar.toString())))
+            HibernateExtractor().extract(ExtractionRequest(listOf("missing.ApplicationEntity"), classpath = listOf(jar.toString()), discoverRepositories = false))
         }
         assertTrue(failure.message!!.contains("7.0.0.Final"))
         assertTrue(failure.message!!.contains("6.6.13.Final"))
@@ -55,18 +55,18 @@ class ExtractionFeedbackTest {
     @Test fun `validation is disabled even when application requests callbacks`() {
         // No Bean Validation provider is installed. CALLBACK would fail bootstrap without the forced NONE setting.
         val contract = HibernateExtractor().extract(ExtractionRequest(listOf(Customer::class.java.name),
-            hibernateProperties = mapOf("jakarta.persistence.validation.mode" to "callback")))
+            hibernateProperties = mapOf("jakarta.persistence.validation.mode" to "callback"), discoverRepositories = false))
         assertTrue(contract.coverage.complete, contract.toString())
         assertTrue(contract.coverage.notes.any { it.contains("PostgreSQL dialect version 16.8") }, contract.coverage.notes.toString())
     }
 
     @Test fun `application Hibernate settings can customize mappings without enabling connections`() {
         val contract = HibernateExtractor().extract(ExtractionRequest(listOf(Customer::class.java.name),
-            hibernateProperties = mapOf("hibernate.default_schema" to "tenant_a")))
+            hibernateProperties = mapOf("hibernate.default_schema" to "tenant_a"), discoverRepositories = false))
         assertEquals("tenant_a.customers", contract.entities.single().table)
         val error = assertFailsWith<IllegalArgumentException> {
             HibernateExtractor().extract(ExtractionRequest(listOf(Customer::class.java.name),
-                hibernateProperties = mapOf("hibernate.connection.url" to "jdbc:postgresql://invalid.example/app")))
+                hibernateProperties = mapOf("hibernate.connection.url" to "jdbc:postgresql://invalid.example/app"), discoverRepositories = false))
         }
         assertTrue(error.message!!.contains("hibernate.connection.url"))
         assertFalse(error.message!!.contains("invalid.example"))
@@ -75,7 +75,7 @@ class ExtractionFeedbackTest {
     @Test fun `directory package discovery finds compiled entities`() {
         val classes = Path.of(ScannedCustomer::class.java.protectionDomain.codeSource.location.toURI())
         val contract = HibernateExtractor().extract(ExtractionRequest(classpath = listOf(classes.toString()),
-            scanPackages = listOf("dev.epoch.scanfixture")))
+            scanPackages = listOf("dev.epoch.scanfixture"), discoverRepositories = false))
         assertEquals(listOf("public.scanned_customers"), contract.entities.map { it.table })
     }
 
@@ -94,7 +94,7 @@ class ExtractionFeedbackTest {
 
     @Test fun `keep-going retains healthy entities and records malformed components`() {
         val contract = HibernateExtractor().extract(ExtractionRequest(
-            listOf(Customer::class.java.name, MissingIdentifier::class.java.name), keepGoing = true))
+            listOf(Customer::class.java.name, MissingIdentifier::class.java.name), keepGoing = true, discoverRepositories = false))
         assertTrue(contract.entities.any { it.table == "public.customers" }, contract.toString())
         assertTrue(contract.unresolvedQueries.any { it.id == MissingIdentifier::class.java.name && it.reason.contains("bootstrap") }, contract.toString())
         assertFalse(contract.coverage.complete)
@@ -102,16 +102,16 @@ class ExtractionFeedbackTest {
 
     @Test fun `keep-going does not silently cut association dependencies`() {
         val contract = HibernateExtractor().extract(ExtractionRequest(
-            listOf(Customer::class.java.name, BrokenAssociationOwner::class.java.name, MissingIdentifier::class.java.name), keepGoing = true))
+            listOf(Customer::class.java.name, BrokenAssociationOwner::class.java.name, MissingIdentifier::class.java.name), keepGoing = true, discoverRepositories = false))
         assertTrue(contract.entities.any { it.table == "public.customers" }, contract.toString())
-        assertFalse(contract.entities.any { it.table == "public.broken_owner" }, contract.toString())
-        assertTrue(contract.unresolvedQueries.any { it.id == BrokenAssociationOwner::class.java.name })
+        assertTrue(contract.entities.any { it.table == "public.broken_owner" }, contract.toString())
+        assertTrue(contract.unresolvedQueries.any { it.id.startsWith(BrokenAssociationOwner::class.java.name) })
         assertTrue(contract.unresolvedQueries.any { it.id == MissingIdentifier::class.java.name })
     }
 
     @Test fun `immutable projections default to SELECT while overrides can explicitly enable operations`() {
         val extractor = HibernateExtractor()
-        val request = ExtractionRequest(listOf(ReadOnlyProjection::class.java.name))
+        val request = ExtractionRequest(listOf(ReadOnlyProjection::class.java.name), discoverRepositories = false)
         val readOnly = extractor.extract(request)
         assertEquals(setOf(Operation.SELECT), readOnly.entities.single().operations)
         assertEquals(setOf(Operation.SELECT), readOnly.queries.map { it.operation }.toSet())
@@ -123,7 +123,7 @@ class ExtractionFeedbackTest {
     @Test fun `result mapping only entity has no fabricated table or CRUD dependencies`() {
         val contract = HibernateExtractor().extract(ExtractionRequest(listOf(Customer::class.java.name, ResultProjection::class.java.name),
             entityOverrides = mapOf("ResultProjection" to EntityOverride(resultMappingOnly = true)),
-            nativeQueryParameterTypes = mapOf("projection.native" to listOf("bigint"))))
+            nativeQueryParameterTypes = mapOf("projection.native" to listOf("bigint")), discoverRepositories = false))
         assertFalse(contract.entities.any { it.table.contains("not_a_table") })
         assertFalse(contract.queries.any { it.source == QuerySource.HIBERNATE_MAPPING && it.id.startsWith(ResultProjection::class.java.name) })
         assertEquals(listOf("bigint"), contract.queries.single { it.id == "projection.native" }.parameterTypes)
@@ -132,7 +132,7 @@ class ExtractionFeedbackTest {
 
     @Test fun `explicit exclusion is recorded without bootstrapping the excluded class`() {
         val contract = HibernateExtractor().extract(ExtractionRequest(listOf(Customer::class.java.name, "missing.ExcludedEntity"),
-            entityOverrides = mapOf("missing.ExcludedEntity" to EntityOverride(exclude = true))))
+            entityOverrides = mapOf("missing.ExcludedEntity" to EntityOverride(exclude = true)), discoverRepositories = false))
         assertTrue(contract.coverage.complete, contract.toString())
         assertTrue(contract.coverage.notes.any { it.contains("missing.ExcludedEntity") })
     }
@@ -140,7 +140,7 @@ class ExtractionFeedbackTest {
     @Test fun `native query parameter declarations retain JDBC order`() {
         val contract = HibernateExtractor().extract(ExtractionRequest(listOf(Customer::class.java.name),
             nativeQueries = mapOf("native.lookup" to "select email_address from customers where id = :id and email_address = :email"),
-            nativeQueryParameterTypes = mapOf("native.lookup" to listOf("bigint", "text"))))
+            nativeQueryParameterTypes = mapOf("native.lookup" to listOf("bigint", "text")), discoverRepositories = false))
         val query = contract.queries.single { it.id == "native.lookup" }
         assertEquals(listOf("bigint", "text"), query.parameterTypes)
         assertTrue(query.sql.contains("?"))
@@ -148,7 +148,7 @@ class ExtractionFeedbackTest {
     }
 
     @Test fun `double and tiny integer JDBC types use PostgreSQL names`() {
-        val contract = HibernateExtractor().extract(ExtractionRequest(listOf(NumericEntity::class.java.name)))
+        val contract = HibernateExtractor().extract(ExtractionRequest(listOf(NumericEntity::class.java.name), discoverRepositories = false))
         val types = contract.queries.flatMap { it.parameterTypes }.toSet()
         assertTrue("double precision" in types, types.toString())
         assertTrue("smallint" in types, types.toString())
