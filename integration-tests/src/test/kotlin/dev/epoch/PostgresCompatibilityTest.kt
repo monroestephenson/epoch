@@ -142,8 +142,8 @@ class PostgresCompatibilityTest {
         })
         val report = verify("V2__metadata.sql" to "ALTER TABLE customers ADD COLUMN metadata text;", contract = contract)
         assertEquals(Verdict.UNKNOWN, report.verdict, report.toString())
-        assertTrue(report.migrations.single().findings.any {
-            it.ruleId == "BASELINE_SQL_UNVERIFIED" && "Customer.find" in it.affectedContractIds &&
+        assertTrue(requireNotNull(report.baseline).findings.any {
+            it.ruleId == "BASELINE_SQL_UNVERIFIED" && it.migration == null && "Customer.find" in it.affectedContractIds &&
                 it.evidence.contains("result columns")
         }, report.toString())
     }
@@ -155,8 +155,8 @@ class PostgresCompatibilityTest {
         })
         val report = verify("V2__metadata.sql" to "ALTER TABLE customers ADD COLUMN metadata text;", contract = contract)
         assertEquals(Verdict.UNKNOWN, report.verdict, report.toString())
-        assertTrue(report.migrations.single().findings.any {
-            it.ruleId == "BASELINE_SQL_UNVERIFIED" && "Customer.find" in it.affectedContractIds &&
+        assertTrue(requireNotNull(report.baseline).findings.any {
+            it.ruleId == "BASELINE_SQL_UNVERIFIED" && it.migration == null && "Customer.find" in it.affectedContractIds &&
                 it.evidence.contains("1 parameters but 0 declared")
         }, report.toString())
     }

@@ -2,39 +2,61 @@
 
 ## Extraction descriptor
 
-The `extract` command consumes an `ExtractionRequest` JSON document. It loads already compiled entity classes; it does not compile or scan an application repository.
+`extract` consumes an `ExtractionRequest` JSON document and loads already compiled application classes. It can discover annotated entities in selected packages; it does not compile the application or discover every repository/query source.
 
 ```json
 {
   "applicationVersion": "orders-1.0.0",
-  "entityClasses": ["com.example.orders.Customer"],
-  "classpath": ["../build/classes/java/main", "../build/resources/main"],
-  "hqlQueries": {
-    "Customer.byEmail": "select c from Customer c where c.email = :email"
+  "entityClasses": [],
+  "scanPackages": ["com.example.orders.entity"],
+  "classpath": ["../build/classes/kotlin/main", "../build/resources/main", "../lib/application-dependencies.jar"],
+  "hibernateProperties": {
+    "hibernate.default_schema": "public",
+    "hibernate.type.preferred_uuid_jdbc_type": "UUID"
   },
+  "entityOverrides": {
+    "com.example.orders.entity.CustomerProjection": {"operations": ["SELECT"]},
+    "com.example.orders.entity.NativeResult": {"resultMappingOnly": true},
+    "com.example.orders.entity.UnusedEntity": {"exclude": true}
+  },
+  "hqlQueries": {"Customer.byEmail": "select c from Customer c where c.email = :email"},
+  "nativeQueries": {"Customer.nativeById": "select id, email from customers where id = ?"},
+  "nativeQueryParameterTypes": {"Customer.nativeById": ["bigint"]},
   "finiteHqlVariants": {},
-  "nativeQueries": {},
-  "unresolvedDynamicQueries": {}
+  "unresolvedDynamicQueries": {},
+  "keepGoing": false
 }
 ```
 
-This descriptor is illustrative: replace the class and paths with your compiled application artifacts. Include JARs or class directories needed by the entities, embeddables, converters, and naming strategies. The CLI distribution supplies its own Hibernate version; it does not automatically reproduce all settings from a Spring or application bootstrap.
+Replace the illustrative classes and paths with your application's artifacts. Classpath entries are individual directories or JARs, resolved relative to the descriptor file. Include mapping dependencies, embeddables, converters, and naming strategies. `scanPackages` inspects class-file annotations without initializing the classes. It scans only the supplied classpath entries and combines discovered entities with explicitly listed `entityClasses`.
 
 | Field | Meaning |
 | --- | --- |
-| `entityClasses` | Required, nonempty list of fully qualified annotated entity class names. |
-| `classpath` | Additional JARs/class directories, relative to the descriptor's directory; defaults to `[]`. |
-| `applicationVersion` | Release identifier retained in the contract and report; defaults to `unspecified`. |
-| `physicalNamingStrategy` | Optional fully qualified Hibernate physical naming strategy class. |
-| `implicitNamingStrategy` | Optional fully qualified Hibernate implicit naming strategy class. |
-| `hqlQueries` | Stable query ID to a fixed HQL query. The current adapter translates SELECT HQL. |
-| `nativeQueries` | Stable query ID to native SQL retained as incomplete evidence. |
+| `entityClasses` | Fully qualified annotated entity names; defaults to `[]`. Supply classes, scan packages, or both. |
+| `scanPackages` | Package roots to scan recursively for `jakarta.persistence.Entity`; requires an explicit classpath. |
+| `classpath` | JARs/class directories, relative to the descriptor; defaults to `[]`. |
+| `applicationVersion` | Release identifier retained in the contract/report; defaults to `unspecified`. |
+| `physicalNamingStrategy`, `implicitNamingStrategy` | Optional fully qualified Hibernate naming strategy classes. |
+| `hibernateProperties` | String-to-string Hibernate settings, including type preferences and default schema. Offline safeguards override or reject connection, schema-generation, validation, and dialect settings. |
+| `entityOverrides` | Class name or JPA entity name to an operation/scope override, described below. |
+| `hqlQueries` | Stable query ID to a fixed SELECT HQL query. |
+| `nativeQueries` | Stable query ID to native SQL retained as incomplete structural evidence. |
+| `nativeQueryParameterTypes` | Query ID or registered named-native-query name to ordered PostgreSQL/JDBC parameter type names. |
 | `finiteHqlVariants` | Source ID to a finite list of fixed SELECT HQL alternatives. Exhaustiveness is the caller's assertion. |
 | `unresolvedDynamicQueries` | Source ID to the reason its query variants cannot be enumerated. |
+| `keepGoing` | Continue independent mapping groups after bootstrap failures and record failures as unresolved; defaults to `false`. The CLI's `--keep-going` enables it too. |
 
-The adapter also reads registered named HQL and native queries from Hibernate metadata. It uses PostgreSQL dialect settings and defaults the schema to `public`. It disables JDBC metadata access and schema generation during extraction. It obtains physical mappings, static mutation SQL, single-ID loader SQL, and translated HQL through Hibernate APIs.
+The adapter uses **Hibernate 6.6.13.Final**. It checks Hibernate artifacts on the supplied classpath before bootstrap and rejects a different or unidentifiable version with a clear error. It does not isolate and run Hibernate 7, and it does not silently substitute its bundled version for an incompatible supplied runtime. Include the application's actual dependencies so this check can detect a mismatch; removing an incompatible Hibernate JAR is not a compatibility fix.
 
-Extraction writes a contract even when individual query sources remain unresolved. A failed application bootstrap, missing compiled class, or invalid descriptor is a runtime error instead.
+Extraction uses the PostgreSQL **16.8** dialect, disables JDBC metadata access and schema generation, and sets `jakarta.persistence.validation.mode=none`. It obtains physical mappings, static mutation SQL, single-ID loader SQL, and translated HQL through Hibernate APIs. Registered named HQL and native queries are included. Synthetic Hibernate discriminator placeholders do not become physical columns. Formula selectables are omitted from physical dependencies and recorded as unresolved where their SQL dependencies remain unproven.
+
+## Entity overrides and partial extraction
+
+`operations` accepts a nonempty subset of `SELECT`, `INSERT`, `UPDATE`, and `DELETE`. Immutable Hibernate entities default to `SELECT`; override this explicitly if the intended contract must include other operations. Excluding an operation narrows the declared scope and is recorded in coverage notes; it is not proof that the application never performs that operation.
+
+`resultMappingOnly: true` retains a class in Hibernate bootstrap for query result mappings but omits entity CRUD and table-dependency claims. Named queries still carry their own evidence and limitations. `exclude: true` removes the class from bootstrap. Associations to an excluded entity remain errors or unresolved dependencies; Epoch does not prune them to manufacture completeness.
+
+Without `--keep-going`, a failed bootstrap or missing compiled class is a runtime failure. With it, Epoch isolates failures across association/inheritance components using a bounded retry budget. Failed components and anything left after the retry budget become unresolved entries. Successful independent groups can still produce useful SQL, but partial extraction always has incomplete coverage. A global Hibernate version mismatch still fails before bootstrap. Fatal VM failures are not treated as recoverable mapping errors.
 
 ## Contract schema version 1
 
@@ -42,48 +64,44 @@ The JSON model is defined by [`Model.kt`](../core/src/main/kotlin/dev/epoch/core
 
 | Top-level field | Meaning |
 | --- | --- |
-| `schemaVersion` | Integer format version; the CLI currently accepts `1`. |
-| `applicationVersion` | Identity of the old application release being checked. |
+| `schemaVersion` | Integer format version; currently `1`. |
+| `applicationVersion` | Identity of the old application release. |
 | `dialect` | `PostgreSQL`; other dialects are unsupported. |
-| `scope` | `STRUCTURAL_CONTRACT`. Requesting `WHOLE_APPLICATION` yields `UNKNOWN`. |
+| `scope` | `STRUCTURAL_CONTRACT`. `WHOLE_APPLICATION` remains `UNKNOWN`. |
 | `entities` | Mapped table/column dependencies and declared operations. |
 | `queries` | SQL templates with explicit dependency and type information. |
-| `coverage` | Completeness within the declared scope, extraction mechanisms, and qualifications. |
-| `unresolvedQueries` | Stable source IDs and reasons that coverage remains unresolved. |
+| `coverage` | Completeness within the declared scope, mechanisms, and qualifications. |
+| `unresolvedQueries` | Stable source IDs and reasons coverage remains unresolved. |
 
-Entity entries contain a unique `id`, a schema-qualified `table`, `columns`, and an operation set drawn from `SELECT`, `INSERT`, `UPDATE`, and `DELETE`. A column records its physical `name`, optional `typeName` and `nullable` value, and `insertable`, `updatable`, and `generated` flags. `generatedIdentifier` records a generator description when present; it does not prove allocation semantics.
+Entity entries contain a unique `id`, a schema-qualified `table`, `columns`, and an operation set. A column records its physical `name`, optional `typeName` and `nullable`, and `insertable`, `updatable`, and `generated` flags. `generatedIdentifier` records a generator description; it does not prove allocation semantics.
 
 Query entries record:
 
-- `id`, `operation`, and a `sql` template. SQL contains JDBC `?` placeholders, not captured parameter values.
-- `tables`, `columns`, and `writeColumns`, using schema-qualified table names and physical column names.
-- Optional `targetTable` identifies the write target for queries such as `INSERT ... SELECT` that also read other tables. Ambiguous write targets remain `UNKNOWN`.
-- Ordered `parameterTypes` using PostgreSQL-resolvable type names such as `bigint`, `varchar`, and `text`, plus optional `resultColumns` with names and types. The number of declared parameter types must match the number of JDBC placeholders.
+- `id`, `operation`, and `sql` with JDBC `?` placeholders rather than captured parameter values.
+- `tables`, `columns`, and `writeColumns`, using physical names. Optional `targetTable` disambiguates writes such as `INSERT ... SELECT` that also read other tables.
+- Ordered `parameterTypes` and optional `resultColumns` with labels/types. The declared parameter count must match JDBC placeholders. `DOUBLE` maps to `double precision`; `TINYINT` maps to `smallint`. PostgreSQL resolves `OTHER` from query/column context when possible, including UUID, JSON, and custom types. Ambiguous types remain `UNKNOWN` and need an explicit declaration. Inferred baseline types are frozen when checking later schemas.
 - `source`: `HIBERNATE_MAPPING`, `NAMED_HQL`, `NAMED_NATIVE`, `STATIC`, `RUNTIME_OBSERVED`, or `DYNAMIC_VARIANT`.
 - `verificationStatus`: `EXTRACTED`, `OBSERVED`, or `UNSUPPORTED`.
-- `dependenciesComplete`, `explicitColumnList`, and `exactResultShape`; these describe evidence and positional dependencies, not preferences for relaxing checks.
-- Optional `variant`, identifying a member of a declared finite query family.
+- `dependenciesComplete`, `explicitColumnList`, `exactResultShape`, and optional `variant`.
 
-Entity and query IDs must be unique across the contract. Keep IDs stable across releases to make findings traceable. Hand-authored contracts are supported, but their dependency lists and completeness assertions must accurately represent the declared operations.
+Native parameter declarations allow PostgreSQL preparation and type checking. They do **not** establish complete native-query dependencies, hydration, or behavioral equivalence; these remain unresolved. An old native statement that PostgreSQL accepts at baseline and rejects after migration can still supply concrete breaking evidence.
+
+Entity/query IDs must be unique within a contract. Keep them stable across releases. Multiple input contracts are namespaced as `contract[1]/...`, `contract[2]/...`, and so on, in input order. Their application versions and scopes are retained in coverage notes.
 
 ## What completeness means
 
-`coverage.complete` describes extraction of the **declared** contract. It does not mean every database access in the application has been found. The extractor sets it only when its declared sources have no unresolved entries. `coverage.mechanisms` records how evidence was obtained; `coverage.notes` records scope restrictions.
+`coverage.complete` applies to the **declared** contract, not every database access in the application. `coverage.mechanisms` and `coverage.notes` record how evidence was obtained and its scope. A global flag cannot override an incomplete query, observed-only evidence, unresolved source, or unsupported scope. An empty contract cannot prove compatibility.
 
-Each query's `dependenciesComplete` concerns that query's enumerated table/column dependencies. A global completeness flag cannot override an incomplete query, an observed-only query, an unresolved source, or an unsupported verification scope. An empty contract cannot produce a compatibility proof.
+Do not change completeness flags or delete unresolved entries just to obtain `SAFE`. Package scanning discovers entities; it does not discover repository methods, Criteria builders, arbitrary JDBC, or unlisted runtime query sources. Finite variants must include every relevant fixed alternative; a nonempty list does not establish that application control flow has no other variants.
 
-Do not change completeness flags or remove unresolved entries just to obtain `SAFE`. Add missing, justified evidence or accept that the answer remains `UNKNOWN`. Repository scanning, Criteria API builders, arbitrary JDBC, custom query builders, and unlisted runtime query sources are not automatically discovered.
+`dev.epoch.hibernate.SqlCollector` implements `StatementInspector`. Install it with `hibernate.session_factory.statement_inspector` in integration tests. `statements()` returns sorted distinct SQL, `queries()` creates observed incomplete entries, and `clear()` resets capture. It does not collect bind values or prove exhaustive coverage. Reports mention this limitation when the contract actually contains observed SQL.
 
-Finite HQL variants must include every relevant fixed alternative. A nonempty list alone does not prove that application control flow cannot produce other variants. Collection-valued HQL parameters, dynamic insert/update, and other variable SQL shapes can still leave the contract unresolved.
+## Report and accepted-baseline schemas
 
-## Optional SQL observations
+A report contains `schemaVersion`, `applicationVersion`, `scope`, `verdict`, `baseline`, ordered `migrations`, `ruleSummary`, and `limitations`. `baseline` contains health `verdict`, `findings`, a deterministic `fingerprint`, and optional `cacheStatus`/`cacheKey`. Baseline findings have `migration: null`; they appear once and are not attributed to pending migrations. With no pending migrations, `migrations` is empty and the overall verdict reflects baseline health.
 
-`dev.epoch.hibernate.SqlCollector` implements Hibernate's `StatementInspector`. Install it through Hibernate's `hibernate.session_factory.statement_inspector` setting in application integration tests to capture SQL templates. `statements()` returns distinct, sorted statements; `queries()` represents them as observed, incomplete contract entries. `clear()` resets the collector.
+Each migration contains its version/filename, delta verdict, and findings. Each finding has `ruleId`, `objectName`, `message`, `evidence`, `affectedContractIds`, optional migration attribution, and optional mitigation. `ruleSummary` groups counts by rule and verdict: `baselineCount`, `migrationCount`, and `acceptedBaselineCount`.
 
-The collector does not capture bind values or establish exhaustive coverage. It does not infer a complete read/write dependency contract from the observed text. Combining observations with extracted evidence cannot by itself prove that unexecuted application paths are safe.
+The overall `verdict` includes baseline health. Explicit baseline acceptance adds `gateVerdict` and `acceptedBaseline` without changing that compatibility verdict. For example, an accepted unresolved baseline may yield `verdict: UNKNOWN` and `gateVerdict: SAFE` when no new migration issue is found. This is a reviewed policy gate, not a new proof of compatibility.
 
-## Report schema
-
-The report records `schemaVersion`, `applicationVersion`, `scope`, aggregate `verdict`, ordered `migrations`, and `limitations`. Each migration contains its version/filename, verdict, and findings. A finding contains `ruleId`, `objectName`, `message`, `evidence`, `affectedContractIds`, migration attribution, and an optional mitigation.
-
-Aggregation is conservative: any `BREAKING` finding wins; otherwise any `UNKNOWN` finding wins; `SAFE` requires all evaluated findings to be safe. When no migration is pending, the database verifier emits a synthetic `baseline` step to check the contract against the unchanged schema. At the report-model level, an empty list of evaluated steps aggregates to `UNKNOWN`.
+An acceptance file has `schemaVersion: 1`, `baselineFingerprint`, and `findings`, each with a finding `fingerprint` and a required nonblank `justification`. The fingerprint binds acceptance to the contract, baseline files/settings, catalog, and baseline evidence. Stale, unknown, duplicated, or unjustified entries are rejected. Pending-migration findings cannot be accepted through this file. See [CI usage](ci.md) for the generation and review workflow.

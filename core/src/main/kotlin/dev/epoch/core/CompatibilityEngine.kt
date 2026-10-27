@@ -179,6 +179,13 @@ class CompatibilityEngine {
             val b = after.sequences[name]
             if (a != b) unknown("SEQUENCE_CHANGED", name, "Identifier sequence behavior changed.", "Baseline=$a; target=$b.")
         }
+        for (name in (baseline.extensions.keys + after.extensions.keys).sorted()) {
+            val a = baseline.extensions[name]
+            val b = after.extensions[name]
+            if (a != b) unknown("EXTENSION_CHANGED", name,
+                "Installed PostgreSQL extension or version changed; its behavior requires separate verification.",
+                "Baseline=$a; target=$b.")
+        }
         if (findings.none { it.verdict != Verdict.SAFE } && findings.isEmpty()) {
             finding(Verdict.SAFE, "STRUCTURAL_CONTRACT_PRESERVED", "contract", "The supported structural dependencies are preserved.", "All declared baseline tables and columns remain compatible under the supported catalog rules.")
         }
@@ -186,12 +193,66 @@ class CompatibilityEngine {
         return MigrationReport(migration, aggregate(stable.map { it.verdict }), stable)
     }
 
-    fun report(contract: DatabaseContract, steps: List<MigrationReport>): CompatibilityReport = CompatibilityReport(
-        applicationVersion = contract.applicationVersion,
-        scope = contract.scope,
-        verdict = if (steps.isEmpty()) Verdict.UNKNOWN else aggregate(steps.map { it.verdict }),
-        migrations = steps,
-    )
+    /** Baseline evidence is independent of any pending migration and is emitted only once. */
+    fun inspectBaseline(
+        contract: DatabaseContract,
+        snapshot: SchemaSnapshot,
+        additionalFindings: List<Finding> = emptyList(),
+        fingerprintContext: String = "",
+    ): BaselineReport {
+        val observations = additionalFindings.toMutableList()
+        if (snapshot.behaviors.isNotEmpty()) observations += Finding(
+            Verdict.UNKNOWN, "EXISTING_DATABASE_BEHAVIOR", "database",
+            "Preexisting database-side behavior may respond differently to schema changes.",
+            "Unanalyzed objects: ${snapshot.behaviors.keys.sorted().joinToString()}",
+        )
+        val findings = verifyStep(contract, snapshot, snapshot,
+            MigrationInfo("baseline", "Baseline health"), observations).findings
+            .filter { it.verdict != Verdict.SAFE }.map { it.copy(migration = null) }.distinct()
+        return BaselineReport(
+            verdict = aggregate(findings.map { it.verdict } + Verdict.SAFE),
+            findings = findings,
+            fingerprint = BaselineFingerprints.baseline(contract, snapshot, findings, fingerprintContext),
+        )
+    }
+
+    fun report(
+        contract: DatabaseContract,
+        steps: List<MigrationReport>,
+        baseline: BaselineReport? = null,
+        acceptedBaseline: AcceptedBaseline? = null,
+    ): CompatibilityReport {
+        val baselineIdentities = baseline?.findings.orEmpty().map(BaselineFingerprints::identity).toSet()
+        val invalidBaselineObjects = baseline?.findings.orEmpty()
+            .filter { it.ruleId.startsWith("INVALID_BASELINE_") }.map { it.ruleId to it.objectName }.toSet()
+        val deltas = if (baseline == null) steps else steps.map { step ->
+            val findings = step.findings.filter {
+                BaselineFingerprints.identity(it) !in baselineIdentities &&
+                    (it.ruleId to it.objectName) !in invalidBaselineObjects
+            }
+            step.copy(verdict = aggregate(findings.map { it.verdict } + Verdict.SAFE), findings = findings)
+        }
+        val verdicts = deltas.map { it.verdict } + listOfNotNull(baseline?.verdict)
+        val limitations = buildList {
+            add("SAFE is limited to the declared structural contract; it does not prove application behavior or operational migration safety.")
+            if (contract.queries.any { it.source == QuerySource.RUNTIME_OBSERVED || it.verificationStatus == VerificationStatus.OBSERVED }) {
+                add("Runtime-observed SQL does not establish exhaustive query coverage.")
+            }
+            if (baseline?.verdict != null && baseline.verdict != Verdict.SAFE) {
+                add("Migration findings exclude preexisting baseline problems; the overall verdict still includes baseline health.")
+            }
+        }
+        val report = CompatibilityReport(
+            applicationVersion = contract.applicationVersion,
+            scope = contract.scope,
+            verdict = aggregate(verdicts),
+            migrations = deltas,
+            limitations = limitations,
+            baseline = baseline,
+            ruleSummary = summarizeFindings(baseline, deltas),
+        )
+        return if (acceptedBaseline == null) report else BaselineAcceptance.apply(report, acceptedBaseline)
+    }
 
     companion object {
         private fun queryTarget(query: QueryContract): String? = query.targetTable

@@ -25,11 +25,11 @@ cli/build/install/db-compat/bin/db-compat --help
 ./gradlew :core:test :hibernate:test :cli:test
 ```
 
-The project targets Kotlin/JVM, Hibernate 6.6, Flyway 11, and PostgreSQL 16.8. See the checked-in Gradle files for exact dependency versions.
+The project targets Kotlin/JVM, Hibernate **6.6.13.Final**, Flyway 11, PostgreSQL **16.8**, and Testcontainers **2.0.5**. Extraction rejects mismatched supplied Hibernate versions before bootstrap; Hibernate 7 extraction is not implemented. The required container images are `postgres:16.8` and `testcontainers/ryuk:0.14.0`.
 
 ## Check an old application release
 
-Build the **old** application's entity classes first. Supply those compiled classes and their mapping dependencies to an extraction descriptor. Classpath entries are directories or JARs, resolved relative to the descriptor file.
+Build the **old** application's entity classes first. Supply those compiled classes and their mapping dependencies to an extraction descriptor. Classpath entries are directories or JARs, resolved relative to the descriptor file. Use `scanPackages` to discover entities in compiled artifacts instead of listing every class. The descriptor also supports Hibernate properties, entity operation/scope overrides, and explicit native-query parameter types.
 
 ```sh
 cli/build/install/db-compat/bin/db-compat extract \
@@ -57,9 +57,29 @@ Verification starts its own PostgreSQL container. There is no target JDBC URL op
 | `UNKNOWN` | 2 |
 | Invalid arguments or runtime failure | 3 |
 
-`report` returns the verdict's exit code too. A report with `UNKNOWN` is deliberately a failing CI gate. A pending migration execution or validation failure is recorded as `UNKNOWN` when a report can be produced; a failure to start PostgreSQL or establish the baseline is a runtime failure. Extraction success means a contract was written; inspect `coverage` and `unresolvedQueries` before treating it as complete.
+`report` returns the verdict's exit code too. By default, `UNKNOWN` is a failing CI gate. With an explicitly reviewed accepted-baseline file, `verify` and `report` use the separate `gateVerdict` for their exit code; the overall compatibility verdict remains unchanged. A pending migration execution or validation failure is recorded as `UNKNOWN` when a report can be produced; a failure to start PostgreSQL or establish the baseline is a runtime failure. Extraction success means a contract was written; inspect `coverage` and `unresolvedQueries` before treating it as complete.
 
-Read [the descriptor and contract format](docs/contracts.md), [verification boundaries](docs/verification.md), and [CI usage](docs/ci.md) before integrating the result into a deployment workflow.
+Unexpected errors, including `NoClassDefFoundError`, return `3` and print the underlying cause. Library logging defaults to warnings/errors; use `--verbose` for INFO logs and full traces.
+
+Read [the descriptor and contract format](docs/contracts.md), [verification boundaries](docs/verification.md), and [CI usage](docs/ci.md) before integrating the result into a deployment workflow. [Feedback changes and remaining boundaries](docs/feedback.md) maps the reported adoption issues to this revision.
+
+## Baseline health, scale, and multiple persistence units
+
+Reports separate preexisting baseline health from findings introduced by migrations. Default terminal output includes per-rule counts and limits individual details; use `report --summary` or `report --details` to choose the level of detail. Existing baseline findings have no pending-migration attribution.
+
+For several persistence units sharing one database, repeat `--contract`. The baseline is constructed once. Add `--baseline-cache DIR` to reuse a checksummed baseline dump across runs; every run still uses a fresh disposable PostgreSQL container.
+
+```sh
+cli/build/install/db-compat/bin/db-compat verify \
+  --contract orders-contract.json --contract billing-contract.json \
+  --baseline migrations/baseline --migrations migrations/pending \
+  --baseline-cache .cache/epoch-baseline \
+  --report compatibility-report.json
+```
+
+A justified accepted-baseline file can make the CI gate measure new migration findings while retaining baseline debt and the original compatibility verdict. It cannot suppress new migration findings, and stale input fingerprints are rejected. See [the review workflow](docs/ci.md#review-existing-baseline-debt) before enabling it.
+
+Use `extract --keep-going` to retain independent mapping groups when another group cannot bootstrap. Failures become unresolved evidence; partial results never imply complete coverage.
 
 ## Run the examples
 

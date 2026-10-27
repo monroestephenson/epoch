@@ -71,6 +71,8 @@ data class SchemaSnapshot(
     /** Stable names -> PostgreSQL definitions, including views, functions, triggers and policies. */
     val behaviors: Map<String, String> = emptyMap(),
     val sequences: Map<String, String> = emptyMap(),
+    /** Extension name -> installed version; member objects are excluded from behaviors. */
+    val extensions: Map<String, String> = emptyMap(),
 )
 
 data class TableSchema(
@@ -116,6 +118,36 @@ data class CompatibilityReport(
     val migrations: List<MigrationReport>,
     val limitations: List<String> = listOf(
         "SAFE is limited to the declared structural contract; it does not prove application behavior or operational migration safety.",
-        "Runtime-observed SQL does not establish exhaustive query coverage.",
     ),
+    /** Existing problems are recorded once, without pending-migration attribution. */
+    val baseline: BaselineReport? = null,
+    /** Optional accepted-baseline gate; never substitutes for the scientific verdict. */
+    val gateVerdict: Verdict? = null,
+    val acceptedBaseline: List<AcceptedBaselineFinding> = emptyList(),
+    val ruleSummary: List<RuleSummary> = emptyList(),
+)
+
+/** A baseline fingerprint binds acceptance to the contract, catalog and baseline migration input. */
+data class BaselineReport(
+    val verdict: Verdict,
+    val findings: List<Finding>,
+    val fingerprint: String,
+    val cacheStatus: String? = null,
+    val cacheKey: String? = null,
+)
+
+data class AcceptedBaseline(
+    val schemaVersion: Int = 1,
+    val baselineFingerprint: String,
+    val findings: List<AcceptedBaselineFinding>,
+)
+
+data class AcceptedBaselineFinding(val fingerprint: String, val justification: String)
+
+data class RuleSummary(
+    val ruleId: String,
+    val verdict: Verdict,
+    val baselineCount: Int = 0,
+    val migrationCount: Int = 0,
+    val acceptedBaselineCount: Int = 0,
 )

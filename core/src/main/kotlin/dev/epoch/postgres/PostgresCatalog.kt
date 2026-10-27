@@ -67,28 +67,35 @@ class PostgresCatalog {
             SELECT 'view:' || n.nspname || '.' || c.relname, pg_get_viewdef(c.oid,true)
             FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
             WHERE c.relkind IN ('v','m') AND n.nspname NOT LIKE 'pg_%' AND n.nspname <> 'information_schema'
+              AND ${notExtensionOwned("pg_class", "c.oid")}
         """)
         behavior("""
             SELECT 'function:' || n.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')',
                    pg_get_functiondef(p.oid)
             FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
             WHERE p.prokind IN ('f','p','w') AND n.nspname NOT LIKE 'pg_%' AND n.nspname <> 'information_schema'
+              AND ${notExtensionOwned("pg_proc", "p.oid")}
         """)
         behavior("""
             SELECT 'trigger:' || n.nspname || '.' || c.relname || '.' || t.tgname,
                    pg_get_triggerdef(t.oid,true) || '; enabled=' || t.tgenabled::text
             FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace
             WHERE NOT t.tgisinternal AND n.nspname NOT LIKE 'pg_%' AND n.nspname <> 'information_schema'
+              AND ${notExtensionOwned("pg_trigger", "t.oid")}
+              AND ${notExtensionOwned("pg_class", "c.oid")}
         """)
         behavior("""
             SELECT 'rule:' || n.nspname || '.' || c.relname || '.' || r.rulename, pg_get_ruledef(r.oid,true)
             FROM pg_rewrite r JOIN pg_class c ON c.oid=r.ev_class JOIN pg_namespace n ON n.oid=c.relnamespace
             WHERE r.rulename <> '_RETURN' AND n.nspname NOT LIKE 'pg_%' AND n.nspname <> 'information_schema'
+              AND ${notExtensionOwned("pg_rewrite", "r.oid")}
+              AND ${notExtensionOwned("pg_class", "c.oid")}
         """)
         behavior("""
             SELECT 'rls:' || n.nspname || '.' || c.relname, c.relrowsecurity::text || ':' || c.relforcerowsecurity::text
             FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
             WHERE (c.relrowsecurity OR c.relforcerowsecurity) AND n.nspname NOT LIKE 'pg_%'
+              AND ${notExtensionOwned("pg_class", "c.oid")}
         """)
         behavior("""
             SELECT 'policy:' || n.nspname || '.' || c.relname || '.' || p.polname,
@@ -96,20 +103,25 @@ class PostgresCatalog {
                    coalesce(pg_get_expr(p.polqual,p.polrelid),'') || ':' || coalesce(pg_get_expr(p.polwithcheck,p.polrelid),'')
             FROM pg_policy p JOIN pg_class c ON c.oid=p.polrelid JOIN pg_namespace n ON n.oid=c.relnamespace
             WHERE n.nspname NOT LIKE 'pg_%'
+              AND ${notExtensionOwned("pg_policy", "p.oid")}
+              AND ${notExtensionOwned("pg_class", "c.oid")}
         """)
         behavior("""
             SELECT 'partition:' || n.nspname || '.' || c.relname, pg_get_partkeydef(c.oid)
             FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='p' AND n.nspname NOT LIKE 'pg_%'
+              AND ${notExtensionOwned("pg_class", "c.oid")}
         """)
         behavior("""
             SELECT 'inheritance:' || child.oid::regclass::text, parent.oid::regclass::text || ':' ||
                    coalesce(pg_get_expr(child.relpartbound,child.oid),'')
             FROM pg_inherits i JOIN pg_class child ON child.oid=i.inhrelid JOIN pg_class parent ON parent.oid=i.inhparent
+            WHERE ${notExtensionOwned("pg_class", "child.oid")}
         """)
         behavior("""
             SELECT 'enum:' || n.nspname || '.' || t.typname, jsonb_agg(e.enumlabel ORDER BY e.enumsortorder)::text
             FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace JOIN pg_enum e ON e.enumtypid=t.oid
-            WHERE n.nspname NOT LIKE 'pg_%' GROUP BY n.nspname,t.typname
+            WHERE n.nspname NOT LIKE 'pg_%' AND ${notExtensionOwned("pg_type", "t.oid")}
+            GROUP BY n.nspname,t.typname
         """)
         behavior("""
             SELECT 'domain:' || n.nspname || '.' || t.typname,
@@ -118,6 +130,7 @@ class PostgresCatalog {
                              FROM pg_constraint co WHERE co.contypid=t.oid),'')
             FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace
             WHERE t.typtype='d' AND n.nspname NOT LIKE 'pg_%' AND n.nspname <> 'information_schema'
+              AND ${notExtensionOwned("pg_type", "t.oid")}
         """)
         behavior("""
             SELECT 'collation:' || n.nspname || '.' || c.relname || '.' || a.attname,
@@ -126,6 +139,8 @@ class PostgresCatalog {
             JOIN pg_collation coll ON coll.oid=a.attcollation JOIN pg_namespace cn ON cn.oid=coll.collnamespace
             WHERE c.relkind IN ('r','p') AND a.attnum > 0 AND NOT a.attisdropped
               AND coll.collname <> 'default' AND n.nspname NOT LIKE 'pg_%' AND n.nspname <> 'information_schema'
+              AND ${notExtensionOwned("pg_collation", "coll.oid")}
+              AND ${notExtensionOwned("pg_class", "c.oid")}
         """)
         val sequences = sortedMapOf<String, String>()
         connection.rows("""
@@ -133,9 +148,18 @@ class PostgresCatalog {
                    max_value || ':' || increment_by || ':' || cycle || ':' || cache_size
             FROM pg_sequences WHERE schemaname NOT LIKE 'pg_%' ORDER BY 1
         """) { sequences[it.getString(1)] = it.getString(2) }
-        return SchemaSnapshot(tables, behaviors, sequences)
+        val extensions = sortedMapOf<String, String>()
+        connection.rows("SELECT extname, extversion FROM pg_extension ORDER BY extname") {
+            extensions[it.getString(1)] = it.getString(2)
+        }
+        return SchemaSnapshot(tables = tables, behaviors = behaviors, sequences = sequences, extensions = extensions)
     }
 }
+
+/** Extension membership is an object dependency, not a schema/name convention. */
+private fun notExtensionOwned(catalog: String, objectId: String) =
+    "NOT EXISTS (SELECT 1 FROM pg_depend dependency WHERE dependency.classid = '$catalog'::regclass " +
+        "AND dependency.objid = $objectId AND dependency.objsubid = 0 AND dependency.deptype = 'e')"
 
 private fun Connection.rows(sql: String, consume: (ResultSet) -> Unit) = createStatement().use { statement ->
     statement.executeQuery(sql).use { result -> while (result.next()) consume(result) }
