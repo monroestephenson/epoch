@@ -92,7 +92,7 @@ Query entries record:
 - `dependenciesComplete`, `explicitColumnList`, `exactResultShape`, and optional `variant`.
 - `accessPathIds` link exact inventoried methods to fixed templates. `observationFrames` preserve runtime stack frames; an observed frame does not establish a method overload or exhaustive method coverage.
 
-Native parameter declarations allow PostgreSQL preparation and type checking. They do **not** establish complete native-query dependencies, hydration, or behavioral equivalence; these remain unresolved. An old native statement that PostgreSQL accepts at baseline and rejects after migration can still supply concrete breaking evidence.
+Supported fixed native SELECT and explicit-column DML templates retain their SQL-derived physical dependencies. Explicit parameter declarations or unambiguous PostgreSQL inference establish parameter types independently. Wildcards, nested scopes, ambiguous aliases, positional inserts, conflict-update variants, and opaque function/sequence access remain unresolved. Complete structural dependencies do not prove arbitrary native hydration or behavioral equivalence. An old native statement that PostgreSQL accepts at baseline and rejects after migration supplies concrete breaking evidence even when another part of its contract is unresolved.
 
 Entity/query IDs must be unique within a contract. Keep them stable across releases. Multiple input contracts are namespaced as `contract[1]/...`, `contract[2]/...`, and so on, in input order. Their application versions and scopes are retained in coverage notes.
 

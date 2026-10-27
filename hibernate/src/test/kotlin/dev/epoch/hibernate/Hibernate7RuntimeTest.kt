@@ -27,7 +27,8 @@ class Hibernate7RuntimeTest {
         val native = HibernateExtractor().extract(ExtractionRequest(listOf(Customer::class.java.name), classpath = classpath,
             nativeQueries = mapOf("native7" to "select id from customers where id = :id"), discoverRepositories = false))
         assertEquals(listOf("OTHER"), native.queries.single { it.id == "native7" }.parameterTypes)
-        assertTrue(native.unresolvedQueries.any { it.id == "native7" })
+        assertTrue(native.queries.single { it.id == "native7" }.dependenciesComplete)
+        assertFalse(native.unresolvedQueries.any { it.id == "native7" })
         }
     }
 }

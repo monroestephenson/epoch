@@ -20,7 +20,9 @@ Setting `discoverRepositories: false` explicitly selects the narrower entity/des
 
 ## What is discovered
 
-The scanner uses ASM bytecode data flow. It retains a query string only when all incoming control-flow paths establish the same constant. Literal strings, constant fields, supported constant concatenation, and constant JVM string-concatenation templates can be discovered without running application code. Dynamically constructed strings are recorded individually as unresolved; a nearby string constant is never assumed to be a query argument.
+The scanner uses ASM bytecode data flow. It retains literal strings, constant fields, supported constant concatenation, and constant JVM string-concatenation templates without running application code. Kotlin literal `trimIndent()` and `trimMargin()` calls are normalized, including an explicit margin prefix or the compiled default-argument call. A nearby string constant is never assumed to be a query argument.
+
+When control-flow branches establish different constant strings, the scanner enumerates up to 16 alternatives at that call site. A single finite operand can be combined with constant string fragments. Combining multiple finite operands remains unresolved when their branch correlations are unavailable: a Cartesian product could invent SQL that the application never executes and cause a false `BREAKING` verdict. Unknown templates, unsupported string builders, and variant sets larger than 16 retain their individual unresolved class/method/line locations.
 
 | Access mechanism | Evidence retained |
 | --- | --- |
@@ -37,7 +39,7 @@ Spring named-query lookup takes precedence over method-name derivation. Register
 
 ## Methods, variants, and coverage
 
-Each discovered call site has a stable identifier based on the class, JVM method signature, and database-access call index, such as `example.CustomerDao#find(Ljava/lang/String;)Ljava/util/List;:0`. Annotation and framework-derived entries use descriptive suffixes. Source line numbers are retained when the compiled class contains debug information.
+Each discovered call site has a stable identifier based on the class, JVM method signature, and database-access call index, such as `example.CustomerDao#find(Ljava/lang/String;)Ljava/util/List;:0`. Annotation and framework-derived entries use descriptive suffixes. Multiple constant alternatives use query IDs ending in `.variant.N`, assigned after sorting the query strings; one call-site entry links every variant. Source line numbers are retained when the compiled class contains debug information.
 
 `accessPaths` in the contract and compatibility report contains each call's class, method, status, query IDs, mechanism, optional source line, and unresolved reason. Statuses are `STATIC`, `OBSERVED`, `DECLARED`, and `UNRESOLVED`. Extraction and saved-report rendering show percentages per class over the discovered methods. A method with any unresolved site counts as unresolved; observations do not count as an exhaustive static proof. The JSON retains individual sites, and `report --details` prints the full inventory.
 

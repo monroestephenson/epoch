@@ -20,7 +20,7 @@ data class DiscoveredQueries(
     val notes: List<String> = emptyList(),
 )
 
-/** Bytecode data flow preserves a string only if every incoming path proves the same constant. */
+/** Bounded bytecode data flow retains only established constants or finite string alternatives. */
 object RepositoryDiscovery {
     fun discover(classpath: List<String>, packages: List<String>, loader: ClassLoader, entityClasses: List<String> = emptyList()): DiscoveredQueries {
         val nodes = sortedMapOf<String, ClassNode>()
@@ -103,6 +103,21 @@ object RepositoryDiscovery {
                         unresolved += UnresolvedQuery(id, explanation)
                         paths += AccessPathCoverage(id, className, methodName, AccessPathStatus.UNRESOLVED, reason = explanation, mechanism = mechanism, line = line)
                     }
+                }
+                fun recordVariants(id: String, queries: List<String>?, mechanism: String, nativeSql: Boolean = false,
+                                   reason: String? = null, line: Int? = null) {
+                    val fixed = queries?.distinct()?.sorted()
+                    if (fixed.isNullOrEmpty() || fixed.size == 1 || reason != null || fixed.any { it.isBlank() || it.contains("#{") }) {
+                        record(id, fixed?.singleOrNull(), mechanism, nativeSql, reason ?: fixed?.takeIf {
+                            it.any { query -> query.isBlank() || query.contains("#{") }
+                        }?.let { "A finite query variant is empty or contains unresolved expression-language substitution" }, line)
+                        return
+                    }
+                    val queryIds = fixed.mapIndexed { variant, query ->
+                        "$id.variant.$variant".also { (if (nativeSql) native else hql)[it] = query }
+                    }
+                    paths += AccessPathCoverage(id, className, methodName, AccessPathStatus.STATIC, queryIds,
+                        reason = "Enumerated ${fixed.size} constant query variants from compiled control flow", mechanism = mechanism, line = line)
                 }
                 val queryAnnotations = annotations.filter { it.desc in SPRING_QUERY_ANNOTATIONS }
                 val queryAnnotation = queryAnnotations.singleOrNull()
@@ -198,22 +213,27 @@ object RepositoryDiscovery {
                     val arguments = Type.getArgumentTypes(instruction.desc)
                     val stringArgument = arguments.indexOfFirst { it.className == "java.lang.String" }
                     val frame = frames?.get(index)
-                    val query = if (frame != null && stringArgument >= 0) {
+                    val queryValue = if (frame != null && stringArgument >= 0) {
                         val position = frame.stackSize - arguments.size + stringArgument
-                        if (position >= 0) frame.getStack(position).constant as? String else null
+                        if (position >= 0) frame.getStack(position) else null
                     } else null
+                    val queries = queryValue?.constants?.takeIf { it.all { value -> value is String } }?.map { it as String }?.sorted()
+                    val queryFailure = analysisFailure ?: queryValue?.unresolvedReason
                     when (mechanism) {
-                        "JPA_HQL" -> record(id, query, mechanism, reason = analysisFailure, line = sourceLine)
-                        "JPA_NAMED" -> if (query != null && query.isNotBlank()) {
-                            paths += AccessPathCoverage(id, className, methodName, AccessPathStatus.DECLARED, listOf(query), mechanism = mechanism, line = sourceLine)
-                        } else record(id, null, mechanism, reason = analysisFailure, line = sourceLine)
-                        "JPA_NATIVE", "JDBC_SQL" -> record(id, query, mechanism, nativeSql = true, reason = analysisFailure, line = sourceLine)
+                        "JPA_HQL" -> recordVariants(id, queries, mechanism, reason = queryFailure, line = sourceLine)
+                        "JPA_NAMED" -> if (queries != null && queries.all(String::isNotBlank) && queryFailure == null) {
+                            paths += AccessPathCoverage(id, className, methodName, AccessPathStatus.DECLARED, queries, mechanism = mechanism, line = sourceLine)
+                        } else record(id, null, mechanism, reason = queryFailure, line = sourceLine)
+                        "JPA_NATIVE", "JDBC_SQL" -> recordVariants(id, queries, mechanism, nativeSql = true, reason = queryFailure, line = sourceLine)
                         "JDBC_PREPARED_EXECUTION" -> {
                             val receiver = frame?.takeIf { it.stackSize > arguments.size }
-                                ?.let { it.getStack(it.stackSize - arguments.size - 1).constant } as? PreparedSql
-                            val source = receiver?.let { sql -> native.entries.firstOrNull { it.key.startsWith("$className#$methodName:") && it.value == sql.sql }?.key }
-                            if (source != null) paths += AccessPathCoverage(id, className, methodName, AccessPathStatus.STATIC,
-                                listOf(source), mechanism = mechanism, line = sourceLine)
+                                ?.let { it.getStack(it.stackSize - arguments.size - 1).constants }
+                                ?.takeIf { it.all { value -> value is PreparedSql } }?.map { it as PreparedSql }
+                            val sources = receiver?.map { sql -> native.entries.firstOrNull {
+                                it.key.startsWith("$className#$methodName:") && it.value == sql.sql
+                            }?.key }
+                            if (!sources.isNullOrEmpty() && sources.all { it != null }) paths += AccessPathCoverage(id, className, methodName, AccessPathStatus.STATIC,
+                                sources.filterNotNull().distinct().sorted(), mechanism = mechanism, line = sourceLine)
                             else record(id, null, mechanism, reason = "Prepared statement execution has no locally established constant SQL source; declare its producer's complete SQL variants", line = sourceLine)
                         }
                         "PANACHE" -> {
@@ -225,11 +245,12 @@ object RepositoryDiscovery {
                                 return@forEachIndexed
                             }
                             val entity = panacheEntity(owner, instruction.owner, nodes, loader)
-                            val fixed = query ?: "".takeIf { arguments.isEmpty() && instruction.name in setOf("findAll", "listAll", "deleteAll", "count") }
+                            val fixed = queries ?: listOf("").takeIf { arguments.isEmpty() && instruction.name in setOf("findAll", "listAll", "deleteAll", "count") }
                             val expanded = if (fixed == null) Result.failure(IllegalArgumentException("Panache query is not a compile-time constant"))
                                 else if (entity == null) Result.failure(IllegalArgumentException("Panache entity type cannot be resolved from the compiled repository/entity hierarchy"))
-                                else expandPanache(instruction.name, entity, fixed, loader)
-                            record(id, expanded.getOrNull(), mechanism, reason = expanded.exceptionOrNull()?.let(::describe), line = sourceLine)
+                                else runCatching { fixed.map { expandPanache(instruction.name, entity, it, loader).getOrThrow() } }
+                            recordVariants(id, expanded.getOrNull(), mechanism,
+                                reason = queryFailure ?: expanded.exceptionOrNull()?.let(::describe), line = sourceLine)
                         }
                         else -> record(id, null, mechanism, reason = "$mechanism database-access call ${instruction.owner.replace('/', '.')}.${instruction.name} is not exhaustively translated; declare finite SQL/HQL variants or instrument runtime SQL", line = sourceLine)
                     }
@@ -445,7 +466,8 @@ object RepositoryDiscovery {
     }
 }
 
-private data class ConstantValue(val basic: BasicValue, val constant: Any? = null) : Value {
+private data class ConstantValue(val basic: BasicValue, val constants: Set<Any>? = null, val unresolvedReason: String? = null) : Value {
+    val constant: Any? get() = constants?.singleOrNull()
     override fun getSize() = basic.size
 }
 
@@ -466,43 +488,88 @@ private class ConstantInterpreter(private val fields: Map<String, Any>) : Interp
                 else -> null
             }
         }
-        return ConstantValue(base.newOperation(instruction), constant)
+        return ConstantValue(base.newOperation(instruction), constant?.let(::setOf))
     }
     override fun copyOperation(instruction: AbstractInsnNode, value: ConstantValue) = value
     override fun unaryOperation(instruction: AbstractInsnNode, value: ConstantValue) =
-        base.unaryOperation(instruction, value.basic)?.let { ConstantValue(it, if (instruction.opcode == Opcodes.CHECKCAST) value.constant else null) }
+        base.unaryOperation(instruction, value.basic)?.let {
+            if (instruction.opcode == Opcodes.CHECKCAST) ConstantValue(it, value.constants, value.unresolvedReason) else ConstantValue(it)
+        }
     override fun binaryOperation(instruction: AbstractInsnNode, left: ConstantValue, right: ConstantValue) =
         base.binaryOperation(instruction, left.basic, right.basic)?.let { ConstantValue(it) }
     override fun ternaryOperation(instruction: AbstractInsnNode, a: ConstantValue, b: ConstantValue, c: ConstantValue) =
         base.ternaryOperation(instruction, a.basic, b.basic, c.basic)?.let { ConstantValue(it) }
     override fun naryOperation(instruction: AbstractInsnNode, values: MutableList<out ConstantValue>): ConstantValue? {
         val basic = base.naryOperation(instruction, values.map { it.basic }) ?: return null
-        val constant: Any? = when {
+        val evaluated: Evaluation = when {
             instruction is MethodInsnNode && instruction.owner == "java/sql/Connection" && instruction.name == "prepareStatement" ->
-                (values.getOrNull(1)?.constant as? String)?.let(::PreparedSql)
-            instruction is InvokeDynamicInsnNode && instruction.bsm.owner == "java/lang/invoke/StringConcatFactory" -> concatenate(instruction, values)
+                evaluate(values.drop(1).take(1)) { (it.singleOrNull() as? String)?.let(::PreparedSql) }
+            instruction is InvokeDynamicInsnNode && instruction.bsm.owner == "java/lang/invoke/StringConcatFactory" ->
+                evaluate(values) { concatenate(instruction, it) }
             instruction is MethodInsnNode && instruction.owner == "java/lang/String" && instruction.name == "concat" && values.size == 2 ->
-                (values[0].constant as? String)?.let { left -> (values[1].constant as? String)?.let { left + it } }
+                evaluate(values) { parts -> (parts[0] as? String)?.let { left -> (parts[1] as? String)?.let { left + it } } }
             instruction is MethodInsnNode && instruction.owner == "java/lang/String" && instruction.name == "valueOf" && values.size == 1 ->
-                values.single().constant?.let { value -> when (Type.getArgumentTypes(instruction.desc).single().sort) {
+                evaluate(values) { parts -> val value = parts.single(); when (Type.getArgumentTypes(instruction.desc).single().sort) {
                     Type.BOOLEAN -> (value as? Number)?.let { (it.toInt() != 0).toString() }
                     Type.CHAR -> (value as? Number)?.toInt()?.toChar()?.toString()
                     else -> value.toString()
                 } }
-            else -> null
+            instruction is MethodInsnNode && instruction.owner in setOf("kotlin/text/StringsKt", "kotlin/text/StringsKt__IndentKt") ->
+                normalizeKotlin(instruction, values)
+            else -> Evaluation()
         }
-        return ConstantValue(basic, constant)
+        return ConstantValue(basic, evaluated.constants, evaluated.reason)
     }
     override fun returnOperation(instruction: AbstractInsnNode, value: ConstantValue, expected: ConstantValue) = base.returnOperation(instruction, value.basic, expected.basic)
-    override fun merge(left: ConstantValue, right: ConstantValue): ConstantValue = if (left == right) left else ConstantValue(base.merge(left.basic, right.basic))
+    override fun merge(left: ConstantValue, right: ConstantValue): ConstantValue {
+        if (left == right) return left
+        val basic = base.merge(left.basic, right.basic)
+        if (left.constants == null || right.constants == null)
+            return ConstantValue(basic, unresolvedReason = listOfNotNull(left.unresolvedReason, right.unresolvedReason).sorted().firstOrNull())
+        val combined = left.constants + right.constants
+        return if (combined.size <= MAX_VARIANTS) ConstantValue(basic, combined)
+        else ConstantValue(basic, unresolvedReason = "Query string alternatives exceed the $MAX_VARIANTS-variant bytecode bound")
+    }
 
-    private fun concatenate(instruction: InvokeDynamicInsnNode, values: List<ConstantValue>): String? {
-        if (values.any { it.constant == null }) return null
+    private data class Evaluation(val constants: Set<Any>? = null, val reason: String? = null)
+
+    /** Do not invent Cartesian products whose branch correlations have been lost by frame merging. */
+    private fun evaluate(values: List<ConstantValue>, operation: (List<Any>) -> Any?): Evaluation {
+        if (values.any { it.constants == null }) return Evaluation(reason = values.mapNotNull { it.unresolvedReason }.sorted().firstOrNull())
+        if (values.count { it.constants!!.size > 1 } > 1)
+            return Evaluation(reason = "Multiple finite string operands require correlated branch analysis; their Cartesian product is not asserted as executable SQL")
+        var arguments = listOf(emptyList<Any>())
+        for (value in values) arguments = arguments.flatMap { prefix -> value.constants!!.map { prefix + it } }
+        val results = linkedSetOf<Any>()
+        for (args in arguments) {
+            val result = runCatching { operation(args) }.getOrNull() ?: return Evaluation()
+            results += result
+        }
+        return Evaluation(results)
+    }
+
+    private fun normalizeKotlin(instruction: MethodInsnNode, values: List<ConstantValue>): Evaluation = when {
+        instruction.name == "trimIndent" && instruction.desc == "(Ljava/lang/String;)Ljava/lang/String;" ->
+            evaluate(values) { (it.single() as? String)?.trimIndent() }
+        instruction.name == "trimMargin" && instruction.desc == "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;" ->
+            evaluate(values) { parts -> (parts[0] as? String)?.let { text -> (parts[1] as? String)?.let(text::trimMargin) } }
+        instruction.name == "trimMargin\$default" && instruction.desc == "(Ljava/lang/String;Ljava/lang/String;ILjava/lang/Object;)Ljava/lang/String;" -> {
+            val mask = values.getOrNull(2)?.constant as? Int
+            when {
+                mask == null -> Evaluation()
+                mask and 1 != 0 -> evaluate(values.take(1)) { (it.single() as? String)?.trimMargin() }
+                else -> evaluate(values.take(2)) { parts -> (parts[0] as? String)?.let { text -> (parts[1] as? String)?.let(text::trimMargin) } }
+            }
+        }
+        else -> Evaluation()
+    }
+
+    private fun concatenate(instruction: InvokeDynamicInsnNode, values: List<Any>): String? {
         val argumentTypes = Type.getArgumentTypes(instruction.desc)
         fun value(index: Int): String = when (argumentTypes[index].sort) {
-            Type.BOOLEAN -> ((values[index].constant as? Number)?.toInt() != 0).toString()
-            Type.CHAR -> ((values[index].constant as Number).toInt().toChar()).toString()
-            else -> values[index].constant.toString()
+            Type.BOOLEAN -> ((values[index] as Number).toInt() != 0).toString()
+            Type.CHAR -> ((values[index] as Number).toInt().toChar()).toString()
+            else -> values[index].toString()
         }
         if (instruction.bsm.name == "makeConcat") return values.indices.joinToString("") { value(it) }
         if (instruction.bsm.name != "makeConcatWithConstants") return null
@@ -517,4 +584,6 @@ private class ConstantInterpreter(private val fields: Map<String, Any>) : Interp
             }
         }
     }
+
+    companion object { private const val MAX_VARIANTS = 16 }
 }

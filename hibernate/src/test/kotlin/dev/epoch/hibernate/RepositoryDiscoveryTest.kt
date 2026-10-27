@@ -32,19 +32,30 @@ class RepositoryDiscoveryTest {
         assertTrue(result.accessPaths.filter { it.id.contains("#fixed(") }.all { it.line != null && it.status == AccessPathStatus.STATIC })
     }
 
-    @Test fun `only equal constants survive control flow merges and unused literal is not mistaken for argument`() {
+    @Test fun `equal and finite different constants survive merges but unused literals never replace dynamic arguments`() {
         val result = discover()
-        for (method in listOf("dynamic", "differentBranches")) {
-            assertTrue(result.unresolved.any { it.id.contains("#$method(") }, method)
-            assertFalse(result.hqlQueries.keys.any { it.contains("#$method(") }, method)
-        }
         assertTrue(result.hqlQueries.keys.any { it.contains("#sameBranches(") })
+        val variants = result.hqlQueries.filterKeys { it.contains("#differentBranches(") }
+        assertEquals(2, variants.size, result.toString())
+        assertTrue(variants.keys.all { it.contains(".variant.") })
+        assertEquals(variants.keys.sorted(), result.accessPaths.single { it.method.startsWith("differentBranches(") }.queryIds)
+        assertFalse(result.unresolved.any { it.id.contains("#differentBranches(") })
+        assertTrue(result.unresolved.any { it.id.contains("#dynamic(") })
+        assertFalse(result.hqlQueries.keys.any { it.contains("#dynamic(") })
     }
 
     @Test fun `constant invokedynamic concatenation and boolean char conversions are resolved correctly`() {
         val result = discover()
         assertEquals("select c from RepositoryCustomer c", result.hqlQueries.entries.single { it.key.contains("#concatenation(") }.value)
         assertEquals("select true, 'A'", result.nativeQueries.entries.single { it.key.contains("#valueOf(") }.value)
+    }
+
+    @Test fun `one finite concat operand is enumerated but correlated operands cannot fabricate query combinations`() {
+        val result = discover()
+        assertEquals(setOf("select id from repository_customer", "select email from repository_customer"),
+            result.nativeQueries.filterKeys { it.contains("#finiteSuffix(") }.values.toSet())
+        assertTrue(result.nativeQueries.keys.none { it.contains("#correlatedFragments(") })
+        assertTrue(result.unresolved.single { it.id.contains("#correlatedFragments(") }.reason.contains("Cartesian product"), result.toString())
     }
 
     @Test fun `builders procedure calls and query modifiers remain individually unresolved`() {

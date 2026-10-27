@@ -144,7 +144,8 @@ class ExtractionFeedbackTest {
         val query = contract.queries.single { it.id == "native.lookup" }
         assertEquals(listOf("bigint", "text"), query.parameterTypes)
         assertTrue(query.sql.contains("?"))
-        assertTrue(contract.unresolvedQueries.any { it.id == query.id && it.reason.contains("declared parameter types") })
+        assertTrue(query.dependenciesComplete)
+        assertFalse(contract.unresolvedQueries.any { it.id == query.id })
     }
 
     @Test fun `double and tiny integer JDBC types use PostgreSQL names`() {

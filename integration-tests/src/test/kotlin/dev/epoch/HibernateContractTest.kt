@@ -43,7 +43,8 @@ class HibernateContractTest {
         val query = contract.queries.firstOrNull { it.id.contains("Customer.nativeByEmail") }
         assertNotNull(query, contract.toString())
         assertEquals(QuerySource.NAMED_NATIVE, query!!.source)
-        assertFalse(query.dependenciesComplete, "Native SQL must not silently claim complete semantic extraction")
+        assertTrue(query.dependenciesComplete, "The supported explicit-column native query has complete structural dependencies")
+        assertEquals(setOf("id", "email"), query.columns.map { it.column }.toSet())
     }
 
     @Test fun `association mapping preserves physical foreign key and query join`() {

@@ -41,6 +41,19 @@ public class CustomerDao {
         manager.createQuery(prefix + " from RepositoryCustomer c");
     }
 
+    public void finiteSuffix(EntityManager manager, boolean condition) {
+        String prefix = condition ? "select id" : "select email";
+        manager.createNativeQuery(prefix + " from repository_customer");
+    }
+
+    public void correlatedFragments(EntityManager manager, boolean condition) {
+        String column;
+        String table;
+        if (condition) { column = "id"; table = "repository_customer"; }
+        else { column = "legacy_id"; table = "archived_customer"; }
+        manager.createNativeQuery("select " + column + " from " + table);
+    }
+
     public void valueOf(EntityManager manager) {
         manager.createNativeQuery("select " + String.valueOf(true) + ", '" + String.valueOf('A') + "'");
     }

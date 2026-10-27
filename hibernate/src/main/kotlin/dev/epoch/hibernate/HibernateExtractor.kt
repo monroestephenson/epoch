@@ -80,10 +80,13 @@ class HibernateExtractor {
             }
             val unresolved = (result.unresolvedQueries + failures + discovery?.unresolved.orEmpty() + runtimeFailures)
                 .distinct().sortedWith(compareBy({ it.id }, { it.reason }))
+            val staticMatches = observedQueries.count { observed -> result.queries.any { it.sql == observed.sql } }
             val notes = result.coverage.notes + excluded.sorted().map { "Explicitly excluded from this contract: $it" } +
                 request.classpath.filter { !java.nio.file.Files.exists(Path.of(it)) }.distinct().sorted().map { "Warning: ignored nonexistent classpath entry: $it" } +
                 (discovery?.notes ?: listOf("Explicit entity/descriptor scope; repository discovery disabled")) +
-                if (observations.isNotEmpty()) listOf("Runtime-observed SQL and call-site frames are factual observations; they do not resolve unenumerated query sources or establish exhaustive coverage.") else emptyList()
+                if (observations.isNotEmpty()) listOf(
+                    "Runtime capture cross-check: $staticMatches distinct SQL templates match static extraction exactly; ${observedQueries.size - staticMatches} have no exact static match.",
+                    "Runtime-observed SQL and call-site frames are factual observations; they do not resolve unenumerated query sources or establish exhaustive coverage.") else emptyList()
             val links = discovery?.accessPaths.orEmpty().flatMap { path -> path.queryIds.map { it to path.id } }.groupBy({ it.first }, { it.second })
             val paths = discovery?.accessPaths.orEmpty().map { path ->
                 val missing = path.queryIds.filter { id -> result.queries.none { it.id == id } }
@@ -352,15 +355,18 @@ class HibernateExtractor {
                 try {
                     ParameterParser.parse(sql, recognizer)
                     recognizer.complete()
-                    queries += QueryContract(id, SqlOperationClassifier.operation(recognizer.adjustedSqlString), recognizer.adjustedSqlString, source = source,
+                    val adjusted = recognizer.adjustedSqlString
+                    val dependencies = SqlDependencies.inspect(adjusted, request.hibernateProperties["hibernate.default_schema"] ?: "public", nativeSql = true)
+                    queries += QueryContract(id, SqlOperationClassifier.operation(adjusted), adjusted, source = source,
+                        tables = dependencies.tables, columns = dependencies.columns, writeColumns = dependencies.writes,
+                        targetTable = dependencies.target,
                         parameterTypes = request.nativeQueryParameterTypes[id] ?: List((recognizer.javaClass.getMethod("getParameterList").invoke(recognizer) as? List<*>)?.size ?: 0) { "OTHER" },
-                        dependenciesComplete = false, explicitColumnList = false)
+                        dependenciesComplete = dependencies.complete, explicitColumnList = dependencies.explicitColumnList)
+                    if (!dependencies.complete) unresolved += UnresolvedQuery(id,
+                        "Native SQL is retained for PostgreSQL preparation, but wildcard/nested/function/conflict variants or ambiguous alias dependencies are not complete; declare a supported explicit-column template or retain this unresolved access path")
                 } catch (e: Exception) {
                     unresolved += UnresolvedQuery(id, "Native SQL parsing/classification failed: ${e.message}")
                 }
-                unresolved += UnresolvedQuery(id, if (id in request.nativeQueryParameterTypes)
-                    "Native SQL has declared parameter types for PostgreSQL preparation; its structural dependencies and behavioral contract remain unproven"
-                else "Native SQL is retained for PostgreSQL preparation, but its dependencies, parameter/result types, and behavioral contract are not proven")
             }
             named.visitNativeQueryMementos { native(it.registrationName, it.sqlString, QuerySource.NAMED_NATIVE) }
             request.nativeQueries.toSortedMap().forEach { (id, text) -> native(id, text, QuerySource.STATIC) }

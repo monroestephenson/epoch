@@ -12,6 +12,21 @@ import kotlin.test.*
 class RuntimeSqlInputTest {
     @TempDir lateinit var directory: Path
 
+    @Test fun `runtime capture cross-checks exact static SQL without closing dynamic coverage gaps`() {
+        val file = directory.resolve("cross-check.jsonl")
+        Files.writeString(file, """{"schemaVersion":1,"sql":"select id from customers","callSites":["example.Dao#lookup(Dao.kt:12)"]}
+{"schemaVersion":1,"sql":"select email_address from customers","callSites":["example.Dao#dynamic(Dao.kt:20)"]}
+""")
+        val contract = HibernateExtractor().extract(ExtractionRequest(listOf(Customer::class.java.name),
+            nativeQueries = mapOf("static.lookup" to "select id from customers"),
+            unresolvedDynamicQueries = mapOf("example.Dao#dynamic" to "Runtime-dependent SQL variants"),
+            runtimeSqlFiles = listOf(file.toString()), discoverRepositories = false))
+        assertTrue(contract.coverage.notes.any { it.contains("1 distinct SQL templates match static extraction exactly; 1 have no exact static match") })
+        assertTrue(contract.unresolvedQueries.any { it.id == "example.Dao#dynamic" })
+        assertEquals(2, contract.queries.count { it.source == QuerySource.RUNTIME_OBSERVED })
+        assertFalse(contract.coverage.complete)
+    }
+
     @Test fun `StatementInspector writes reusable SQL templates with factual stack provenance`() {
         val file = directory.resolve("observed.jsonl")
         val previous = System.getProperty("epoch.sql.capture")
