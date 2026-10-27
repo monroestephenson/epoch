@@ -58,6 +58,8 @@ Repository discovery is enabled by default and records recognized DAO/repository
 
 Retain the old compiled application artifacts, extraction descriptor, generated contract, baseline migrations, pending migrations, and report together. Preserve the Gradle wrapper and pinned dependencies. Inferred PostgreSQL parameter types are fixed at baseline, so a migrated column cannot silently redefine the old binding contract. Retain accepted-baseline policies and their justifications alongside reports when used. Use the same PostgreSQL version when reproducing a result, and review the contract whenever application mappings, query definitions, or naming strategies change.
 
+`Hibernate7CompiledFixtureTest` compiles a separate Kotlin fixture against Hibernate 7.1.4/JPA 3.2, then extracts it with actual Hibernate 7.0.10 and 7.1.4 runtimes. Its generic `List<X>` fields include `@ManyToMany` and join-table `@OneToMany`, with no explicit `targetEntity`. The test checks collection SQL and association-query dependencies while confirming that the tool's bundled Hibernate 6.6 runtime remains isolated. Other collection strategies retain the explicit limitations above.
+
 This tool accepts no arbitrary target database connection. Migrations still execute SQL in the disposable database, so use trusted migrations and a Docker daemon appropriate for CI work.
 
 ## Scale and execution failures
