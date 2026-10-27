@@ -86,6 +86,8 @@ class Verify : Callable<Int> {
     var migrationTimeoutSeconds: Long = 120
     @Option(names = ["--global-timeout-seconds"], defaultValue = "1800", description = ["Maximum seconds for verification (default: 1800)"])
     var globalTimeoutSeconds: Long = 1800
+    @Option(names = ["--planning-parallelism"], defaultValue = "4", description = ["Maximum independent planning connections (default: 4); transactional migration checks remain on their owning connection"])
+    var planningParallelism: Int = 4
     @Option(names = ["--sarif"], description = ["Optional SARIF 2.1.0 output for CI code scanning"])
     var sarifPath: Path? = null
     @Option(names = ["--migration-source-prefix"], description = ["Repository-relative path prepended to migration filenames in SARIF"])
@@ -98,22 +100,32 @@ class Verify : Callable<Int> {
         require(Files.isDirectory(baseline)) { "Baseline directory does not exist: $baseline" }
         require(Files.isDirectory(migrations)) { "Migration directory does not exist: $migrations" }
         val accepted = acceptedBaseline?.let { json.readValue<AcceptedBaseline>(it.toFile()) }
-        val options = VerificationOptions(baselineCache, accepted, migrationTimeoutSeconds, globalTimeoutSeconds, executeBoundaries)
-        val verifier = PostgresVerifier()
-        if (newContractPaths.isNotEmpty()) {
-            val newContracts = newContractPaths.map { json.readValue<DatabaseContract>(it.toFile()) }
-            val report = verifier.verifyBidirectional(contracts, newContracts, baseline, migrations, options)
-            writeJson(reportPath, report)
-            val directions = listOf("old-on-new" to report.oldOnNew, "new-on-old" to report.newOnOld)
-            sarifPath?.let { writeJson(it, sarifReport(directions, migrationSourcePrefix)) }
-            directions.forEach { (name, result) -> println("Direction: $name\n${renderReport(result, allDetails = details)}") }
-            return exitCode(CompatibilityEngine.aggregate(directions.map { it.second.gateVerdict ?: it.second.verdict }))
+        val newContracts = newContractPaths.map { json.readValue<DatabaseContract>(it.toFile()) }
+        val expectedDirections = if (newContracts.isEmpty()) listOf("old-on-new") else listOf("old-on-new", "new-on-old")
+        return VerificationCheckpoint(reportPath, expectedDirections).use { checkpoint ->
+            try {
+                val options = VerificationOptions(baselineCache, accepted, migrationTimeoutSeconds, globalTimeoutSeconds,
+                    executeBoundaries, planningParallelism = planningParallelism, progress = checkpoint::progress)
+                val verifier = PostgresVerifier()
+                if (newContracts.isNotEmpty()) {
+                    val report = verifier.verifyBidirectional(contracts, newContracts, baseline, migrations, options)
+                    checkpoint.complete(report)
+                    val directions = listOf("old-on-new" to report.oldOnNew, "new-on-old" to report.newOnOld)
+                    sarifPath?.let { writeJson(it, sarifReport(directions, migrationSourcePrefix)) }
+                    directions.forEach { (name, result) -> println("Direction: $name\n${renderReport(result, allDetails = details)}") }
+                    exitCode(CompatibilityEngine.aggregate(directions.map { it.second.gateVerdict ?: it.second.verdict }))
+                } else {
+                    val report = verifier.verify(contracts, baseline, migrations, options)
+                    checkpoint.complete(report)
+                    sarifPath?.let { writeJson(it, sarifReport(listOf("old-on-new" to report), migrationSourcePrefix)) }
+                    println(renderReport(report, allDetails = details))
+                    exitCode(report.gateVerdict ?: report.verdict)
+                }
+            } catch (failure: Throwable) {
+                try { checkpoint.fail(failure) } catch (checkpointFailure: Throwable) { failure.addSuppressed(checkpointFailure) }
+                throw failure
+            }
         }
-        val report = verifier.verify(contracts, baseline, migrations, options)
-        writeJson(reportPath, report)
-        sarifPath?.let { writeJson(it, sarifReport(listOf("old-on-new" to report), migrationSourcePrefix)) }
-        println(renderReport(report, allDetails = details))
-        return exitCode(report.gateVerdict ?: report.verdict)
     }
 }
 
@@ -139,9 +151,22 @@ class Report : Callable<Int> {
         require(!(summaryOnly && details)) { "Choose either --summary or --details" }
         val tree = json.readTree(input.toFile())
         require(tree.path("schemaVersion").asInt(-1) == 1) { "Unsupported report schemaVersion: ${tree.path("schemaVersion")}" }
+        val sourcePrefix = migrationSourcePrefix.ifEmpty { tree.path("release").path("migrationPath").asText("") }
+        if (tree.path("complete").isBoolean && !tree.path("complete").asBoolean() && tree.has("reports")) {
+            require(acceptedOutput == null && justification == null) { "Cannot accept baseline findings from incomplete verification." }
+            val directions = tree.path("reports").fields().asSequence().sortedBy { it.key }.map { (name, value) ->
+                val report = json.treeToValue(value, CompatibilityReport::class.java)
+                require(report.schemaVersion == 1) { "Unsupported report schemaVersion: ${report.schemaVersion}" }
+                name to report
+            }.toList()
+            println("INCOMPLETE verification: ${tree.path("failureStage").asText("INCOMPLETE")}")
+            println(tree.path("incompleteReason").asText("Only completed checkpoints are available."))
+            directions.forEach { (name, result) -> println("Direction: $name\n${renderReport(result, summaryOnly, details)}") }
+            sarifPath?.let { writeJson(it, sarifReport(directions, sourcePrefix)) }
+            return 3
+        }
         val payload = tree.get("verification") ?: tree
         require(payload.path("schemaVersion").asInt(-1) == 1) { "Unsupported verification schemaVersion: ${payload.path("schemaVersion")}" }
-        val sourcePrefix = migrationSourcePrefix.ifEmpty { tree.path("release").path("migrationPath").asText("") }
         if (payload.has("oldOnNew")) {
             require(acceptedOutput == null && justification == null) { "Export baseline acceptance from a single-direction report" }
             val directions = listOf("old-on-new" to json.treeToValue(payload.get("oldOnNew"), CompatibilityReport::class.java),
@@ -151,12 +176,18 @@ class Report : Callable<Int> {
                 println("Direction: $name\n${renderReport(result, summaryOnly, details)}")
             }
             sarifPath?.let { writeJson(it, sarifReport(directions, sourcePrefix)) }
+            if (directions.any { !it.second.complete } || payload.path("complete").let { it.isBoolean && !it.asBoolean() } ||
+                tree.path("complete").let { it.isBoolean && !it.asBoolean() }) return 3
             return exitCode(CompatibilityEngine.aggregate(directions.map { it.second.gateVerdict ?: it.second.verdict }))
         }
         val report = json.treeToValue(payload, CompatibilityReport::class.java)
         require(report.schemaVersion == 1) { "Unsupported report schemaVersion: ${report.schemaVersion}" }
         println(renderReport(report, summaryOnly, details))
         sarifPath?.let { writeJson(it, sarifReport(listOf("old-on-new" to report), sourcePrefix)) }
+        if (!report.complete || tree.path("complete").let { it.isBoolean && !it.asBoolean() }) {
+            require(acceptedOutput == null && justification == null) { "Cannot accept baseline findings from incomplete verification." }
+            return 3
+        }
         acceptedOutput?.let {
             writeJson(it, BaselineAcceptance.fromReport(report, requireNotNull(justification) {
                 "--justification is required with --write-accepted-baseline"
@@ -184,12 +215,15 @@ fun renderReport(report: CompatibilityReport, summaryOnly: Boolean = false, allD
     appendLine("Database Compatibility Report")
     appendLine("Application: ${report.applicationVersion}")
     appendLine("Scope: ${report.scope}")
+    if (!report.complete) appendLine("INCOMPLETE: ${report.incompleteReason ?: "Verification did not finish."}")
     if (report.accessPaths.isNotEmpty()) appendLine(renderCoverage(report.accessPaths, details = allDetails,
         maxClasses = if (allDetails) Int.MAX_VALUE else 20))
     report.baseline?.let { baseline ->
         appendLine("Baseline health: ${baseline.verdict} (${baseline.findings.size} findings)")
         baseline.cacheStatus?.let { appendLine("Baseline cache: $it") }
         baseline.cacheReason?.let { appendLine("Baseline cache reason: $it") }
+        baseline.planCacheStatus?.let { appendLine("Baseline plan cache: $it") }
+        baseline.planCacheReason?.let { appendLine("Baseline plan cache reason: $it") }
         if (report.acceptedBaseline.isNotEmpty()) appendLine("Accepted baseline findings: ${report.acceptedBaseline.size} (justifications retained in JSON)")
     }
     val ruleRows = report.ruleSummary.ifEmpty {
@@ -231,7 +265,7 @@ fun renderReport(report: CompatibilityReport, summaryOnly: Boolean = false, allD
     }
     if (omitted > 0 && !summaryOnly) appendLine("$omitted findings omitted from terminal output; use report --details or inspect JSON.")
     appendLine()
-    appendLine("Result: ${report.verdict}")
+    appendLine(if (report.complete) "Result: ${report.verdict}" else "Partial evidence: ${report.verdict} (verification incomplete; exit 3)")
     report.gateVerdict?.let { appendLine("Migration gate with accepted baseline: $it (not a whole-contract safety proof)") }
     report.limitations.forEach { appendLine("Scope limitation: $it") }
 }.trimEnd()

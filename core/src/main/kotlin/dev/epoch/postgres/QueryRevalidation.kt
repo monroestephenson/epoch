@@ -2,62 +2,62 @@ package dev.epoch.postgres
 
 import dev.epoch.core.*
 
-/**
- * Reuses only structural planning results whose declared dependencies are unchanged.
- * This does not suppress catalog/input-domain rules or migration-effect analysis.
- * Incomplete dependencies and database-side behavior deliberately take the full path.
- */
+/** Catalog facts are diffed once per migration, independently of the number of SQL templates. */
 internal object QueryRevalidation {
-    fun needsPlanning(query: QueryContract, before: SchemaSnapshot, after: SchemaSnapshot): Boolean {
-        if (!query.dependenciesComplete || query.verificationStatus != VerificationStatus.EXTRACTED) return true
-        // Function bodies, views, triggers, row policies, casts and custom type semantics
-        // can reach dependencies not represented by table/column references in schema v1.
-        if (before.behaviors != after.behaviors ||
-            (before.behaviors.keys + after.behaviors.keys).any { !it.startsWith("enum:") } ||
-            before.extensions != after.extensions || before.enumTypes != after.enumTypes) return true
+    fun needsPlanning(query: QueryContract, before: SchemaSnapshot, after: SchemaSnapshot): Boolean =
+        delta(before, after).needsPlanning(query)
 
-        val tables = (query.tables + listOfNotNull(query.targetTable) +
-            (query.columns + query.writeColumns).map { it.table }).map(::physicalTable).toSet()
-        if (before.sequences != after.sequences) {
-            // Schema v1 does not enumerate direct sequence-function dependencies. A
-            // possible direct call therefore invalidates conservatively. Owned
-            // sequences on unrelated relations cannot affect this query's columns.
-            if (listOf("nextval", "currval", "setval").any { it in query.sql.lowercase() }) return true
-            val changed = (before.sequences.keys + after.sequences.keys).filter { before.sequences[it] != after.sequences[it] }
-            if (changed.any { name ->
-                val owner = after.sequenceOwners[name] ?: before.sequenceOwners[name]
-                owner == null || owner.table in tables
-            }) return true
-        }
-        val references = (query.columns + query.writeColumns).groupBy({ physicalTable(it.table) }, { postgresIdentifier(it.column) })
-        for (name in tables) {
+    fun delta(before: SchemaSnapshot, after: SchemaSnapshot): Delta {
+        val opaque = before.behaviors != after.behaviors ||
+            (before.behaviors.keys + after.behaviors.keys).any { !it.startsWith("enum:") } ||
+            before.extensions != after.extensions || before.enumTypes != after.enumTypes
+        val relations = mutableSetOf<String>()
+        val columns = mutableMapOf<String, Set<String>>()
+        val incomingTargets = mutableSetOf<String>()
+        var unknownIncomingTarget = false
+        for (name in before.tables.keys + after.tables.keys) {
             val old = before.tables[name]
             val new = after.tables[name]
-            if (old == null || new == null) {
-                if (old != new) return true
-                // A previous rejected plan remains rejected while its dependency
-                // remains absent; reuse does not turn that failure into acceptance.
-                continue
-            }
-            if (old.kind != new.kind) return true
-            if (old.constraints != new.constraints || old.indexes != new.indexes) return true
-            if (!query.explicitColumnList) {
-                if (old.columns != new.columns) return true
-            } else if (references[name].orEmpty().any { old.columns[it] != new.columns[it] }) return true
-        }
-        if (query.operation != Operation.SELECT) {
-            // Adding a referencing table can change an existing target's DELETE/UPDATE
-            // behavior; foreign keys are not declared among the query's source tables.
-            val changedConstraints = (before.tables.keys + after.tables.keys).any { name ->
-                val old = before.tables[name]?.constraints.orEmpty()
-                val new = after.tables[name]?.constraints.orEmpty()
-                if (old == new) false else (old.values + new.values).any { constraint ->
-                    constraint.type == "f" && (constraint.referencedTable == null || constraint.referencedTable in tables)
+            if (old == new) continue
+            if (old == null || new == null || old.kind != new.kind || old.constraints != new.constraints || old.indexes != new.indexes)
+                relations += name
+            val changed = (old?.columns.orEmpty().keys + new?.columns.orEmpty().keys)
+                .filter { old?.columns?.get(it) != new?.columns?.get(it) }.toSet()
+            if (changed.isNotEmpty()) columns[name] = changed
+            if (old?.constraints.orEmpty() != new?.constraints.orEmpty()) {
+                (old?.constraints.orEmpty().values + new?.constraints.orEmpty().values).filter { it.type == "f" }.forEach {
+                    if (it.referencedTable == null) unknownIncomingTarget = true else incomingTargets += it.referencedTable
                 }
             }
-            if (changedConstraints) return true
         }
-        return false
+        val changedSequences = (before.sequences.keys + after.sequences.keys).filter { before.sequences[it] != after.sequences[it] }
+        val owners = changedSequences.map { after.sequenceOwners[it] ?: before.sequenceOwners[it] }
+        return Delta(opaque, relations, columns, changedSequences.isNotEmpty(), owners.any { it == null },
+            owners.filterNotNull().map { it.table }.toSet(), incomingTargets, unknownIncomingTarget)
+    }
+
+    data class Delta internal constructor(
+        private val forceAll: Boolean,
+        private val changedRelations: Set<String>,
+        private val changedColumns: Map<String, Set<String>>,
+        private val sequencesChanged: Boolean,
+        private val unknownSequenceOwner: Boolean,
+        private val sequenceOwnerTables: Set<String>,
+        private val incomingTargets: Set<String>,
+        private val unknownIncomingTarget: Boolean,
+    ) {
+        fun needsPlanning(query: QueryContract): Boolean {
+            if (!query.dependenciesComplete || query.verificationStatus != VerificationStatus.EXTRACTED || forceAll) return true
+            val tables = (query.tables + listOfNotNull(query.targetTable) + (query.columns + query.writeColumns).map { it.table })
+                .map(::physicalTable).toSet()
+            if (tables.any { it in changedRelations }) return true
+            if (!query.explicitColumnList && tables.any { it in changedColumns }) return true
+            if ((query.columns + query.writeColumns).any { postgresIdentifier(it.column) in changedColumns[physicalTable(it.table)].orEmpty() }) return true
+            if (sequencesChanged && (unknownSequenceOwner || tables.any { it in sequenceOwnerTables } ||
+                    listOf("nextval", "currval", "setval").any { it in query.sql.lowercase() })) return true
+            if (query.operation != Operation.SELECT && (unknownIncomingTarget || tables.any { it in incomingTargets })) return true
+            return false
+        }
     }
 
     private fun physicalTable(name: String) = name.split('.').joinToString(".", transform = ::postgresIdentifier)

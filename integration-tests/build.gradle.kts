@@ -11,3 +11,7 @@ dependencies {
     testImplementation("io.quarkus:quarkus-panache-hibernate-common:3.15.4") { isTransitive = false }
     testImplementation("io.quarkus:quarkus-panache-common:3.15.4") { isTransitive = false }
 }
+
+tasks.test {
+    systemProperty("epoch.cli.test.classpath", sourceSets.test.get().runtimeClasspath.asPath)
+}

@@ -43,7 +43,7 @@ Repeated `--contract` inputs share one migrated baseline and pending migration s
 
 Exit codes are `0` for `SAFE`, `1` for `BREAKING`, `2` for `UNKNOWN`, and `3` for invalid input or runtime failure, including unexpected linkage errors. Without acceptance, the exit code follows the overall compatibility verdict. With `--accepted-baseline`, it follows the distinct `gateVerdict`; the report still preserves the overall verdict and justified baseline debt.
 
-Preserve the executable's exit status in CI. Upload the JSON report after verification, including nonzero compatibility results. Startup or baseline failure can occur before a report is written; never reuse an earlier run's report as the current result.
+Preserve the executable's exit status in CI. Upload the JSON report after verification, including nonzero compatibility results. Verification checkpoints are explicitly incomplete until the entire requested run succeeds; incomplete reports return exit 3 when rendered and cannot be used to accept baseline debt. Invalid arguments can still fail before a checkpoint is created, so never reuse an earlier run's report as the current result.
 
 ## Review existing baseline debt
 
@@ -77,6 +77,16 @@ Acceptance never suppresses new migration findings. A stale contract, baseline i
 The cache key covers all baseline file names and bytes, PostgreSQL image identity, Flyway version, and relevant settings. File locks and atomic publication protect concurrent writers; archive and catalog checksums detect corruption or an incompatible restore. Flyway validates restored history against current baseline files. Reports expose `DISABLED`, `MISS`, `HIT`, or `REBUILT` in `baseline.cacheStatus`. A valid hit avoids rerunning the historical migrations. Invalid entries are rebuilt from the supplied baseline; no stale pending-migration state is reused.
 
 Preserve this directory between trusted CI runs if desired. The cache must be outside both migration directories; nested paths and symlink aliases are rejected. Baseline and pending directories must not overlap, since Flyway scans them recursively. Cache metadata can differ between otherwise equivalent reports; compare compatibility evidence and verdicts when assessing repeatability across cache states.
+
+## Planning cost and interrupted runs
+
+Use `--planning-parallelism 4` to bound independent PostgreSQL planning workers. Baseline checks and already committed states can use separate connections. Checks within a transactional Flyway migration stay on its own connection so they see that migration's uncommitted DDL; opening worker connections there would check the wrong schema or block on migration locks.
+
+Each step computes its catalog changes once and retains the previous plans for unaffected complete dependencies. Incomplete SQL, hidden database behavior, and relevant constraint or type changes take the conservative re-check path. `replannedQueries` and `reusedQueries` show the work performed. A 10,000-statement contract with 100 statements affected per step needs 10,000 re-checks over 100 steps, rather than 1,000,000. Baseline contract-check caching is separate from the database dump cache and remains bound to the contract, baseline, catalog, and planner format.
+
+Size CI from measured planning cost on the actual runner. For example, at 4 ms per statement, 10,000 serial checks cost about 40 seconds before startup, catalog inspection, and report output. Re-checking 100 statements adds roughly 0.4 seconds per transactional step at the same rate. These are arithmetic estimates, not latency promises. Start with 2–4 planning workers and leave memory and CPU for PostgreSQL as well as the JVM; increase the global timeout for large contracts. Do not multiply every migration by the entire contract size when dependencies are complete.
+
+The CLI writes an initial incomplete checkpoint and replaces it atomically after baseline verification and each completed step. On timeout, failure, SIGINT, or SIGTERM, completed results remain available. `report` identifies the checkpoint as incomplete and returns exit 3 even if its completed steps were safe. The in-flight step is not claimed complete, and SIGKILL cannot run a shutdown hook. Reports omit elapsed times, process IDs, and scheduling-dependent ordering; compare findings and verdicts separately from cache-hit metadata.
 
 ## Logging and offline use
 

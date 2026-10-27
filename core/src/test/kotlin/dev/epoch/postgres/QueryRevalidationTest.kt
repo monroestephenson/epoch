@@ -14,6 +14,26 @@ class QueryRevalidationTest {
     private val table = TableSchema(columns = mapOf("id" to ColumnSchema("bigint", false), "unused" to ColumnSchema("text", true)))
     private val baseline = SchemaSnapshot(tables = mapOf("public.customers" to table))
 
+    @Test fun `ten thousand query dependencies across one hundred steps select only the changed table`() {
+        val queries = (0 until 100).flatMap { relation -> (0 until 100).map { index ->
+            query.copy(id = "$relation-$index", tables = listOf("public.table_$relation"),
+                columns = listOf(ColumnReference("public.table_$relation", "id")))
+        } }
+        var before = SchemaSnapshot(tables = (0 until 100).associate { "public.table_$it" to table })
+        var total = 0
+        repeat(100) { index ->
+            val name = "public.table_$index"
+            val after = before.copy(tables = before.tables + (name to table.copy(columns = table.columns + ("id" to ColumnSchema("integer", false)))))
+            val delta = QueryRevalidation.delta(before, after)
+            val selected = queries.filter(delta::needsPlanning)
+            assertEquals(100, selected.size)
+            assertTrue(selected.all { name in it.tables })
+            total += selected.size
+            before = after
+        }
+        assertEquals(10000, total, "The SQL planning workload follows changed dependencies, not 100 times the 10000-query contract")
+    }
+
     @Test fun `unreferenced table and column changes reuse explicit query plans`() {
         val after = baseline.copy(tables = baseline.tables + ("public.audit" to table) +
             ("public.customers" to table.copy(columns = table.columns + ("metadata" to ColumnSchema("text", true)))))

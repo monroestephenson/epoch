@@ -7,7 +7,8 @@ import java.sql.SQLException
 import java.sql.SQLNonTransientConnectionException
 import java.sql.SQLRecoverableException
 import java.sql.SQLTransientConnectionException
-import java.util.concurrent.atomic.AtomicLong
+import java.security.MessageDigest
+import java.util.concurrent.ConcurrentLinkedQueue
 
 internal data class QueryPlan(
     val accepted: Boolean,
@@ -23,16 +24,79 @@ internal data class QueryPlanningStep(
     val plans: Map<String, QueryPlan>,
     val replannedQueries: Int,
     val reusedQueries: Int,
+    val planningParallelism: Int = 1,
 )
+
+internal data class QueryPlanningBatch(val plans: Map<String, QueryPlan>, val planningParallelism: Int)
 
 /** PREPARE plus EXPLAIN, never EXECUTE/ANALYZE: DML is planned but not run. */
 internal class PostgresQueryPlanner {
-    private val nextId = AtomicLong()
     private var batchTypeCache: MutableMap<String, String?>? = null
 
     /** Resolve recurring JDBC type aliases once per schema state, not once per parameter. */
-    fun inspectAll(connection: Connection, queries: List<QueryContract>): Map<String, QueryPlan> = withTypeCache {
-        queries.associate { it.id to inspect(connection, it) }
+    fun inspectAll(connection: Connection, queries: List<QueryContract>,
+                   baselineParameterTypes: Map<String, List<String>> = emptyMap()): Map<String, QueryPlan> = withTypeCache {
+        queries.associate { it.id to inspect(connection, it, baselineParameterTypes[it.id]) }
+    }
+
+    /** Each worker owns its connection and type cache; aggregation follows contract order, not completion order. */
+    fun inspectParallel(queries: List<QueryContract>, connectionFactory: () -> Connection, parallelism: Int,
+                        baselineParameterTypes: Map<String, List<String>> = emptyMap()): QueryPlanningBatch {
+        if (queries.isEmpty()) return QueryPlanningBatch(emptyMap(), 0)
+        val opened = ConcurrentLinkedQueue<Connection>()
+        try {
+            val partitions = PlanningWorkers.mapPartitions(queries, parallelism) { batch ->
+                connectionFactory().also(opened::add).use { connection ->
+                    PostgresQueryPlanner().inspectAll(connection, batch, baselineParameterTypes)
+                }
+            }
+            val gathered = partitions.flatMap { it.entries }.associate { it.toPair() }
+            return QueryPlanningBatch(queries.associate { it.id to gathered.getValue(it.id) }, minOf(parallelism, queries.size))
+        } catch (failure: Throwable) {
+            opened.forEach { connection -> runCatching { connection.abort { it.run() } }.exceptionOrNull()?.let(failure::addSuppressed) }
+            throw failure
+        }
+    }
+
+    fun inspectSupportedBatch(connection: Connection, queries: List<QueryContract>, snapshot: SchemaSnapshot,
+                              connectionFactory: (() -> Connection)?, parallelism: Int,
+                              baselineParameterTypes: Map<String, List<String>> = emptyMap()): QueryPlanningBatch {
+        if (queries.isEmpty()) return QueryPlanningBatch(emptyMap(), 0)
+        if (connectionFactory == null || parallelism == 1 || !connection.autoCommit)
+            return QueryPlanningBatch(inspectAll(connection, queries, baselineParameterTypes), 1)
+        val safety = PlanningSafety(snapshot)
+        val eligible = queries.map(safety::eligible)
+        val plans = linkedMapOf<String, QueryPlan>()
+        var maximumWorkers = 1
+        var start = 0
+        while (start < queries.size) {
+            var end = start + 1
+            while (end < queries.size && eligible[end] == eligible[start]) end++
+            val batch = queries.subList(start, end)
+            var pooled: QueryPlanningBatch? = null
+            if (eligible[start] && batch.size > 1) {
+                val expected = PlanningSession.capture(connection)
+                try {
+                    pooled = inspectParallel(batch, {
+                        val opened = connectionFactory()
+                        try {
+                            if (PlanningSession.capture(opened) != expected) throw PlanningSessionMismatch()
+                            opened
+                        } catch (failure: Throwable) {
+                            runCatching { opened.close() }.exceptionOrNull()?.let(failure::addSuppressed)
+                            throw failure
+                        }
+                    }, parallelism, baselineParameterTypes)
+                } catch (_: PlanningSessionMismatch) {
+                    // Session-local settings, role or temporary names require the migration's own connection.
+                }
+            }
+            val result = pooled ?: QueryPlanningBatch(inspectAll(connection, batch, baselineParameterTypes), 1)
+            plans.putAll(result.plans)
+            maximumWorkers = maxOf(maximumWorkers, result.planningParallelism)
+            start = end
+        }
+        return QueryPlanningBatch(plans, maximumWorkers)
     }
 
     private inline fun <T> withTypeCache(block: () -> T): T {
@@ -43,7 +107,9 @@ internal class PostgresQueryPlanner {
 
     fun inspect(connection: Connection, query: QueryContract, baselineParameterTypes: List<String>? = null): QueryPlan {
         val savepoint = if (!connection.autoCommit) connection.setSavepoint() else null
-        val name = "epoch_contract_${nextId.incrementAndGet()}"
+        // Fixed-length names keep PostgreSQL error positions stable across worker schedules and cache hits.
+        val name = "epoch_" + MessageDigest.getInstance("SHA-256").digest((query.id + "\u0000" + query.sql).toByteArray())
+            .take(16).joinToString("") { "%02x".format(it) }
         var prepared = false
         var primaryFailure: Throwable? = null
         return try {
@@ -161,29 +227,27 @@ internal class PostgresQueryPlanner {
         before: SchemaSnapshot,
         after: SchemaSnapshot,
         previousPlans: Map<String, QueryPlan> = baseline,
-    ): QueryPlanningStep = withTypeCache {
+        connectionFactory: (() -> Connection)? = null,
+        parallelism: Int = 1,
+    ): QueryPlanningStep {
+        val delta = QueryRevalidation.delta(before, after)
+        val changed = queries.filter { query -> baseline.getValue(query.id).accepted &&
+            (previousPlans[query.id] == null || delta.needsPlanning(query)) }
+        val types = changed.associate { it.id to baseline.getValue(it.id).parameterTypes }
+        // A second session cannot observe DDL inside Flyway's current transaction.
+        val inspected = inspectSupportedBatch(connection, changed, after, connectionFactory, parallelism, types)
         val plans = linkedMapOf<String, QueryPlan>()
-        var replanned = 0
-        var reused = 0
         val findings = queries.mapNotNull { query ->
             val original = baseline.getValue(query.id)
             if (!original.accepted) {
                 plans[query.id] = original
-                reused++
                 return@mapNotNull baselineFinding(query, original)
             }
-            val previous = previousPlans[query.id]
-            val current = if (previous == null || QueryRevalidation.needsPlanning(query, before, after)) {
-                replanned++
-                inspect(connection, query, original.parameterTypes)
-            } else {
-                reused++
-                previous
-            }
+            val current = inspected.plans[query.id] ?: previousPlans.getValue(query.id)
             plans[query.id] = current
             comparisonFinding(query, original, current, migration)
         }
-        QueryPlanningStep(findings, plans, replanned, reused)
+        return QueryPlanningStep(findings, plans, changed.size, queries.size - changed.size, inspected.planningParallelism)
     }
 
     /** Full revalidation entry point retained for callers without factual dependency snapshots. */

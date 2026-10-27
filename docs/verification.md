@@ -71,6 +71,10 @@ Flyway's PostgreSQL transactional lock is disabled to avoid holding the snapshot
 
 `RuntimeCliPostgresTest` exercises actual PostgreSQL container termination during a pending migration and malformed SQL (`42601`) through the CLI. Both retain `MIGRATION_EXECUTION_FAILED` and the migration filename and return exit 3. `VerificationOperationsTest` separately verifies concurrent index completion and timeout cancellation. These are execution diagnostics, not compatibility findings or evidence that an old contract is broken.
 
+Planning uses a bounded connection pool for independent baseline checks and committed states. Transactional migration checks retain the migration connection to observe uncommitted changes. Incremental invalidation computes each catalog diff once and reuses only plans whose complete dependencies remain unchanged. A cached baseline plan must match the contract, baseline migration key, catalog, and planner format; unsupported or data-dependent evidence is re-checked. Neither parallelism nor caching changes a compatibility rule or turns incomplete coverage into safety.
+
+Progress snapshots carry `complete=false` until verification finishes. An interrupted checkpoint is execution evidence for completed work, not a completed compatibility verdict. Reading it through `report` exits 3, and baseline acceptance cannot be generated from it. The CLI preserves checkpoints on timeouts and termination signals; it does not certify an interrupted migration's final state.
+
 The optional baseline cache explains `MISS`, `HIT`, and `REBUILT` through `baseline.cacheReason`. Its schema digest uses logical live-column order, so PostgreSQL restore's removal of historical dropped-column slots does not repeatedly invalidate equivalent dumps.
 
 See [rollout and rollback workflows](feedback-round2.md#rollout-and-rollback-workflows) for `--new-contract` and `verify-release`. Reverse verification uses a retained copy of the old schema; it does not execute down migrations.

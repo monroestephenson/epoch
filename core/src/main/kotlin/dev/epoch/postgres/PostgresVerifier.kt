@@ -21,6 +21,9 @@ data class VerificationOptions(
     val migrationTimeoutSeconds: Long = 120,
     val globalTimeoutSeconds: Long = 1800,
     val executeBoundaries: Boolean = false,
+    val planningParallelism: Int = 4,
+    /** Immutable incomplete snapshots after baseline and each migration; final results are returned normally. */
+    val progress: ((String, CompatibilityReport) -> Unit)? = null,
 )
 
 /** The only public verification target is a newly created, disposable PostgreSQL container. */
@@ -63,6 +66,7 @@ class PostgresVerifier {
         newContracts?.let(::validateContracts)
         require(options.migrationTimeoutSeconds in 1..86400) { "migrationTimeoutSeconds must be between 1 and 86400" }
         require(options.globalTimeoutSeconds in 1..604800) { "globalTimeoutSeconds must be between 1 and 604800" }
+        require(options.planningParallelism in 1..32) { "planningParallelism must be between 1 and 32" }
         require(Files.isDirectory(baselineDirectory)) { "Baseline migration directory does not exist: $baselineDirectory" }
         require(Files.isDirectory(migrationsDirectory)) { "Pending migration directory does not exist: $migrationsDirectory" }
         validateDirectoryIsolation(baselineDirectory, migrationsDirectory, options.baselineCache)
@@ -115,14 +119,22 @@ class PostgresVerifier {
                     catch (failure: Throwable) { throw executionFailure("BASELINE_VALIDATION_FAILED", null, failure) }
                     val catalog = PostgresCatalog()
                     val planner = PostgresQueryPlanner()
+                    fun openPlanningConnection() = DriverManager.getConnection(database.jdbcUrl, database.username, database.password)
+                    fun planBatch(connection: java.sql.Connection, queries: List<QueryContract>, snapshot: SchemaSnapshot): QueryPlanningBatch {
+                        return planner.inspectSupportedBatch(connection, queries, snapshot, ::openPlanningConnection, options.planningParallelism)
+                    }
                     val boundaryCollector = if (options.executeBoundaries) PostgresBoundaryProbes() else null
                     val engine = CompatibilityEngine()
                     val baseline: SchemaSnapshot
                     val baselinePlans: Map<String, QueryPlan>
+                    val baselinePlanResult: BaselinePlans
                     val boundaryBaseline: BoundaryProbeBaseline?
                     DriverManager.getConnection(database.jdbcUrl, database.username, database.password).use { connection ->
                         baseline = catalog.inspect(connection)
-                        baselinePlans = planner.inspectAll(connection, contract.queries)
+                        baselinePlanResult = BaselinePlanCache(options.baselineCache, PlanningSession.capture(connection)).prepare(contract, cacheKey, baseline) { queries ->
+                            planBatch(connection, queries, baseline)
+                        }
+                        baselinePlans = baselinePlanResult.plans
                         boundaryBaseline = boundaryCollector?.collectBaseline(connection, contract, baseline, baselinePlans)
                         // Preserve the exact old schema and seed data once, without replaying migrations.
                         // PostgreSQL clones only this verifier-owned database into another owned database.
@@ -133,11 +145,16 @@ class PostgresVerifier {
                     val baselineFindings = planner.baselineFindings(contract.queries, baselinePlans) +
                         baselineCallbacks.map { callbackFinding(it, null) }
                     val baselineHealth = engine.inspectBaseline(contract, baseline, baselineFindings, cacheKey)
-                        .copy(cacheStatus = cacheResult.status, cacheKey = cacheKey, cacheReason = cacheResult.reason)
+                        .copy(cacheStatus = cacheResult.status, cacheKey = cacheKey, cacheReason = cacheResult.reason,
+                            planCacheStatus = baselinePlanResult.status, planCacheKey = baselinePlanResult.key,
+                            planCacheReason = baselinePlanResult.reason, plannedQueries = baselinePlanResult.plannedQueries,
+                            reusedQueries = baselinePlanResult.reusedQueries, planningParallelism = baselinePlanResult.planningParallelism)
                     val steps = pendingCallbacks.map { filename ->
                         val migration = MigrationInfo("callback", filename)
                         MigrationReport(migration, Verdict.UNKNOWN, listOf(callbackFinding(filename, migration)))
                     }.toMutableList()
+                    if (options.progress != null) publishProgress(options, "old-on-new",
+                        engine.report(contract, steps.toList(), baselineHealth, options.acceptedBaseline))
                     var priorSchema = baseline
                     var currentPlans = baselinePlans
                     MigrationDeadline(options.migrationTimeoutSeconds).use { deadline ->
@@ -157,13 +174,16 @@ class PostgresVerifier {
                                         failure.javaClass.simpleName, migration = migration))
                                 }
                                 val planning = planner.planStep(context.connection, contract.queries, baselinePlans,
-                                    migration, priorSchema, after, currentPlans)
+                                    migration, priorSchema, after, currentPlans, ::openPlanningConnection, options.planningParallelism)
                                 val witnesses = boundaryBaseline?.let { boundaryCollector?.findings(context.connection, it, after, migration) }.orEmpty()
                                 steps += engine.verifyStep(contract, baseline, after, migration,
                                     baselineHealth.findings + effects + planning.findings + witnesses)
-                                    .copy(replannedQueries = planning.replannedQueries, reusedQueries = planning.reusedQueries)
+                                    .copy(replannedQueries = planning.replannedQueries, reusedQueries = planning.reusedQueries,
+                                        planningParallelism = planning.planningParallelism)
                                 priorSchema = after
                                 currentPlans = planning.plans
+                                if (options.progress != null) publishProgress(options, "old-on-new",
+                                    engine.report(contract, steps.toList(), baselineHealth, options.acceptedBaseline))
                             }
                         }
                         try {
@@ -185,19 +205,24 @@ class PostgresVerifier {
                         val finalPlans: Map<String, QueryPlan>
                         DriverManager.getConnection(database.jdbcUrl, database.username, database.password).use { connection ->
                             finalSchema = catalog.inspect(connection)
-                            finalPlans = planner.inspectAll(connection, next.queries)
+                            finalPlans = planBatch(connection, next.queries, finalSchema).plans
                         }
                         val finalHealth = engine.inspectBaseline(next, finalSchema,
                             planner.baselineFindings(next.queries, finalPlans), "new-application-final-schema:$cacheKey")
+                        if (options.progress != null) publishProgress(options, "new-on-old", engine.report(next, emptyList(), finalHealth))
                         val queryPart = database.jdbcUrl.substringAfter('?', "")
                         val oldUrl = database.jdbcUrl.substringBefore('?').substringBeforeLast('/') + "/epoch_rollback" +
                             if (queryPart.isNotEmpty()) "?$queryPart" else ""
                         val reverseStep = DriverManager.getConnection(oldUrl, database.username, database.password).use { connection ->
                             val migration = MigrationInfo("rollback", "<old-schema>")
-                            val planning = planner.planStep(connection, next.queries, finalPlans, migration, finalSchema, baseline)
+                            val planning = planner.planStep(connection, next.queries, finalPlans, migration, finalSchema, baseline,
+                                connectionFactory = { DriverManager.getConnection(oldUrl, database.username, database.password) },
+                                parallelism = options.planningParallelism)
                             engine.verifyStep(next, finalSchema, baseline, migration, finalHealth.findings + planning.findings)
-                                .copy(replannedQueries = planning.replannedQueries, reusedQueries = planning.reusedQueries)
+                                .copy(replannedQueries = planning.replannedQueries, reusedQueries = planning.reusedQueries,
+                                    planningParallelism = planning.planningParallelism)
                         }
+                        if (options.progress != null) publishProgress(options, "new-on-old", engine.report(next, listOf(reverseStep), finalHealth))
                         engine.report(next, listOf(reverseStep), finalHealth).let {
                             it.copy(limitations = it.limitations + "New-on-old verifies the new contract against the retained original schema; it does not execute or prove down-migration behavior." +
                                 if (options.executeBoundaries) listOf("Optional boundary execution applies only to old-on-new verification; reverse compatibility uses catalog and SQL planning evidence.") else emptyList())
@@ -205,6 +230,20 @@ class PostgresVerifier {
                     }
                     forward to reverse
                 }
+        }
+    }
+
+    private fun publishProgress(options: VerificationOptions, direction: String, report: CompatibilityReport) {
+        val snapshot = report.copy(
+            migrations = report.migrations.map { it.copy(findings = it.findings.toList()) },
+            complete = false,
+            incompleteReason = "Verification has not completed all requested migration states.",
+            verdict = if (report.verdict == Verdict.BREAKING) Verdict.BREAKING else Verdict.UNKNOWN,
+            gateVerdict = report.gateVerdict?.let { if (it == Verdict.BREAKING) it else Verdict.UNKNOWN },
+        )
+        try { options.progress?.invoke(direction, snapshot) }
+        catch (failure: Exception) {
+            throw VerificationException("PROGRESS_REPORT_FAILED", message = "Could not persist verification progress: ${failure.message}", cause = failure)
         }
     }
 

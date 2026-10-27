@@ -139,6 +139,8 @@ data class MigrationReport(
     val findings: List<Finding>,
     val replannedQueries: Int? = null,
     val reusedQueries: Int? = null,
+    /** Effective number of planning workers; transactional DDL is checked on its owning connection. */
+    val planningParallelism: Int? = null,
 )
 
 data class CompatibilityReport(
@@ -157,6 +159,9 @@ data class CompatibilityReport(
     val acceptedBaseline: List<AcceptedBaselineFinding> = emptyList(),
     val ruleSummary: List<RuleSummary> = emptyList(),
     val accessPaths: List<AccessPathCoverage> = emptyList(),
+    /** A checkpoint cannot certify all requested migration states. */
+    val complete: Boolean = true,
+    val incompleteReason: String? = null,
 )
 
 /** A baseline fingerprint binds acceptance to the contract, catalog and baseline migration input. */
@@ -167,6 +172,12 @@ data class BaselineReport(
     val cacheStatus: String? = null,
     val cacheKey: String? = null,
     val cacheReason: String? = null,
+    val planCacheStatus: String? = null,
+    val planCacheKey: String? = null,
+    val planCacheReason: String? = null,
+    val plannedQueries: Int? = null,
+    val reusedQueries: Int? = null,
+    val planningParallelism: Int? = null,
 )
 
 data class AcceptedBaseline(

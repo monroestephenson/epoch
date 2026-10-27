@@ -34,6 +34,8 @@ class VerifyRelease : Callable<Int> {
     var migrationTimeoutSeconds: Long = 120
     @Option(names = ["--global-timeout-seconds"], defaultValue = "1800", description = ["Maximum verification duration in seconds"])
     var globalTimeoutSeconds: Long = 1800
+    @Option(names = ["--planning-parallelism"], defaultValue = "4", description = ["Maximum independent planning connections (default: 4); transactional checks use their owning connection"])
+    var planningParallelism: Int = 4
     @Option(names = ["--details"], description = ["Show every finding"])
     var details = false
     @Option(names = ["--execute-boundaries"], description = ["Run supported counterexample probes; samples never establish SAFE"])
@@ -42,26 +44,35 @@ class VerifyRelease : Callable<Int> {
     override fun call(): Int {
         val contracts = contractPaths.map { json.readValue<DatabaseContract>(it.toFile()) }
         val newContracts = newContractPaths.map { json.readValue<DatabaseContract>(it.toFile()) }
-        val options = VerificationOptions(baselineCache = baselineCache, migrationTimeoutSeconds = migrationTimeoutSeconds,
-            globalTimeoutSeconds = globalTimeoutSeconds, executeBoundaries = executeBoundaries)
         return GitReleaseMigrations.materialize(repository, baseRef, targetRef, migrationPath).use { files ->
-            val verifier = PostgresVerifier()
-            val verification: Any
-            val directions: List<Pair<String, CompatibilityReport>>
-            if (newContracts.isEmpty()) {
-                val report = verifier.verify(contracts, files.baseline, files.pending, options)
-                verification = report
-                directions = listOf("old-on-new" to report)
-            } else {
-                val report = verifier.verifyBidirectional(contracts, newContracts, files.baseline, files.pending, options)
-                verification = report
-                directions = listOf("old-on-new" to report.oldOnNew, "new-on-old" to report.newOnOld)
+            val expectedDirections = if (newContracts.isEmpty()) listOf("old-on-new") else listOf("old-on-new", "new-on-old")
+            VerificationCheckpoint(reportPath, expectedDirections, files.provenance).use { checkpoint ->
+                try {
+                    val options = VerificationOptions(baselineCache = baselineCache, migrationTimeoutSeconds = migrationTimeoutSeconds,
+                        globalTimeoutSeconds = globalTimeoutSeconds, executeBoundaries = executeBoundaries,
+                        planningParallelism = planningParallelism, progress = checkpoint::progress)
+                    val verifier = PostgresVerifier()
+                    val verification: Any
+                    val directions: List<Pair<String, CompatibilityReport>>
+                    if (newContracts.isEmpty()) {
+                        val report = verifier.verify(contracts, files.baseline, files.pending, options)
+                        verification = report
+                        directions = listOf("old-on-new" to report)
+                    } else {
+                        val report = verifier.verifyBidirectional(contracts, newContracts, files.baseline, files.pending, options)
+                        verification = report
+                        directions = listOf("old-on-new" to report.oldOnNew, "new-on-old" to report.newOnOld)
+                    }
+                    checkpoint.complete(mapOf("schemaVersion" to 1, "release" to files.provenance, "verification" to verification))
+                    sarifPath?.let { writeJson(it, sarifReport(directions, migrationPath)) }
+                    println("Git migrations: ${files.provenance.baseCommit} -> ${files.provenance.targetCommit}")
+                    directions.forEach { (name, report) -> println("Direction: $name\n${renderReport(report, allDetails = details)}") }
+                    exitCode(CompatibilityEngine.aggregate(directions.map { it.second.gateVerdict ?: it.second.verdict }))
+                } catch (failure: Throwable) {
+                    try { checkpoint.fail(failure) } catch (checkpointFailure: Throwable) { failure.addSuppressed(checkpointFailure) }
+                    throw failure
+                }
             }
-            writeJson(reportPath, mapOf("schemaVersion" to 1, "release" to files.provenance, "verification" to verification))
-            sarifPath?.let { writeJson(it, sarifReport(directions, migrationPath)) }
-            println("Git migrations: ${files.provenance.baseCommit} -> ${files.provenance.targetCommit}")
-            directions.forEach { (name, report) -> println("Direction: $name\n${renderReport(report, allDetails = details)}") }
-            exitCode(CompatibilityEngine.aggregate(directions.map { it.second.gateVerdict ?: it.second.verdict }))
         }
     }
 }
