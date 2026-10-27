@@ -9,7 +9,7 @@ import java.nio.file.Path
 
 /** Runs the API-compatible, tested adapter against the application's own Hibernate and JPA runtime. */
 internal object IsolatedHibernateRuntime {
-    val testedVersions = setOf("6.6.13.Final", "7.0.10.Final", "7.1.4.Final")
+    val testedVersions = setOf("6.6.13.Final", "7.0.10.Final", "7.1.4.Final", "7.4.9.Final")
 
     fun extractIfRequired(request: ExtractionRequest): DatabaseContract? {
         // Request/model classes deliberately cross the loader boundary; Hibernate classes never do.

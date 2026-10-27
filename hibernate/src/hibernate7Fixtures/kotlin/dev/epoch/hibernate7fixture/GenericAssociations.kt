@@ -5,12 +5,14 @@ import jakarta.persistence.Id
 import jakarta.persistence.JoinColumn
 import jakarta.persistence.JoinTable
 import jakarta.persistence.ManyToMany
+import jakarta.persistence.NamedQuery
 import jakarta.persistence.OneToMany
 import jakarta.persistence.Table
 
-/** Compiled against Hibernate 7/JPA 3.2, without the adapter's bundled Hibernate 6 classes. */
+/** Compiled against Hibernate 7.4.9/JPA 3.2, without the adapter's bundled Hibernate 6 classes. */
 @Entity
 @Table(name = "hibernate7_team")
+@NamedQuery(name = "GenericTeam.byMember", query = "select t from GenericTeam t join t.members m where m.name = :name")
 open class GenericTeam {
     @field:Id open var id: Long = 0
     open var name: String = ""

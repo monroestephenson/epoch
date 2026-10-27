@@ -8,7 +8,8 @@ import kotlin.test.*
 
 class Hibernate7RuntimeTest {
     @Test fun `application Hibernate 7 boots in isolation and produces mapping and SQL contracts`() {
-        for ((property, version) in listOf("epoch.hibernate7.classpath" to "7.1.4.Final", "epoch.hibernate70.classpath" to "7.0.10.Final")) {
+        for ((property, version) in listOf("epoch.hibernate749.classpath" to "7.4.9.Final",
+            "epoch.hibernate7.classpath" to "7.1.4.Final", "epoch.hibernate70.classpath" to "7.0.10.Final")) {
         val classpath = System.getProperty(property).split(File.pathSeparator) +
             Path.of(Customer::class.java.protectionDomain.codeSource.location.toURI()).toString()
         val contract = HibernateExtractor().extract(ExtractionRequest(listOf(Customer::class.java.name, CollectionRecord::class.java.name,

@@ -8,6 +8,7 @@ import org.hibernate.engine.spi.LoadQueryInfluencers
 import org.hibernate.engine.spi.SessionFactoryImplementor
 import org.hibernate.loader.ast.internal.SingleIdEntityLoaderStandardImpl
 import org.hibernate.metamodel.mapping.SelectableMapping
+import org.hibernate.metamodel.mapping.SelectableMappings
 import org.hibernate.persister.entity.AbstractEntityPersister
 import org.hibernate.query.sqm.tree.select.SqmSelectStatement
 import org.hibernate.query.sql.internal.ParameterParser
@@ -198,7 +199,10 @@ class HibernateExtractor {
             p.forEachSelectable(consume)
             // Secondary/JOINED tables have their own key columns, which do not always appear among attribute selectables.
             p.forEachMutableTable { table ->
-                table.keyMapping.forEachSelectable { _, selectable ->
+                // KeyMapping changes from a class to an interface in Hibernate 7.4.
+                // Dispatch through its stable superinterface in both runtime generations.
+                val keySelectables: SelectableMappings = table.keyMapping
+                keySelectables.forEachSelectable { _, selectable ->
                     if (!selectable.isFormula) selectables.putIfAbsent(qualified(table.tableName) to identifier(selectable.selectionExpression), selectable)
                 }
             }
@@ -268,9 +272,10 @@ class HibernateExtractor {
                 val loader = SingleIdEntityLoaderStandardImpl<Any>(p, influencers)
                 val resolve = loader.javaClass.methods.single { it.name == "resolveLoadPlan" }
                 val plan = (if (resolve.parameterCount == 2) resolve.invoke(loader, LockOptions.NONE, influencers)
-                    else resolve.invoke(loader, LockOptions.NONE, influencers, factory)) as org.hibernate.loader.ast.internal.SingleIdLoadPlan<*>
-                capture("${p.entityName}.findById", Operation.SELECT, plan.jdbcSelect.sqlString,
-                    plan.jdbcSelect.affectedTableNames.map(::qualified), plan.jdbcSelect.parameterBinders)
+                    else resolve.invoke(loader, LockOptions.NONE, influencers, factory))
+                val jdbc = HibernateSqlOperations.loadPlanSelect(plan)
+                capture("${p.entityName}.findById", Operation.SELECT, jdbc.sqlString,
+                    HibernateSqlOperations.affectedTableNames(jdbc).map(::qualified), jdbc.parameterBinders)
             } catch (e: ReflectiveOperationException) {
                 unresolved += UnresolvedQuery("${p.entityName}.findById", "Hibernate loader SPI accessor failed: ${e.javaClass.simpleName}: ${e.message}")
             } catch (e: RuntimeException) {
@@ -317,14 +322,7 @@ class HibernateExtractor {
                             options, xref, parameters, influencers, creationContext).translate().sqlAst
                         else -> error("Unsupported Hibernate SQM statement ${sqm.javaClass.name}")
                     }
-                    val translator = factory.jdbcServices.jdbcEnvironment.sqlAstTranslatorFactory
-                    val jdbc = when (ast) {
-                        is org.hibernate.sql.ast.tree.select.SelectStatement -> translator.buildSelectTranslator(factory, ast)
-                            .translate(JdbcParameterBindings.NO_BINDINGS, options)
-                        is org.hibernate.sql.ast.tree.MutationStatement -> translator.buildMutationTranslator(factory, ast)
-                            .translate(JdbcParameterBindings.NO_BINDINGS, options)
-                        else -> error("Unsupported Hibernate SQL AST ${ast.javaClass.name}")
-                    }
+                    val jdbc = HibernateSqlOperations.translate(factory, ast, options)
                     val deps = SqlDependencies.inspect(jdbc.sqlString, request.hibernateProperties["hibernate.default_schema"] ?: "public")
                     val astDependencies = DependencyWalker()
                     ast.accept(astDependencies)
@@ -416,8 +414,7 @@ class HibernateExtractor {
             }
             try {
                 val loader = org.hibernate.loader.ast.internal.CollectionLoaderSingleKey(p.attributeMapping, LoadQueryInfluencers(factory), factory)
-                val jdbc = factory.jdbcServices.jdbcEnvironment.sqlAstTranslatorFactory.buildSelectTranslator(factory, loader.sqlAst)
-                    .translate(JdbcParameterBindings.NO_BINDINGS, org.hibernate.query.spi.QueryOptions.NONE)
+                val jdbc = HibernateSqlOperations.translate(factory, loader.sqlAst, org.hibernate.query.spi.QueryOptions.NONE)
                 capture("load", Operation.SELECT, jdbc.sqlString, jdbc.parameterBinders)
                 val writable = p.isMutable && (owner == null || operations(request, owner).any { it != Operation.SELECT })
                 if (writable && !p.isInverse) {

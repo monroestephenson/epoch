@@ -1,6 +1,7 @@
 package dev.epoch.hibernate
 
 import dev.epoch.core.Operation
+import dev.epoch.core.QuerySource
 import org.junit.jupiter.api.Test
 import java.io.File
 import java.nio.file.Files
@@ -13,14 +14,15 @@ class Hibernate7CompiledFixtureTest {
     @Test fun `Kotlin List associations compiled against Hibernate 7 extract with the application runtime`() {
         val compileClasspath = requireNotNull(System.getProperty("epoch.hibernate7.fixture.compile.classpath"))
             .split(File.pathSeparator)
-        assertTrue(compileClasspath.any { Path.of(it).fileName.toString() == "hibernate-core-7.1.4.Final.jar" })
+        assertTrue(compileClasspath.any { Path.of(it).fileName.toString() == "hibernate-core-7.4.9.Final.jar" })
         assertFalse(compileClasspath.any { Path.of(it).fileName.toString().startsWith("hibernate-core-6.") })
         val fixtureClasspath = requireNotNull(System.getProperty("epoch.hibernate7.fixture.classpath"))
             .split(File.pathSeparator).filter { Files.isDirectory(Path.of(it)) }
         assertTrue(fixtureClasspath.isNotEmpty(), "The Hibernate 7 fixture must be compiled before this test")
         val entities = listOf("GenericTeam", "GenericMember", "GenericTask").map { "dev.epoch.hibernate7fixture.$it" }
 
-        for ((property, version) in listOf("epoch.hibernate7.classpath" to "7.1.4.Final", "epoch.hibernate70.classpath" to "7.0.10.Final")) {
+        for ((property, version) in listOf("epoch.hibernate749.classpath" to "7.4.9.Final",
+            "epoch.hibernate7.classpath" to "7.1.4.Final", "epoch.hibernate70.classpath" to "7.0.10.Final")) {
             val runtime = requireNotNull(System.getProperty(property)).split(File.pathSeparator)
             val contract = HibernateExtractor().extract(ExtractionRequest(entityClasses = entities,
                 classpath = runtime + fixtureClasspath, discoverRepositories = false,
@@ -35,6 +37,14 @@ class Hibernate7CompiledFixtureTest {
             }
             for (query in listOf("team.members", "team.tasks")) {
                 assertTrue(contract.queries.single { it.id == query }.dependenciesComplete, contract.toString())
+            }
+            val named = contract.queries.single { it.id == "GenericTeam.byMember" }
+            assertEquals(QuerySource.NAMED_HQL, named.source)
+            assertTrue(named.dependenciesComplete, contract.toString())
+            assertTrue("public.hibernate7_team_members" in named.tables, named.toString())
+            for (table in listOf("public.hibernate7_team", "public.hibernate7_member", "public.hibernate7_task")) {
+                val operations = contract.queries.filter { it.dependenciesComplete && table in it.tables }.map { it.operation }.toSet()
+                assertTrue(operations.containsAll(Operation.entries), "$version $table: $operations")
             }
             assertTrue(contract.coverage.complete, contract.unresolvedQueries.toString())
             assertEquals("6.6.13.Final", org.hibernate.Version.getVersionString(), "The bundled runtime must remain isolated")

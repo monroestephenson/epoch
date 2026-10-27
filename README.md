@@ -25,7 +25,7 @@ cli/build/install/db-compat/bin/db-compat --help
 ./gradlew :core:test :hibernate:test :cli:test
 ```
 
-The project targets Kotlin/JVM, Hibernate **6.6 and 7**, Flyway 11, PostgreSQL **16.8**, and Testcontainers **2.0.5**. Hibernate 7 extraction uses the application’s supplied runtime in an isolated classloader; see the tested versions and adapter boundaries in [the contract guide](docs/contracts.md). The required container images are `postgres:16.8` and `testcontainers/ryuk:0.14.0`.
+The project targets Kotlin/JVM, Hibernate **6.6 and 7 (including 7.4.9)**, Flyway 11, PostgreSQL **16.8**, and Testcontainers **2.0.5**. Hibernate 7 extraction uses the application’s supplied runtime in an isolated classloader; see the tested versions and adapter boundaries in [the contract guide](docs/contracts.md). The required container images are `postgres:16.8` and `testcontainers/ryuk:0.14.0`.
 
 ## Check an old application release
 
