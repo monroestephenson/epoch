@@ -8,6 +8,7 @@ import jakarta.persistence.*
 open class JoinedPerson {
     @field:Id open var id: Long = 0
     @field:Column(name = "display_name") open var displayName: String? = null
+    @field:Column(name = "created_at") open var createdAt: java.time.LocalDateTime? = null
 }
 
 @Entity(name = "JoinedEmployee")

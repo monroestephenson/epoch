@@ -31,13 +31,24 @@ class MappingRefinementTest {
     @Test fun `JOINED inheritance attributes parent columns to their actual physical table`() {
         val contract = extract(JoinedPerson::class.java, JoinedEmployee::class.java)
         assertFalse(contract.queries.flatMap { it.columns }.any {
-            it.table == "public.employees" && it.column == "display_name"
+            it.table == "public.employees" && it.column in setOf("display_name", "created_at")
         }, contract.toString())
+        val childDeletes = contract.queries.filter { it.operation == Operation.DELETE && it.targetTable == "public.employees" }
+        assertTrue(childDeletes.isNotEmpty(), contract.toString())
+        childDeletes.forEach { query ->
+            assertTrue(query.dependenciesComplete, query.toString())
+            assertEquals(listOf("public.employees"), query.tables, query.toString())
+            assertEquals(listOf(ColumnReference("public.employees", "id")), query.columns, query.toString())
+        }
         val report = verify(contract, """
-            CREATE TABLE people (id bigint PRIMARY KEY, display_name varchar(255));
+            CREATE TABLE people (id bigint PRIMARY KEY, display_name varchar(255), created_at timestamp(6));
             CREATE TABLE employees (id bigint PRIMARY KEY REFERENCES people(id), department varchar(255));
         """.trimIndent(), "ALTER TABLE employees ADD COLUMN metadata text;")
         assertTrue(report.baseline?.findings.orEmpty().none { it.ruleId == "INVALID_BASELINE_COLUMN" }, report.toString())
+        val childDeleteIds = childDeletes.map { it.id }.toSet()
+        assertTrue(report.baseline?.findings.orEmpty().none {
+            it.ruleId == "BASELINE_SQL_UNVERIFIED" && it.affectedContractIds.any(childDeleteIds::contains)
+        }, report.toString())
         assertNotEquals(Verdict.BREAKING, report.verdict, report.toString())
     }
 

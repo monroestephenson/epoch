@@ -53,6 +53,8 @@ These are rules for the declared scope, not assurances about every side effect o
 
 Repository discovery is enabled by default and records recognized DAO/repository call sites, individually unresolved dynamic paths, and observed test statements. Per-class percentages cover only the discovered method inventory. See [repository coverage](repository-coverage.md) for scan scope, framework subsets, and variant boundaries.
 
+`MappingRefinementTest` verifies physical SQL attribution against PostgreSQL for JOINED inheritance and secondary tables. A child-table DELETE depends only on that table's key; parent audit columns such as `people.created_at` are not attributed to `employees`. The baseline checks both SQL validity and the absence of false missing-column findings.
+
 `UNKNOWN` is an explicit limit of the evidence. Resolve it through a more precise contract, added implementation support, or separate behavioral review/tests. It is not an instruction to turn off the rule.
 
 ## Reproducibility
