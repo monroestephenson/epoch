@@ -294,6 +294,12 @@ object RepositoryDiscovery {
                     val count = Type.getArgumentTypes(instruction.desc).size
                     return frame?.takeIf { it.stackSize > count }?.getStack(frame.stackSize - count - 1)
                 }
+                val originOverflow = frames?.filterNotNull()?.any { frame ->
+                    (0 until frame.locals).any { frame.getLocal(it).originOverflow } ||
+                        (0 until frame.stackSize).any { frame.getStack(it).originOverflow }
+                } == true
+                if (originOverflow) origins.unresolvedMethodOrigins("$className#$methodName:origin-budget",
+                    "Query origin alternatives exceed the 16-origin bytecode bound; every factory in this method remains unresolved")
                 val neutralBindings = mutableSetOf<MethodInsnNode>()
                 method.instructions.toArray().forEachIndexed { index, instruction ->
                     val frame = frames?.get(index) ?: return@forEachIndexed
@@ -306,7 +312,7 @@ object RepositoryDiscovery {
                             scalarBinding(instruction, values, calls[instruction]?.family)
                         if (neutral) neutralBindings += instruction
                         origins.observeCall(instruction, value?.origins, values.map { it.origins }, neutral,
-                            values.singleOrNull()?.constant as? Int)
+                            values.singleOrNull()?.constant as? Int, value?.originExtentUnknown != false)
                     } else if (instruction is InvokeDynamicInsnNode) {
                         val count = Type.getArgumentTypes(instruction.desc).size
                         if (frame.stackSize >= count) (0 until count).forEach { position ->
@@ -351,7 +357,8 @@ object RepositoryDiscovery {
                         "PANACHE_TERMINAL", "QUERY_TERMINAL" -> {
                             val producerQueries = paths.associate { it.id to if (it.status != AccessPathStatus.UNRESOLVED) it.queryIds else emptyList() }
                             val linked = origins.terminal(receiverValue?.origins, producerQueries,
-                                if (mechanism == "PANACHE_TERMINAL") "PANACHE_QUERY" else "ORM_QUERY")
+                                if (mechanism == "PANACHE_TERMINAL") "PANACHE_QUERY" else "ORM_QUERY",
+                                receiverValue?.originExtentUnknown != false)
                             if (queryFailure == null && linked.unresolved.isEmpty())
                                 paths += AccessPathCoverage(id, className, methodName, AccessPathStatus.STATIC,
                                     linked.sourceQueryIds, mechanism = mechanism, line = sourceLine)
@@ -378,7 +385,8 @@ object RepositoryDiscovery {
                         }
                         "QUERY_PAGINATION" -> {
                             val producerQueries = paths.associate { it.id to if (it.status != AccessPathStatus.UNRESOLVED) it.queryIds else emptyList() }
-                            val linked = origins.terminal(receiverValue?.origins, producerQueries, "ORM_QUERY")
+                            val linked = origins.terminal(receiverValue?.origins, producerQueries, "ORM_QUERY",
+                                receiverValue?.originExtentUnknown != false)
                             if (queryFailure == null && origins.supportsPagination(id) && linked.unresolved.isEmpty())
                                 paths += AccessPathCoverage(id, className, methodName, AccessPathStatus.STATIC,
                                     linked.sourceQueryIds, mechanism = mechanism, line = sourceLine)
@@ -609,7 +617,9 @@ private data class ConstantValue(val basic: BasicValue, val constants: Set<Any>?
                                  val origins: Set<QueryOrigin>? = null,
                                  val referenceTypes: Set<RepositoryType.ClassType>? = RepositoryDomains.descriptor(basic.type),
                                  val dispatchUncertain: Boolean = false,
-                                 val nullReference: Boolean = false) : Value {
+                                 val nullReference: Boolean = false,
+                                 val originExtentUnknown: Boolean = origins == null,
+                                 val originOverflow: Boolean = false) : Value {
     val constant: Any? get() = constants?.singleOrNull()
     override fun getSize() = basic.size
 }
@@ -656,8 +666,8 @@ private class ConstantInterpreter(private val fields: Map<String, Any>, private 
         // BasicInterpreter erases ACONST_NULL to its generic reference value.
         // Keep a separate fact so NULL cannot become a spurious Object receiver.
         val nullReference = instruction.opcode == Opcodes.ACONST_NULL
-        return ConstantValue(basic, constant?.let(::setOf), referenceTypes = if (nullReference) emptySet() else types,
-            nullReference = nullReference)
+        return ConstantValue(basic, constant?.let(::setOf), origins = if (nullReference) emptySet() else null,
+            referenceTypes = if (nullReference) emptySet() else types, nullReference = nullReference)
     }
     override fun copyOperation(instruction: AbstractInsnNode, value: ConstantValue) = value
     override fun unaryOperation(instruction: AbstractInsnNode, value: ConstantValue) =
@@ -671,7 +681,8 @@ private class ConstantInterpreter(private val fields: Map<String, Any>, private 
                     }
                     ConstantValue(it, value.constants, value.unresolvedReason, value.origins,
                         if (value.nullReference) emptySet() else if (preserved) known else RepositoryDomains.descriptor(Type.getObjectType(target)),
-                        !value.nullReference && (value.dispatchUncertain || !preserved), value.nullReference)
+                        !value.nullReference && (value.dispatchUncertain || !preserved), value.nullReference,
+                        value.originExtentUnknown, value.originOverflow)
                 }
                 instruction is FieldInsnNode && instruction.opcode == Opcodes.GETFIELD -> ConstantValue(it, referenceTypes = fieldTypes(instruction))
                 else -> ConstantValue(it)
@@ -696,8 +707,15 @@ private class ConstantInterpreter(private val fields: Map<String, Any>, private 
         // must not erase a successful factory origin while ASM converges branches.
         val nullCall = instruction is MethodInsnNode && instruction.opcode != Opcodes.INVOKESTATIC &&
             values.firstOrNull()?.nullReference == true
-        val queryOrigins = if (nullCall) emptySet() else produced?.let(::setOf) ?: (instruction as? MethodInsnNode)
-            ?.takeIf { origins.returnsReceiver(it) }?.let { values.firstOrNull()?.origins }
+        val returnedReceiver = (instruction as? MethodInsnNode)?.takeIf { origins.returnsReceiver(it) }
+            ?.let { values.firstOrNull() }
+        val queryOrigins = if (nullCall) emptySet() else produced?.let(::setOf) ?: returnedReceiver?.origins
+        val extentUnknown = when {
+            nullCall || produced != null -> false
+            returnedReceiver != null -> returnedReceiver.originExtentUnknown
+            else -> true
+        }
+        val originOverflow = !nullCall && produced == null && returnedReceiver?.originOverflow == true
         val evaluated: Evaluation = when {
             instruction is MethodInsnNode && called?.translation == "JDBC_SQL" && instruction.name == "prepareStatement" ->
                 evaluate(values.drop(1).take(1)) { (it.singleOrNull() as? String)?.let { sql -> PreparedSql(sql, sites.getValue(instruction).id) } }
@@ -715,19 +733,22 @@ private class ConstantInterpreter(private val fields: Map<String, Any>, private 
                 normalizeKotlin(instruction, values)
             else -> Evaluation()
         }
-        return ConstantValue(basic, evaluated.constants, evaluated.reason, queryOrigins, references)
+        return ConstantValue(basic, evaluated.constants, evaluated.reason, queryOrigins, references,
+            originExtentUnknown = extentUnknown, originOverflow = originOverflow)
     }
     override fun returnOperation(instruction: AbstractInsnNode, value: ConstantValue, expected: ConstantValue) = base.returnOperation(instruction, value.basic, expected.basic)
     override fun merge(left: ConstantValue, right: ConstantValue): ConstantValue {
         if (left == right) return left
         val basic = base.merge(left.basic, right.basic)
         val constants = if (left.constants == null || right.constants == null) null else (left.constants + right.constants).takeIf { it.size <= MAX_VARIANTS }
-        val origins = when {
-            left.nullReference -> right.origins
-            right.nullReference -> left.origins
-            left.origins == null || right.origins == null -> null
-            else -> (left.origins + right.origins).takeIf { it.size <= MAX_VARIANTS }
-        }
+        // Preserve every known candidate even when an unestablished producer joins it.
+        // Extent uncertainty prevents a terminal from claiming exhaustive origin coverage,
+        // while modifiers/escapes still invalidate the known factories they may affect.
+        val originUnion = left.origins.orEmpty() + right.origins.orEmpty()
+        val originOverflow = left.originOverflow || right.originOverflow || originUnion.size > MAX_VARIANTS
+        val origins = if (originOverflow) emptySet() else originUnion
+        val originExtentUnknown = originOverflow ||
+            (!left.nullReference && left.originExtentUnknown) || (!right.nullReference && right.originExtentUnknown)
         // NULL contributes no possible successful invocation target. Unknown or bounded-out
         // alternatives must remain explicit, rather than becoming the call owner's default.
         val types = when {
@@ -741,7 +762,7 @@ private class ConstantInterpreter(private val fields: Map<String, Any>, private 
         val exceeded = left.constants != null && right.constants != null && constants == null
         return ConstantValue(basic, constants, if (exceeded) "Query string alternatives exceed the $MAX_VARIANTS-variant bytecode bound"
             else listOfNotNull(left.unresolvedReason, right.unresolvedReason).sorted().firstOrNull(), origins, types, dispatchUncertain,
-            left.nullReference && right.nullReference)
+            left.nullReference && right.nullReference, originExtentUnknown, originOverflow)
     }
 
     private data class Evaluation(val constants: Set<Any>? = null, val reason: String? = null)

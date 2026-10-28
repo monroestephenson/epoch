@@ -73,10 +73,11 @@ internal class QueryOrigins(
 
     /** Called after Analyzer completes, using each instruction's incoming frame, never from naryOperation. */
     fun observeCall(call: MethodInsnNode, receiver: Set<QueryOrigin>?, argumentOrigins: List<Set<QueryOrigin>?>,
-                    bindingShapeProven: Boolean = false, paginationValue: Int? = null) {
+                    bindingShapeProven: Boolean = false, paginationValue: Int? = null,
+                    receiverExtentUnknown: Boolean = false) {
         val site = sites.getValue(call).id
         val known = calls[call]
-        val literalPagination = known?.translation == "QUERY_PAGINATION" && linearControlFlow &&
+        val literalPagination = known?.translation == "QUERY_PAGINATION" && linearControlFlow && !receiverExtentUnknown &&
             paginationValue != null && paginationValue >= 0 &&
             (call.name != "setMaxResults" || paginationValue > 0) && !receiver.isNullOrEmpty() && receiver.all { origin ->
                 origin.family == "ORM_QUERY" && calls.entries.any { (instruction, classification) ->
@@ -111,6 +112,13 @@ internal class QueryOrigins(
         origins.orEmpty().forEach { add(it, sourceId, reason) }
     }
 
+    /** Invoked only after Analyzer converges; discarded candidates cannot evade later effects. */
+    fun unresolvedMethodOrigins(sourceId: String, reason: String) {
+        calls.filterValues { it.role == DatabaseApiRole.FACTORY }.keys.forEach { call ->
+            effects.getOrPut(sites.getValue(call).id) { linkedSetOf() } += QueryEffect(sourceId, reason)
+        }
+    }
+
     private fun add(origin: QueryOrigin, sourceId: String, reason: String) {
         effects.getOrPut(origin.siteId) { linkedSetOf() } += QueryEffect(sourceId, reason)
     }
@@ -120,11 +128,13 @@ internal class QueryOrigins(
             listOf(QueryEffect(originId, "Paginated query has no locally established execution; declare its complete SQL variants")) else emptyList())
         .sortedWith(compareBy({ it.siteId }, { it.reason }))
 
-    fun terminal(origins: Set<QueryOrigin>?, extractedSources: Map<String, List<String>>, family: String): TerminalLink {
+    fun terminal(origins: Set<QueryOrigin>?, extractedSources: Map<String, List<String>>, family: String,
+                 extentUnknown: Boolean = false): TerminalLink {
         if (origins.isNullOrEmpty()) return TerminalLink(emptyList(), listOf(
             "Query execution has no locally established factory origin; returned, field-held, or erased query producers remain unresolved"))
         val ids = sortedSetOf<String>()
         val failures = sortedSetOf<String>()
+        if (extentUnknown) failures += "Query receiver also has an unestablished producer; its complete SQL origin set is unresolved"
         for (origin in origins.sortedBy { it.siteId }) {
             if (origin.family != family) { failures += "Query origin ${origin.siteId} belongs to ${origin.family}, not $family"; continue }
             val effects = limitations(origin.siteId)
