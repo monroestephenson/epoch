@@ -53,6 +53,9 @@ data class QueryBehaviorFacts(
     /** Independently proven absence of hidden relation access, even when semantic syntax
      * support is incomplete. Legacy/missing facts never establish this boundary. */
     val dependencyCoverageComplete: Boolean = false,
+    /** Every Column expression is an explicit scalar physical-column name, not a
+     * whole-row alias or system column. Used only by transparent dependency identity. */
+    val rowIdentityIndependent: Boolean = false,
 )
 
 data class BehaviorUncertainty(val nodeId: String, val reason: String)

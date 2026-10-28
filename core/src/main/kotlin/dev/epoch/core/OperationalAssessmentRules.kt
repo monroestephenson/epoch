@@ -39,8 +39,18 @@ object OperationalAssessmentRules {
                 action.kind in ordinaryCommandKinds && action.catalogConfirmed && action.effectsComplete &&
                     action.target?.kind in tableKinds
             }
-        val observedBlocking = (facts.heldLocksBefore + facts.heldLocksAfter + facts.newlyObservedLocks).distinct()
-            .filter { it.relationKind in tableKinds && it.mode in blockingModes }
+        fun blockingLocks(locks: List<OperationalLock>) = locks
+            .filter { it.relationKind in tableKinds && it.mode in blockingModes }.toSet()
+        val observedBlocking = blockingLocks(facts.heldLocksBefore + facts.heldLocksAfter + facts.newlyObservedLocks)
+        // Literal settings do not acquire relation locks. Unchanged exact lock tuples are
+        // retained acquisitions already assessed on prior statements, not new exposure caused
+        // by SET. This does not erase prior findings, excuse opaque settings/callbacks, or
+        // waive new/upgraded modes and identities (including a renamed physical relation).
+        val settingsOnlyWithoutAcquisition = facts.actions.isNotEmpty() && facts.actions.all { action ->
+            action.kind == OperationalActionKind.SETTINGS_CHANGE && action.catalogConfirmed && action.effectsComplete
+        } && facts.opaqueEffects.isEmpty() && facts.rewrittenTables.isEmpty() &&
+            blockingLocks(facts.heldLocksBefore) == blockingLocks(facts.heldLocksAfter) &&
+            blockingLocks(facts.newlyObservedLocks).isEmpty()
         // These are required PostgreSQL modes for this adapter's bounded, catalog-confirmed
         // commands, not invented pg_locks observations. In particular METADATA_CHANGE is
         // currently ALTER TABLE metadata only, never a generic arbitrary-DDL certification.
@@ -64,7 +74,7 @@ object OperationalAssessmentRules {
         val oldLocks = observedBlocking.filter { it.table?.preExisting == true }
             .groupBy { identity(requireNotNull(it.table)) }
         val oldRequired = requiredLocks.filter { it.table.preExisting == true }.groupBy { identity(it.table) }
-        if (!protectedAcquisition) for (baselineIdentity in (oldLocks.keys + oldRequired.keys).sorted()) {
+        if (!protectedAcquisition && !settingsOnlyWithoutAcquisition) for (baselineIdentity in (oldLocks.keys + oldRequired.keys).sorted()) {
             val locks = oldLocks[baselineIdentity].orEmpty()
             val required = oldRequired[baselineIdentity].orEmpty()
             // Prefer the after-snapshot name when a table was renamed in this statement, while
@@ -79,7 +89,8 @@ object OperationalAssessmentRules {
                 "A write-blocking lock on a pre-existing relation has no established migration-authored acquisition bound.",
                 "Observed modes=$observed; required modes from catalog-confirmed PostgreSQL commands=$needed; " +
                     "sampled locked relations=${locks.map { it.relation }.distinct().sorted().joinToString().ifEmpty { "none" }}; " +
-                    "baseline=${relation.baselineName}; lock_timeout before=${facts.lockTimeoutBefore.milliseconds}ms (${facts.lockTimeoutBefore.origin}), " +
+                    "baseline=${relation.baselineName}; Migration-authored lock_timeout before statement: ${authoredTimeoutEvidence(facts.lockTimeoutBefore)}; " +
+                    "lock_timeout before=${facts.lockTimeoutBefore.milliseconds}ms (${facts.lockTimeoutBefore.origin}), " +
                     "after=${facts.lockTimeoutAfter.milliseconds}ms (${facts.lockTimeoutAfter.origin}). Verifier timeouts are not deployment-authored protection. " +
                     "Only a supported ordinary command without opaque effects can use a positive authored before-timeout; neither sampled nor required locks establish scan timing or hold duration.",
                 "Use an explicit migration-authored lock_timeout before the operation, keep lock-holding transactions short, and review unsupported procedural effects.")
@@ -314,6 +325,13 @@ object OperationalAssessmentRules {
         OperationalActionKind.SET_NOT_NULL, OperationalActionKind.ADD_CHECK, OperationalActionKind.ADD_FOREIGN_KEY,
         OperationalActionKind.VALIDATE_CONSTRAINT, OperationalActionKind.ALTER_COLUMN_TYPE, OperationalActionKind.METADATA_CHANGE)
     private fun identity(relation: OperationalRelation) = relation.baselineName ?: relation.name
+    private fun authoredTimeoutEvidence(timeout: OperationalTimeout): String = when (timeout.origin) {
+        OperationalTimeoutOrigin.VERIFIER -> "none (VERIFIER)"
+        OperationalTimeoutOrigin.UNKNOWN -> "unknown (UNKNOWN)"
+        OperationalTimeoutOrigin.MIGRATION_LOCAL, OperationalTimeoutOrigin.MIGRATION_SESSION ->
+            if (timeout.milliseconds == 0L) "disabled (0ms; ${timeout.origin})"
+            else "${timeout.milliseconds}ms (${timeout.origin})"
+    }
     private val lockOrder = compareBy<OperationalLock> { it.relation }.thenBy { it.relationKind }.thenBy { it.mode }
         .thenBy { it.table?.baselineName ?: "" }.thenBy { it.table?.name ?: "" }
     private fun rank(verdict: OperationalVerdict) = when (verdict) { OperationalVerdict.RISKY -> 0; OperationalVerdict.UNKNOWN -> 1; OperationalVerdict.SAFE -> 2 }
@@ -322,7 +340,7 @@ object OperationalAssessmentRules {
     val limitations: List<String> = listOf(
         "Operational SAFE is limited to supported PostgreSQL lock-acquisition, write-blocking scan and storage-rewrite proofs; it does not guarantee production latency, lock hold duration, I/O capacity, or general deployment safety.",
         "Locks and lock_timeout are observed on the disposable migration connection. Verifier-injected timeouts do not establish deployment-authored protection; after-autocommit lock samples may be empty after locks were released.",
-        "Observed old-table write-blocking locks remain RISKY independently of SQL recognition unless a supported ordinary command has a positive migration-authored acquisition timeout. Catalog-confirmed bounded commands also establish required locks when autocommit releases them before sampling; required modes are labeled separately. Unsupported effects remain UNKNOWN alongside risk; timeouts never waive blocking scan or rewrite risks.",
+        "Observed old-table write-blocking locks remain RISKY independently of SQL recognition unless a supported ordinary command has a positive migration-authored acquisition timeout. Catalog-confirmed bounded commands also establish required locks when autocommit releases them before sampling; required modes are labeled separately. A supported literal setting with unchanged complete blocking-lock tuples does not create another acquisition finding; earlier statement risks remain in the migration result. Unsupported effects remain UNKNOWN alongside risk; timeouts never waive blocking scan or rewrite risks.",
         "Optional table sizes grade risk severity only. Missing estimates stay unknown, fixture sizes are not production evidence, and smaller estimates never turn RISKY into SAFE.",
     )
 }

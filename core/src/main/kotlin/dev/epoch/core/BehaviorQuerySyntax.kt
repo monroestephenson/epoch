@@ -19,14 +19,14 @@ class BehaviorQuerySyntax {
     private data class Key(
         val sql: String, val operation: Operation, val target: String?, val tables: Set<String>,
         val writes: Set<ColumnReference>, val parameters: List<String>, val results: List<String>,
-        val dependenciesComplete: Boolean,
+        val dependenciesComplete: Boolean, val columnNames: Set<String>,
     )
     private val cache = ConcurrentHashMap<Key, QueryBehaviorFacts>()
 
     fun inspect(query: QueryContract): QueryBehaviorFacts {
         val key = Key(query.sql, query.operation, query.targetTable,
             (query.tables + listOfNotNull(query.targetTable) + (query.columns + query.writeColumns).map { it.table }).toSet(),
-            query.writeColumns.toSet(), query.parameterTypes.toList(), query.resultColumns.mapNotNull { it.typeName }, query.dependenciesComplete)
+            query.writeColumns.toSet(), query.parameterTypes.toList(), query.resultColumns.mapNotNull { it.typeName }, query.dependenciesComplete, query.columns.map { it.column }.toSet())
         return cache.computeIfAbsent(key) { parse(it) }
     }
 
@@ -57,6 +57,8 @@ class BehaviorQuerySyntax {
         private val defaults = linkedSetOf<ColumnReference>()
         private val functions = sortedSetOf<String>()
         private val actualTables = sortedSetOf<String>()
+        private val relationAliases = mutableSetOf<String>()
+        private val scalarColumns = mutableListOf<Pair<String?, Boolean>>()
         private var assignmentsComplete = key.operation in setOf(Operation.SELECT, Operation.DELETE)
         private var depth = 0
         private var visited = 0
@@ -76,6 +78,9 @@ class BehaviorQuerySyntax {
                 defaultAssignmentsComplete = assignmentsComplete,
                 unresolvedReasons = reasons.toList(), builtinFunctionCalls = functions.toSet(),
                 dependencyCoverageComplete = key.dependenciesComplete && !dependencyGap,
+                rowIdentityIndependent = key.dependenciesComplete && !dependencyGap && scalarColumns.all { (name, _) ->
+                    name != null && name in key.columnNames && name !in SYSTEM_COLUMNS && name !in relationAliases
+                },
             )
         }
 
@@ -127,11 +132,14 @@ class BehaviorQuerySyntax {
                 else select(body)
                 // Nonrecursive body can see preceding CTEs but not its own declaration.
                 cteNames = cteNames + name
+                relationAliases += name
             }
         }
 
         private fun table(table: Table?): String? {
             if (table == null) return null
+            table.alias?.name?.let(::identifier)?.let(relationAliases::add)
+            identifier(table.name)?.let(relationAliases::add)
             if (table.schemaName.isNullOrBlank() && table.databaseName.isNullOrBlank() &&
                 identifier(table.name) in cteNames) return null
             val name = qualified(table.fullyQualifiedName)
@@ -144,7 +152,10 @@ class BehaviorQuerySyntax {
             when (item) {
                 null -> Unit
                 is Table -> table(item)
-                is ParenthesedSelect -> { semanticProblem("Derived or nested query effects are not exhaustively enumerated."); select(item) }
+                is ParenthesedSelect -> {
+                    item.alias?.name?.let(::identifier)?.let(relationAliases::add)
+                    semanticProblem("Derived or nested query effects are not exhaustively enumerated."); select(item)
+                }
                 else -> problem("The FROM item has unsupported relation or function semantics.")
             }
         }
@@ -304,7 +315,10 @@ class BehaviorQuerySyntax {
             try {
                 when (value) {
                     is NullValue, is JdbcParameter, is LongValue, is DoubleValue, is StringValue, is BooleanValue -> Unit
-                    is Column -> if (isDefault(value)) problem("DEFAULT occurs outside an established assignment position.")
+                    is Column -> {
+                        scalarColumns += identifier(value.columnName) to value.table?.fullyQualifiedName.isNullOrBlank()
+                        if (isDefault(value)) problem("DEFAULT occurs outside an established assignment position.")
+                    }
                     is Function -> function(value)
                     is CastExpression -> {
                         value.colDataType?.let { typeReference(it.toString()) }
@@ -366,6 +380,7 @@ class BehaviorQuerySyntax {
     }
 
     companion object {
+        private val SYSTEM_COLUMNS = setOf("tableoid", "ctid", "xmin", "xmax", "cmin", "cmax")
         private const val MAX_DEPTH = 128
         private const val MAX_EXPRESSIONS = 20_000
         private val BUILTIN_FUNCTIONS = setOf("count", "min", "max", "sum", "avg", "lower", "upper", "length", "char_length", "coalesce", "nullif", "abs")

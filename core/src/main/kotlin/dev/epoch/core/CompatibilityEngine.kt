@@ -622,6 +622,8 @@ class CompatibilityEngine {
         val preservedForeignKeyRoots = ForeignKeyBehaviorProofs.preservedRoots(baseline, after, rawAfter, provenViews)
         val renamedBehaviorRoots = BehaviorAttachmentIdentity.renamedRoots(baseline, after, rawAfter, provenViews)
         val preservedBehaviorRoots = renamedBehaviorRoots.keys + renamedBehaviorRoots.values
+        val transparentQueries = TransparentQueryBoundaries(contract, baseline, after, rawAfter, provenViews,
+            preservedBehaviorRoots + preservedForeignKeyRoots, behaviorSyntax, baselineScopes, targetScopes, behaviorChanges)
         val reachedBehaviorIds = (baselineScopes.reached.keys + targetScopes.reached.keys).toSortedSet()
         for (name in reachedBehaviorIds) {
             if (name in preservedForeignKeyRoots || name in preservedBehaviorRoots || name.startsWith("view:") && name.removePrefix("view:") in provenViews) continue
@@ -644,8 +646,9 @@ class CompatibilityEngine {
             for ((scopeSet, snapshot) in listOf(baselineScopes to baseline, targetScopes to rawAfter)) {
                 scopeSet.entries.forEach { entry -> entry.scope.uncertainties.forEach { cause ->
                     val boundedSyntax = cause.nodeId in entry.scope.boundedQueryUncertaintyIds
-                    val syntaxAffected = boundedSyntax && (behaviorChanges.intersects(entry.scope.queryDependencyReferences) ||
-                        entry.scope.semanticNodeIds.any { it in behaviorChanges.changedNodeIds })
+                    val syntaxAffected = boundedSyntax && !transparentQueries.preserved(cause.nodeId.removePrefix("query:")) &&
+                        (behaviorChanges.intersects(entry.scope.queryDependencyReferences) ||
+                            entry.scope.semanticNodeIds.any { it in behaviorChanges.changedNodeIds })
                     val boundary = scopeSet.resolver.dependencyBoundary(cause.nodeId)
                     val relevant = if (boundedSyntax) syntaxAffected else if (boundary == null) true else
                         !boundary.complete || boundary.nodeIds.any {

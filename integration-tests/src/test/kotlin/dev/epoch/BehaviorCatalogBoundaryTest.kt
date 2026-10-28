@@ -119,7 +119,9 @@ class BehaviorCatalogBoundaryTest {
             it.ruleId == "RELATION_RENAME_EXPRESSION_UNPROVEN" }, renamed.toString())
         assertTrue(renamed.findings.filter { it.ruleId == "DATABASE_BEHAVIOR_DEPENDENCY_UNPROVEN" }
             .flatMap { it.affectedContractIds }.none { it == "accounts.insert" }, renamed.toString())
-        assertTrue(renamed.findings.size <= readonly.size + 12, "Unchanged owned attachments must not multiply rename findings")
+        assertTrue(renamed.findings.none { it.ruleId == "DATABASE_BEHAVIOR_DEPENDENCY_UNPROVEN" },
+            "Closed readonly dependencies survive a proven transparent projection: $renamed")
+        assertTrue(renamed.findings.size <= 8, "Only a handful of actual catalog observations should remain")
         assertEquals(Verdict.UNKNOWN, report.verdict, "Baseline coverage debt is never silently promoted to SAFE")
     }
 }

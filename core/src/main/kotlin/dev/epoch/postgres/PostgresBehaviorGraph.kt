@@ -16,7 +16,7 @@ internal class PostgresBehaviorGraph {
 
     private data class Address(val catalog: String, val oid: Long, val sub: Int = 0)
     private data class Edge(val target: Address, val kind: String)
-    private data class Relation(val name: String, val kind: String, val localName: String)
+    private data class Relation(val name: String, val kind: String, val localName: String, val schemaName: String)
     private data class Type(val name: String, val kind: String, val definition: String, val builtin: Boolean)
     private data class Function(val id: String, val definition: String, val parsed: Boolean, val language: String)
     private data class Root(
@@ -28,6 +28,7 @@ internal class PostgresBehaviorGraph {
 
     private class Collector(private val connection: Connection, private val snapshot: SchemaSnapshot) {
         private val relations = mutableMapOf<Long, Relation>()
+        private val relationsByName = mutableMapOf<Pair<String, String>, Pair<Long, Relation>>()
         private val columns = mutableMapOf<Pair<Long, Int>, String>()
         private val types = mutableMapOf<Long, Type>()
         private val functions = mutableMapOf<Long, Function>()
@@ -77,9 +78,14 @@ internal class PostgresBehaviorGraph {
             """) { pinned += Address(it.getString("target_catalog"), it.getLong("refobjid"), it.getInt("refobjsubid")) }
 
             connection.rows("""
-                SELECT c.oid, n.nspname || '.' || c.relname AS name, c.relkind, c.relname
+                SELECT c.oid, n.nspname || '.' || c.relname AS name, c.relkind, c.relname, n.nspname AS schema_name
                 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
-            """) { relations[it.getLong("oid")] = Relation(it.getString("name"), it.getString("relkind"), it.getString("relname")) }
+            """) {
+                val oid = it.getLong("oid")
+                val relation = Relation(it.getString("name"), it.getString("relkind"), it.getString("relname"), it.getString("schema_name"))
+                relations[oid] = relation
+                relationsByName[relation.schemaName to relation.localName] = oid to relation
+            }
             connection.rows("""
                 SELECT a.attrelid, a.attnum, a.attname FROM pg_catalog.pg_attribute a
                 WHERE a.attnum > 0 AND NOT a.attisdropped
@@ -207,11 +213,28 @@ internal class PostgresBehaviorGraph {
                             references = listOf(BehaviorReference(BehaviorReferenceKind.RELATION, relation.name))),
                             BehaviorAttachment(relation.name, "view:${relation.name}", setOf(Operation.SELECT)))
                     } else {
-                        val pure = functionFreeView(definition) && builtinResolution
+                        val directSyntax = functionFreeView(definition)
+                        val source = if (directSyntax) directViewSource(definition) else null
+                        // PostgreSQL omits pg_depend edges to pinned objects. A positively
+                        // parsed, resolved stored FROM still establishes its actual catalog read.
+                        val systemSource = source?.takeIf { (oid, sourceRelation) ->
+                            systemDependency(Address("pg_class", oid)) ||
+                                sourceRelation.schemaName in setOf("pg_catalog", "information_schema")
+                        }?.second
+                        val recovered = systemSource?.let {
+                            listOf(BehaviorReference(BehaviorReferenceKind.RELATION, it.name, access = BehaviorAccess.SELECT))
+                        }.orEmpty()
+                        val pure = directSyntax && source != null && systemSource == null && builtinResolution
                         val supported = pure && table.view?.completeDirectProjection == true && table.view.options.isEmpty()
                         val id = "view:${relation.name}"
+                        val reason = when {
+                            systemSource != null -> "Observed system catalog relation ${systemSource.name} can expose application DDL beyond relation-local catalog dependencies."
+                            pure -> null
+                            directSyntax && source == null -> "The stored view's direct relation could not be resolved against the actual catalog inventory."
+                            else -> "View expressions may invoke unsupported functions or hidden relation lookups."
+                        }
                         add(Root(id, Address("pg_rewrite", row.getLong("oid")), "view", definition, pure, supported, !pure,
-                            BehaviorAccess.SELECT, if (pure) null else "View expressions may invoke unsupported functions or hidden relation lookups."),
+                            BehaviorAccess.SELECT, reason, references = recovered),
                             BehaviorAttachment(relation.name, id, allOperations, objectName = relation.name))
                     }
                 } else if (row.getString("ev_enabled") != "D") {
@@ -222,6 +245,20 @@ internal class PostgresBehaviorGraph {
                         BehaviorAttachment(relation.name, id, operation?.let(::setOf) ?: allOperations, objectName = "${relation.name}.$name"))
                 }
             }
+        }
+
+        /** Resolve only the already-proven single-table projection syntax. pg_get_viewdef
+         * quotes/qualifies its bound relation under this connection's current search path. */
+        private fun directViewSource(definition: String): Pair<Long, Relation>? {
+            val statement = CCJSqlParserUtil.parse(definition) as? PlainSelect ?: return null
+            val source = statement.fromItem as? Table ?: return null
+            if (!source.databaseName.isNullOrBlank()) return null
+            fun identifier(value: String): String = if (value.startsWith('"') && value.endsWith('"'))
+                value.removeSurrounding("\"").replace("\"\"", "\"") else value.lowercase(java.util.Locale.ROOT)
+            val name = identifier(source.name)
+            val schemas = source.schemaName?.takeIf(String::isNotBlank)?.let { listOf(identifier(it)) }
+                ?: snapshot.expressionSearchPath
+            return schemas.firstNotNullOfOrNull { schema -> relationsByName[schema to name] }
         }
 
         private fun indexRoots() {
