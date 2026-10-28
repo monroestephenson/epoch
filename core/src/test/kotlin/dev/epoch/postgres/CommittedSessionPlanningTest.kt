@@ -113,7 +113,7 @@ internal fun verificationSessionConnection(session: Map<String, String?>, aborte
     return jdbcProxy(Connection::class.java) { name, _ -> when (name) {
         "createStatement" -> jdbcProxy(Statement::class.java) { method, args -> when (method) {
             "executeQuery" -> when {
-                (args.single() as String).startsWith("SELECT name, setting") -> rows(session.filterKeys { !it.startsWith("epoch.") }
+                (args.single() as String).startsWith("WITH registered AS") -> rows(session.filterKeys { !it.startsWith("epoch.") }
                     .toSortedMap().map { (key, value) -> listOf(key, value) })
                 (args.single() as String).startsWith("SELECT current_schemas") -> rows(listOf(listOf(
                     session["epoch.effective_search_path"], session["epoch.current_user"], session["epoch.session_user"])))

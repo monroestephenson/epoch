@@ -50,9 +50,12 @@ internal class DeferredQueryPlanning(
 
     fun checkSession(connection: Connection, expected: Map<String, String?>, lease: PendingMigrationLease) {
         lease.checkExpired()
-        if (PlanningSession.capture(connection) != expected) throw VerificationException(
+        val actual = PlanningSession.capture(connection)
+        val changed = (actual.keys + expected.keys).filter { actual[it] != expected[it] }.sorted()
+        if (changed.isNotEmpty()) throw VerificationException(
             "PENDING_PLANNING_SESSION_CHANGED", lease.migration,
-            "The verification session changed while checking committed migration ${lease.migration.filename}; its evidence is incomplete.")
+            "The verification session changed while checking committed migration ${lease.migration.filename}; " +
+                "setting names: ${changed.joinToString()}. Its evidence is incomplete.")
         lease.checkExpired()
     }
 
