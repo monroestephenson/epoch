@@ -126,7 +126,7 @@ db-compat verify-release --repository . --base-ref v1.4.0 --target-ref HEAD \
   --report build/release-report.json --sarif build/epoch.sarif
 ```
 
-Existing SQL and `.sql.conf` files must be unchanged between refs. Flyway determines pending migration order. The JSON records both commit IDs; `report --input build/release-report.json` renders both directions. `new-on-old` checks deploy-before-migrate or rollback schema compatibility, not the correctness of down migrations.
+Existing SQL and `.sql.conf` files must be unchanged between refs. Flyway determines pending migration order. The JSON records both commit IDs; `report --input build/release-report.json` renders all requested directions. `new-on-old` checks deploy-before-migrate or rollback schema compatibility, not the correctness of down migrations. `new-writes-old-reads` separately checks supported mapped data domains on the final schema; a data-only BREAKING result exits 1 even when both schema directions are SAFE. Incomplete assessment exits 3. See [data verification boundaries](verification.md#new-writes-and-old-readers).
 
 `verify --sarif build/epoch.sarif --migration-source-prefix src/main/resources/db/migration` and `report --sarif ...` also export SARIF 2.1.0. Upload that file through your CI provider's normal code-scanning integration. Baseline findings have no pending-file location. Catalog findings use line 1 as a migration-wide anchor, not an invented exact source line.
 

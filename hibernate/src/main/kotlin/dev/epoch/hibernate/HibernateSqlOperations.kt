@@ -1,6 +1,7 @@
 package dev.epoch.hibernate
 
 import org.hibernate.engine.spi.SessionFactoryImplementor
+import org.hibernate.sql.results.jdbc.spi.JdbcValuesMappingProducer
 import org.hibernate.query.spi.QueryOptions
 import org.hibernate.sql.ast.SqlAstTranslator
 import org.hibernate.sql.ast.tree.MutationStatement
@@ -20,6 +21,9 @@ internal object HibernateSqlOperations {
         // This accessor lived on query implementations before joining JdbcOperation in 7.4.
         (operation.javaClass.getMethod("getAffectedTableNames").invoke(operation) as Collection<*>)
             .map { requireNotNull(it as? String) { "Hibernate returned a non-string affected table name" } }
+
+    fun valuesMappingProducer(operation: JdbcOperation): JdbcValuesMappingProducer =
+        operation.javaClass.getMethod("getJdbcValuesMappingProducer").invoke(operation) as JdbcValuesMappingProducer
 
     fun translate(factory: SessionFactoryImplementor, statement: Statement, options: QueryOptions): JdbcOperation {
         val factoryApi = factory.jdbcServices.jdbcEnvironment.sqlAstTranslatorFactory

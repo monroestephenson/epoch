@@ -20,7 +20,12 @@ fun sarifReport(reports: List<Pair<String, CompatibilityReport>>, migrationPrefi
             }))
             put("properties", mapOf("verdict" to finding.verdict.name, "object" to finding.objectName,
                 "contractIds" to finding.affectedContractIds, "baseline" to (finding.migration == null),
-                "locationPrecision" to "migration-file"))
+                "locationPrecision" to when {
+                    finding.migration?.filename?.endsWith(".sql") == true -> "migration-file"
+                    direction == "new-writes-old-reads" -> "contract"
+                    finding.migration == null -> "baseline"
+                    else -> "schema"
+                }))
             finding.migration?.takeIf { it.filename.endsWith(".sql") }?.let { migration ->
                 val path = listOf(migrationPrefix.trimEnd('/'), migration.filename).filter(String::isNotBlank).joinToString("/")
                 put("locations", listOf(mapOf("physicalLocation" to mapOf(

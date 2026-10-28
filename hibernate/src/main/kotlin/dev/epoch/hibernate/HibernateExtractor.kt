@@ -212,7 +212,17 @@ class HibernateExtractor {
         val entities = mutableListOf<EntityContract>()
         val queries = mutableListOf<QueryContract>()
         val mappingIds = linkedMapOf<String, Map<String, String>>()
+        val hierarchyFacts = linkedMapOf<String, HierarchyContract?>()
+        val schema = request.hibernateProperties["hibernate.default_schema"] ?: "public"
         val scopeNotes = mutableListOf("Hibernate runtime ${org.hibernate.Version.getVersionString()}; PostgreSQL dialect version ${factory.jdbcServices.dialect.version}.")
+        if (!factory.sessionFactoryOptions.isCheckNullability) scopeNotes +=
+            "Hibernate nullability checking is disabled; a raw nullable=false mapping alone does not establish input NULL exclusion."
+        // Data-domain provenance is additive: missing decoder facts must not erase healthy SQL.
+        fun <T> dataMetadata(id: String, phase: String, fallback: T, action: () -> T): T = try { action() }
+        catch (error: Throwable) {
+            scopeNotes += "$id: ${QueryExtraction.failure(id, phase, error)}"
+            fallback
+        }
         val persisters = factory.mappingMetamodel.streamEntityDescriptors().toList().sortedBy { it.entityName }
         for (raw in persisters) {
             val p = raw as? AbstractEntityPersister
@@ -314,6 +324,9 @@ class HibernateExtractor {
                         val updatable = s.isUpdateable && key.second !in p.identifierColumnNames.map(::identifier)
                         val custom = customMutations[table]
                         val directInput = inputDomainComplete(s.jdbcMapping, valueMetadata) &&
+                            // Mapping nullability is a declaration; disabled runtime checks cannot prove NULL exclusion.
+                            (factory.sessionFactoryOptions.isCheckNullability || s.isNullable ||
+                                declaredNullability[key]?.singleOrNull() == true || key in primitiveColumns) &&
                             s.customWriteExpression.let { it == null || it.trim() == "?" } && !dynamicInput && key !in generatedColumns &&
                             (Operation.INSERT !in operations || !insertable || custom?.first == false) &&
                             (Operation.UPDATE !in operations || !updatable || custom?.second == false) &&
@@ -331,6 +344,7 @@ class HibernateExtractor {
                         enumValues = valueMetadata.enumValues,
                         logicalJavaType = logicalType(s.jdbcMapping).name,
                         inputDomainComplete = directInput,
+                        readDomainComplete = readDomainComplete(s, valueMetadata),
                         declaredNonNull = declaredNullability[key]?.singleOrNull(),
                         hibernateNullable = s.isNullable,
                         enumMode = valueMetadata.enumMode,
@@ -351,12 +365,29 @@ class HibernateExtractor {
                 )
             }
         }
+        // Resolve root links only after all physical mapping IDs exist; class-name sorting is not ancestry.
+        for (raw in persisters) {
+            val p = raw as? AbstractEntityPersister ?: continue
+            if (p.entityName !in mappingIds) continue
+            val hierarchy = dataMetadata<HierarchyContract?>(p.entityName, "Data hierarchy metadata unavailable", null) {
+                HibernateHierarchyMetadata.inspect(p, mappingIds, schema, ::jdbcName)
+            }
+            hierarchyFacts[p.entityName] = hierarchy
+            if (hierarchy != null) {
+                val table = hierarchy.discriminator?.table ?: (p.rootEntityDescriptor as? AbstractEntityPersister)
+                    ?.identifierTableMapping?.tableName?.let(::qualified)
+                val id = mappingIds[p.entityName]?.get(table)
+                val index = entities.indexOfFirst { it.id == id }
+                if (index >= 0) entities[index] = entities[index].copy(hierarchy = hierarchy)
+            }
+        }
         for (raw in persisters) {
             val p = raw as? AbstractEntityPersister ?: continue
             val override = entityOverride(request, p.mappedClass)
             if (override?.resultMappingOnly == true || override?.exclude == true) continue
             val operations = operations(request, p)
-            fun capture(id: String, operation: Operation, sql: String, tables: List<String>, binders: List<JdbcParameterBinder>): ExtractedSql {
+            fun capture(id: String, operation: Operation, sql: String, tables: List<String>, binders: List<JdbcParameterBinder>,
+                        readFacts: HibernateReadMetadata.Facts = HibernateReadMetadata.Facts()): ExtractedSql {
                 val deps = SqlDependencies.inspect(sql, request.hibernateProperties["hibernate.default_schema"] ?: "public", sourceId = id)
                 val references = deps.tables.ifEmpty { tables }.distinct().sorted()
                 // Hibernate knows the mutation target even when its SQL uses an unsupported MERGE
@@ -369,7 +400,17 @@ class HibernateExtractor {
                 val query = QueryContract(id, operation, sql, deps.tables.ifEmpty { tables }.distinct().sorted(), deps.columns, deps.writes,
                     parameterTypes = parameterTypes(binders), source = QuerySource.HIBERNATE_MAPPING,
                     dependenciesComplete = deps.complete, explicitColumnList = true,
-                    targetTable = target, mappedEntityIds = origins)
+                    targetTable = target, mappedEntityIds = origins,
+                    mappedReads = readFacts.reads, mappedReadCoverageComplete = readFacts.complete,
+                    polymorphicReads = if (operation == Operation.SELECT && p.entityName == p.rootEntityName)
+                        hierarchyFacts[p.entityName]?.rootEntityId?.let { rootId -> listOf(PolymorphicRead(rootId,
+                            readFacts.unrestricted && readFacts.discriminatorSelected &&
+                                hierarchyFacts[p.entityName]?.complete == true && !p.needsDiscriminator())) }.orEmpty()
+                        else emptyList(),
+                    discriminatorWrites = if (operation == Operation.INSERT)
+                        dataMetadata(id, "Data discriminator write metadata unavailable", emptyList()) {
+                            HibernateHierarchyMetadata.write(p, hierarchyFacts[p.entityName], sql, mappingIds[p.entityName].orEmpty(), schema)
+                        } else emptyList())
                 return ExtractedSql(query, if (deps.complete) emptyList() else listOf(UnresolvedQuery(id,
                     deps.failureReason ?: "Generated SQL has an unsupported dependency expression or unresolved table alias")))
             }
@@ -380,8 +421,12 @@ class HibernateExtractor {
                 val plan = (if (resolve.parameterCount == 2) resolve.invoke(loader, LockOptions.NONE, influencers)
                     else resolve.invoke(loader, LockOptions.NONE, influencers, factory))
                 val jdbc = HibernateSqlOperations.loadPlanSelect(plan)
-                capture("${p.entityName}.findById", Operation.SELECT, jdbc.sqlString,
-                    HibernateSqlOperations.affectedTableNames(jdbc).map(::qualified), jdbc.parameterBinders)
+                val id = "${p.entityName}.findById"
+                val readFacts = dataMetadata(id, "Data read metadata unavailable", HibernateReadMetadata.Facts()) {
+                    HibernateReadMetadata.inspect(factory, p, jdbc, influencers, mappingIds[p.entityName].orEmpty(), schema)
+                }
+                capture(id, Operation.SELECT, jdbc.sqlString,
+                    HibernateSqlOperations.affectedTableNames(jdbc).map(::qualified), jdbc.parameterBinders, readFacts)
             }
             for (operation in listOf(Operation.INSERT, Operation.UPDATE, Operation.DELETE)) {
                 if (operation !in operations) continue
@@ -573,12 +618,14 @@ class HibernateExtractor {
             entities += EntityContract("$role@collection", table, selectables.map { (name, s) ->
                 val valueMetadata = MappingValueMetadata.inspect(s.jdbcMapping)
                 val directInput = inputDomainComplete(s.jdbcMapping, valueMetadata) &&
+                    (factory.sessionFactoryOptions.isCheckNullability || s.isNullable) &&
                     s.customWriteExpression.let { it == null || it.trim() == "?" } &&
                     !(collectionQueries.any { it.operation == Operation.INSERT } && p.collectionTableMapping.insertDetails.customSql != null) &&
                     !(collectionQueries.any { it.operation == Operation.UPDATE } && p.collectionTableMapping.updateDetails.customSql != null)
                 ColumnContract(name, jdbcName(s.jdbcMapping), s.isNullable, s.isInsertable, s.isUpdateable,
                     length = s.length, precision = s.precision, scale = s.scale, enumValues = valueMetadata.enumValues,
                     logicalJavaType = logicalType(s.jdbcMapping).name, inputDomainComplete = directInput,
+                    readDomainComplete = readDomainComplete(s, valueMetadata),
                     hibernateNullable = s.isNullable, enumMode = valueMetadata.enumMode,
                     enumConstants = valueMetadata.enumConstants, enumRelationalValues = valueMetadata.enumRelationalValues,
                     enumEncoding = valueMetadata.enumEncoding, converterClass = valueMetadata.converterClass,
@@ -619,19 +666,43 @@ class HibernateExtractor {
         private fun logicalType(mapping: org.hibernate.metamodel.mapping.JdbcMapping): Class<*> =
             mapping.valueConverter?.domainJavaType?.javaTypeClass ?: mapping.javaTypeDescriptor.javaTypeClass
         private fun inputDomainComplete(mapping: org.hibernate.metamodel.mapping.JdbcMapping, facts: MappingValueMetadata.Facts): Boolean {
-            if (mapping.valueConverter != null) return false
+            if (mapping.valueConverter != null && !knownExplicitEnum(mapping, facts)) return false
             // Recognized standard native PostgreSQL enums live outside descriptor.jdbc. Their finite
             // relational values are established by exact EnumJavaType/JdbcType metadata above.
             if (logicalType(mapping).isEnum) return facts.enumEncoding != null && facts.enumRelationalValues.isNotEmpty()
-            if (!mapping.jdbcType.javaClass.name.startsWith("org.hibernate.type.descriptor.jdbc.")) return false
-            val type = logicalType(mapping)
-            return type.isEnum || type.isPrimitive || type.name in setOf("java.lang.String", "java.lang.Character",
-                "java.lang.Long", "java.lang.Integer", "java.lang.Short", "java.lang.Byte", "java.lang.Boolean",
-                "java.lang.Double", "java.lang.Float", "java.math.BigDecimal", "java.math.BigInteger",
-                "java.util.UUID", "java.time.LocalDate", "java.time.LocalDateTime", "java.time.OffsetDateTime",
-                "java.time.LocalTime", "java.time.OffsetTime", "java.time.Instant", "java.util.Date",
-                "java.sql.Date", "java.sql.Timestamp", "java.sql.Time", "[B")
+            // A custom JavaType can change even non-null inputs before the ordinary JDBC binder sees them.
+            return mapping.javaTypeDescriptor.javaClass.name in READ_JAVA_TYPES && mapping.jdbcType.javaClass.name in READ_JDBC_TYPES
         }
+        private fun knownExplicitEnum(mapping: org.hibernate.metamodel.mapping.JdbcMapping, facts: MappingValueMetadata.Facts): Boolean =
+            mapping.valueConverter?.javaClass?.name == "org.hibernate.boot.model.process.internal.EnumeratedValueConverter" &&
+                facts.enumEncoding == EnumEncoding.EXPLICIT && facts.enumConstants.isNotEmpty() &&
+                facts.enumConstants.size == facts.enumRelationalValues.size &&
+                facts.enumRelationalValues.distinct().size == facts.enumRelationalValues.size
+
+        private fun readDomainComplete(selectable: SelectableMapping, facts: MappingValueMetadata.Facts): Boolean {
+            if (selectable.isFormula || !HibernateReadMetadata.directRead(selectable.customReadExpression, selectable.selectionExpression)) return false
+            val mapping = selectable.jdbcMapping
+            if (mapping.valueConverter != null && !knownExplicitEnum(mapping, facts)) return false
+            if (logicalType(mapping).isEnum) return facts.enumEncoding != null && facts.enumRelationalValues.isNotEmpty()
+            val javaType = mapping.javaTypeDescriptor.javaClass.name
+            if (javaType !in READ_JAVA_TYPES) return false
+            return mapping.jdbcType.javaClass.name in READ_JDBC_TYPES
+        }
+        private val READ_JAVA_TYPES = setOf("StringJavaType", "CharacterJavaType", "LongJavaType", "IntegerJavaType",
+            "ShortJavaType", "ByteJavaType", "BooleanJavaType", "DoubleJavaType", "FloatJavaType", "BigDecimalJavaType",
+            "BigIntegerJavaType", "UUIDJavaType", "LocalDateJavaType", "LocalDateTimeJavaType", "OffsetDateTimeJavaType",
+            "LocalTimeJavaType", "OffsetTimeJavaType", "InstantJavaType", "DateJavaType", "JdbcDateJavaType",
+            "JdbcTimestampJavaType", "JdbcTimeJavaType", "PrimitiveByteArrayJavaType")
+            .map { "org.hibernate.type.descriptor.java.$it" }.toSet()
+        private val READ_JDBC_TYPES = setOf("CharJdbcType", "NCharJdbcType", "VarcharJdbcType", "NVarcharJdbcType",
+            "LongVarcharJdbcType", "LongNVarcharJdbcType", "TinyIntJdbcType", "TinyIntAsSmallIntJdbcType", "SmallIntJdbcType",
+            "IntegerJdbcType", "BigIntJdbcType", "BooleanJdbcType", "BitJdbcType", "DoubleJdbcType", "FloatJdbcType",
+            "RealJdbcType", "DecimalJdbcType", "NumericJdbcType", "UUIDJdbcType", "DateJdbcType", "TimeJdbcType",
+            "TimeWithTimeZoneJdbcType", "TimeUtcAsOffsetTimeJdbcType", "TimestampJdbcType", "TimestampWithTimeZoneJdbcType",
+            "TimestampUtcAsJdbcTimestampJdbcType", "TimestampUtcAsOffsetDateTimeJdbcType", "BinaryJdbcType", "VarbinaryJdbcType",
+            "LongVarbinaryJdbcType").map { "org.hibernate.type.descriptor.jdbc.$it" }.toSet() + setOf(
+            "org.hibernate.dialect.PostgreSQLUUIDJdbcType", "org.hibernate.dialect.type.PostgreSQLUUIDJdbcType")
+
         private fun parameterTypes(binders: List<JdbcParameterBinder>): List<String> = binders.map {
             val parameter = it as? JdbcParameter
             parameter?.expressionType?.getJdbcMapping(0)?.let(::jdbcName) ?: "UNKNOWN"

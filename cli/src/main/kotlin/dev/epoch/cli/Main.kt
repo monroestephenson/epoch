@@ -80,7 +80,7 @@ class Verify : Callable<Int> {
     var baselineCache: Path? = null
     @Option(names = ["--details"], description = ["Print every finding; default output groups rules and limits detail"])
     var details = false
-    @Option(names = ["--new-contract"], description = ["New application contract; repeat to additionally check new application on old schema"])
+    @Option(names = ["--new-contract"], description = ["New application contract; adds new-on-old schema and new-writes/old-reads checks; repeat for multiple units"])
     var newContractPaths: List<Path> = emptyList()
     @Option(names = ["--migration-timeout-seconds"], defaultValue = "120", description = ["Maximum seconds per migration (default: 120)"])
     var migrationTimeoutSeconds: Long = 120
@@ -101,7 +101,7 @@ class Verify : Callable<Int> {
         require(Files.isDirectory(migrations)) { "Migration directory does not exist: $migrations" }
         val accepted = acceptedBaseline?.let { json.readValue<AcceptedBaseline>(it.toFile()) }
         val newContracts = newContractPaths.map { json.readValue<DatabaseContract>(it.toFile()) }
-        val expectedDirections = if (newContracts.isEmpty()) listOf("old-on-new") else listOf("old-on-new", "new-on-old")
+        val expectedDirections = verificationDirections(newContracts.isNotEmpty())
         return VerificationCheckpoint(reportPath, expectedDirections).use { checkpoint ->
             try {
                 val options = VerificationOptions(baselineCache, accepted, migrationTimeoutSeconds, globalTimeoutSeconds,
@@ -110,10 +110,10 @@ class Verify : Callable<Int> {
                 if (newContracts.isNotEmpty()) {
                     val report = verifier.verifyBidirectional(contracts, newContracts, baseline, migrations, options)
                     checkpoint.complete(report)
-                    val directions = listOf("old-on-new" to report.oldOnNew, "new-on-old" to report.newOnOld)
+                    val directions = report.directionReports()
                     sarifPath?.let { writeJson(it, sarifReport(directions, migrationSourcePrefix)) }
                     directions.forEach { (name, result) -> println("Direction: $name\n${renderReport(result, allDetails = details)}") }
-                    exitCode(CompatibilityEngine.aggregate(directions.map { it.second.gateVerdict ?: it.second.verdict }))
+                    verificationExitCode(directions)
                 } else {
                     val report = verifier.verify(contracts, baseline, migrations, options)
                     checkpoint.complete(report)
@@ -169,8 +169,12 @@ class Report : Callable<Int> {
         require(payload.path("schemaVersion").asInt(-1) == 1) { "Unsupported verification schemaVersion: ${payload.path("schemaVersion")}" }
         if (payload.has("oldOnNew")) {
             require(acceptedOutput == null && justification == null) { "Export baseline acceptance from a single-direction report" }
-            val directions = listOf("old-on-new" to json.treeToValue(payload.get("oldOnNew"), CompatibilityReport::class.java),
-                "new-on-old" to json.treeToValue(payload.get("newOnOld"), CompatibilityReport::class.java))
+            val directions = directionReports(
+                json.treeToValue(payload.get("oldOnNew"), CompatibilityReport::class.java),
+                json.treeToValue(payload.get("newOnOld"), CompatibilityReport::class.java),
+                payload.get("dataCompatibility")?.takeUnless { it.isNull }?.let {
+                    json.treeToValue(it, CompatibilityReport::class.java)
+                })
             directions.forEach { (name, result) ->
                 require(result.schemaVersion == 1) { "Unsupported report schemaVersion: ${result.schemaVersion}" }
                 println("Direction: $name\n${renderReport(result, summaryOnly, details)}")
@@ -178,7 +182,7 @@ class Report : Callable<Int> {
             sarifPath?.let { writeJson(it, sarifReport(directions, sourcePrefix)) }
             if (directions.any { !it.second.complete } || payload.path("complete").let { it.isBoolean && !it.asBoolean() } ||
                 tree.path("complete").let { it.isBoolean && !it.asBoolean() }) return 3
-            return exitCode(CompatibilityEngine.aggregate(directions.map { it.second.gateVerdict ?: it.second.verdict }))
+            return verificationExitCode(directions)
         }
         val report = json.treeToValue(payload, CompatibilityReport::class.java)
         require(report.schemaVersion == 1) { "Unsupported report schemaVersion: ${report.schemaVersion}" }
@@ -204,6 +208,23 @@ internal fun writeJson(path: Path, value: Any) {
     path.toAbsolutePath().parent?.let(Files::createDirectories)
     json.writeValue(path.toFile(), value)
 }
+
+internal fun verificationDirections(withNewContract: Boolean): List<String> =
+    if (withNewContract) listOf("old-on-new", "new-on-old", "new-writes-old-reads") else listOf("old-on-new")
+
+internal fun BidirectionalReport.directionReports() = directionReports(oldOnNew, newOnOld, dataCompatibility)
+
+/** Older saved reports contain only schema directions; their scope is preserved when replayed. */
+private fun directionReports(oldOnNew: CompatibilityReport, newOnOld: CompatibilityReport,
+                             dataCompatibility: CompatibilityReport?): List<Pair<String, CompatibilityReport>> = buildList {
+    add("old-on-new" to oldOnNew)
+    add("new-on-old" to newOnOld)
+    dataCompatibility?.let { add("new-writes-old-reads" to it) }
+}
+
+internal fun verificationExitCode(directions: List<Pair<String, CompatibilityReport>>): Int =
+    if (directions.any { !it.second.complete }) 3
+    else exitCode(CompatibilityEngine.aggregate(directions.map { it.second.gateVerdict ?: it.second.verdict }))
 
 fun exitCode(verdict: Verdict) = when (verdict) {
     Verdict.SAFE -> 0

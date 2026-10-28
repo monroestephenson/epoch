@@ -32,7 +32,7 @@ These outcomes remain scoped to the declared structural contract. Dropping data 
 
 ## Rollout and rollback workflows
 
-Repeat `--new-contract` alongside the old `--contract` to check both directions in one disposable PostgreSQL run:
+Repeat `--new-contract` alongside the old `--contract` to check both schema directions and supported data compatibility in one disposable PostgreSQL run:
 
 ```bash
 db-compat verify \
@@ -43,7 +43,7 @@ db-compat verify \
   --report rollout-report.json
 ```
 
-`oldOnNew` checks every pending migration state. `newOnOld` checks the new contract against a retained copy of the original schema, after validating that contract against the final migrated schema. This does not execute or certify down migrations. The report retains each direction's baseline health and verdict.
+`oldOnNew` checks every pending migration state. `newOnOld` checks the new contract against a retained copy of the original schema, after validating that contract against the final migrated schema. This does not execute or certify down migrations. `dataCompatibility` separately compares supported new writes with old readers on the final schema; it has no accepted-baseline waiver. The report retains each direction's verdict. See [data comparison and proof limits](verification.md#new-writes-and-old-readers).
 
 `verify-release` reads migration blobs from Git without checking out or resetting either revision:
 

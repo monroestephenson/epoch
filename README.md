@@ -83,7 +83,7 @@ Use `extract --keep-going` to recover usable mappings after bootstrap failures, 
 
 ## Rollout checks, release history, and CI
 
-Add `--new-contract release-n.json` to `verify` to check both old code on migrated schemas and new code on the retained old schema. `verify-release` can assemble baseline and pending migrations directly from immutable Git refs:
+Add `--new-contract release-n.json` to `verify` to check old code on migrated schemas, new code on the retained old schema, and supported new writes against old readers on the final schema. The [data comparison](docs/verification.md#new-writes-and-old-readers) detects finite enum/discriminator and declared-nullability regressions; unknown codecs and missing read/write provenance remain UNKNOWN. `verify-release` can assemble baseline and pending migrations directly from immutable Git refs:
 
 ```sh
 db-compat verify-release --repository . --base-ref v1.4.0 --target-ref v1.5.0 \

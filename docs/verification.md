@@ -65,6 +65,38 @@ An entity's INSERT and UPDATE can have different input behavior. A proven non-nu
 
 Dormant mapping drift remains baseline health: a missing physical column produces `INVALID_BASELINE_COLUMN`, with no pending-migration attribution. It cannot support a fabricated new failure or terminate the rest of verification.
 
+## New writes and old readers
+
+Supply `--new-contract new.json` alongside the old contract to assess three independent directions:
+
+| Direction | Question |
+| --- | --- |
+| `old-on-new` | Does the old contract remain compatible at every pending migration state? |
+| `new-on-old` | Can the new contract operate on the retained original schema? |
+| `new-writes-old-reads` | On the final schema, do supported values written by the new release remain readable by the old release? |
+
+The third result is `dataCompatibility` in JSON. Its `<old-vs-new-contract>` step is a contract assessment, not a pending migration. It runs even when there are no pending migrations. All three directions contribute to the combined verdict and CI exit code. Accepted-baseline findings cannot suppress new data-format regressions. Older saved reports with only the two schema directions retain that narrower scope when replayed.
+
+Data comparison uses physical table/column identity across releases, actual generated write provenance, and actual decoded-column provenance from supported Hibernate by-ID loaders. Mentioning an enum in a WHERE clause is not evidence that the old query decodes it. Read-only projections and abstract subtype declarations do not establish new writes. Each SQL template must also be valid against the final schema; successful preparation alone does not prove its values or decoder semantics.
+
+| Rule | Proof and mitigation |
+| --- | --- |
+| `DATA_ENUM_VALUE_UNREADABLE` | A supported new writer can store a NAME label or ordinal outside the old finite decoder. Keep the common value set until old readers retire. |
+| `DATA_ENUM_VALUE_REINTERPRETED` | An accepted stored ordinal now denotes a different logical constant. Preserve the existing encoding; declaration order alone is not the encoding for explicit codes or native enum NAME storage. |
+| `DATA_DISCRIMINATOR_UNREADABLE` | A concrete new subtype's actual INSERT stores a scalar discriminator outside an old unrestricted, finite root decoder. Delay writing that subtype until old polymorphic readers retire. Filtered roots, formulas, wildcards, and synthetic discriminators require separate evidence. |
+| `DATA_NULLABILITY_RELAXED` | A supported new NULL write violates an old decoded member's declared non-null domain. Preserve the old non-null invariant during rollout. This is a declared-domain violation; Kotlin field hydration does not invariably throw an NPE. |
+| `DATA_CONVERTER_SEMANTICS_UNPROVEN` | Converter class/hash facts do not establish codec equivalence or a concrete format break. Supply a supported relational-domain proof; changed and unchanged arbitrary converters can both remain UNKNOWN. |
+| `DATA_TYPE_MAPPING_UNPROVEN` | A logical codec/type change lacks a supported readability proof. Retain a compatible encoding or add explicit codec evidence. |
+| `DATA_WRITE_ACCEPTANCE_UNPROVEN` | A candidate old-reader failure lacks a positive supported row-domain admission proof. Opaque/cross-column constraints, defaults, custom writes, and other unsupported behavior cannot be ignored. |
+| `DATA_READ_PROVENANCE_UNPROVEN`, `DATA_WRITE_PROVENANCE_UNPROVEN`, `DATA_WRITE_EFFECT_UNPROVEN` | Relevant paths lack a supported decoder, writer, or indirect-effect model. Re-extract supported metadata or retain UNKNOWN for those paths. |
+| `DATA_READ_EFFECT_UNPROVEN`, `DATA_IMPLICIT_WRITE_UNPROVEN`, `DATA_NULL_DOMAIN_UNPROVEN`, `DATA_POLYMORPHIC_READ_UNPROVEN` | Views/inheritance, omitted values, uncertain NULL domains, or conditional/incomplete discriminator models need additional scoped evidence. They cannot be treated as disjoint or equivalent merely because the explicit SQL still prepares. |
+| `DATA_CONTRACT_UNSUPPORTED`, `DATA_CONTRACT_COVERAGE_UNPROVEN`, `DATA_WHOLE_APPLICATION_UNPROVEN`, `DATA_AMBIGUOUS_PROVENANCE`, `DATA_EMPTY_CONTRACT` | Unsupported versions/dialects, incomplete declared coverage, whole-application claims, duplicate identifiers, or empty evidence prevent a complete data proof. Supply a valid, unambiguous contract covering the relevant supported access paths. |
+| `DATA_DOMAIN_PRESERVED` | Known admitted new domains and decoder meanings are included in the old supported read domains. This is a scoped data proof, independent of the schema verdicts. |
+
+Final NOT NULL, CHECK, or enum restrictions can exclude a proposed new value and prevent a fabricated old-reader failure. Candidate evidence describes the supported relational row domain; it does not claim to execute an INSERT or model current unique-key occupancy, matching UPDATE rows, or sequence exhaustion. PostgreSQL/Hibernate fixture executions independently demonstrate decoder failures and counterexamples. Unsupported or legacy contracts without the required provenance remain UNKNOWN where relevant. The data direction currently concerns the final schema, not new-release writes against every intermediate migration state.
+
+PostgreSQL assignment and JDBC/Hibernate decoding can normalize representations: numeric text `01` can decode as ordinal 1, and a NAME enum decoder can trim surrounding whitespace. Raw string differences in such unsupported cases remain UNKNOWN. Arbitrary JavaType/JdbcType implementations cannot borrow a built-in logical type's producer proof. When effective Hibernate null checks are disabled, raw `hibernateNullable=false` alone does not prove that a nullable property cannot write NULL; the contract preserves that raw fact and withholds the unsupported input-domain proof.
+
 ## Compatibility views
 
 `TRANSPARENT_COMPATIBILITY_VIEW` recognizes a narrow rename pattern:

@@ -7,7 +7,7 @@ import java.io.File
 import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.test.assertEquals
-import kotlin.test.assertFalse
+import kotlin.test.assertTrue
 import kotlin.test.assertNull
 
 class Hibernate7EnumEncodingTest {
@@ -28,12 +28,15 @@ class Hibernate7EnumEncodingTest {
         assertEquals(listOf("z-code", "a-code", "m-code"), string.enumRelationalValues)
         assertEquals(listOf("a-code", "m-code", "z-code"), string.enumValues)
         assertNull(string.converterClass, "Hibernate's built-in finite-map conversion is not an application AttributeConverter")
-        assertFalse(string.inputDomainComplete, "New metadata must not silently widen existing compatibility proofs")
+        assertTrue(string.inputDomainComplete, "The exact Hibernate finite-map converter has a supported direct input domain")
+        assertTrue(string.readDomainComplete)
         val integer = columns.getValue("integer_code")
         assertEquals(EnumMode.ORDINAL, integer.enumMode)
         assertEquals(EnumEncoding.EXPLICIT, integer.enumEncoding)
         assertEquals(names, integer.enumConstants)
         assertEquals(listOf("17", "3", "29"), integer.enumRelationalValues)
+        assertTrue(integer.inputDomainComplete)
+        assertTrue(integer.readDomainComplete)
         val native = columns.getValue("native_ordered")
         assertEquals(EnumMode.ORDINAL, native.enumMode)
         assertEquals(EnumEncoding.NAME, native.enumEncoding)

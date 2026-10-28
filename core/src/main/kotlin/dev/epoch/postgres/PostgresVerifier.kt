@@ -41,9 +41,9 @@ class PostgresVerifier {
         baselineDirectory: Path,
         migrationsDirectory: Path,
         options: VerificationOptions = VerificationOptions(),
-    ): CompatibilityReport = runVerification(contracts, null, baselineDirectory, migrationsDirectory, options).first
+    ): CompatibilityReport = runVerification(contracts, null, baselineDirectory, migrationsDirectory, options).forward
 
-    /** Checks old code on each migrated schema and new code on the retained original schema. */
+    /** Checks both schema directions and new mapped writes against old readers on the final schema. */
     fun verifyBidirectional(
         oldContracts: List<DatabaseContract>,
         newContracts: List<DatabaseContract>,
@@ -51,17 +51,23 @@ class PostgresVerifier {
         migrationsDirectory: Path,
         options: VerificationOptions = VerificationOptions(),
     ): BidirectionalReport {
-        val (forward, reverse) = runVerification(oldContracts, newContracts, baselineDirectory, migrationsDirectory, options)
+        val (forward, reverse, data) = runVerification(oldContracts, newContracts, baselineDirectory, migrationsDirectory, options)
         val backward = requireNotNull(reverse)
-        return BidirectionalReport(oldOnNew = forward, newOnOld = backward,
-            verdict = CompatibilityEngine.aggregate(listOf(forward.verdict, backward.verdict)),
-            gateVerdict = forward.gateVerdict?.let { CompatibilityEngine.aggregate(listOf(it, backward.verdict)) })
+        val dataCompatibility = requireNotNull(data)
+        return BidirectionalReport(oldOnNew = forward, newOnOld = backward, dataCompatibility = dataCompatibility,
+            verdict = CompatibilityEngine.aggregate(listOf(forward.verdict, backward.verdict, dataCompatibility.verdict)),
+            gateVerdict = forward.gateVerdict?.let {
+                CompatibilityEngine.aggregate(listOf(it, backward.verdict, dataCompatibility.verdict))
+            })
     }
+
+    private data class VerificationRun(val forward: CompatibilityReport, val reverse: CompatibilityReport? = null,
+                                       val dataCompatibility: CompatibilityReport? = null)
 
     private fun runVerification(
         contracts: List<DatabaseContract>, newContracts: List<DatabaseContract>?,
         baselineDirectory: Path, migrationsDirectory: Path, options: VerificationOptions,
-    ): Pair<CompatibilityReport, CompatibilityReport?> {
+    ): VerificationRun {
         validateContracts(contracts)
         newContracts?.let(::validateContracts)
         require(options.migrationTimeoutSeconds in 1..86400) { "migrationTimeoutSeconds must be between 1 and 86400" }
@@ -204,6 +210,7 @@ class PostgresVerifier {
                                 "Boundary execution skipped ${entries.size} INSERT templates: $reason"
                             }.sorted())
                     }
+                    var dataCompatibility: CompatibilityReport? = null
                     val reverse = newContract?.let { next ->
                         val finalSchema: SchemaSnapshot
                         val finalPlans: Map<String, QueryPlan>
@@ -227,12 +234,15 @@ class PostgresVerifier {
                                     planningParallelism = planning.planningParallelism)
                         }
                         if (options.progress != null) publishProgress(options, "new-on-old", engine.report(next, listOf(reverseStep), finalHealth))
+                        dataCompatibility = DataContractCompatibility().assess(contract, next, finalSchema,
+                            currentPlans.filterValues { it.accepted }.keys, finalPlans.filterValues { it.accepted }.keys)
+                        if (options.progress != null) publishProgress(options, "new-writes-old-reads", requireNotNull(dataCompatibility))
                         engine.report(next, listOf(reverseStep), finalHealth).let {
                             it.copy(limitations = it.limitations + "New-on-old verifies the new contract against the retained original schema; it does not execute or prove down-migration behavior." +
                                 if (options.executeBoundaries) listOf("Optional boundary execution applies only to old-on-new verification; reverse compatibility uses catalog and SQL planning evidence.") else emptyList())
                         }
                     }
-                    forward to reverse
+                    VerificationRun(forward, reverse, dataCompatibility)
                 }
         }
     }
@@ -307,11 +317,16 @@ class PostgresVerifier {
         val prefixed = contracts.mapIndexed { index, item ->
             val prefix = "contract[${index + 1}]/"
             item.copy(
-                entities = item.entities.map { it.copy(id = prefix + it.id) },
+                entities = item.entities.map { entity -> entity.copy(id = prefix + entity.id,
+                    hierarchy = entity.hierarchy?.let { hierarchy -> hierarchy.copy(
+                        rootEntityId = hierarchy.rootEntityId?.let { prefix + it }) }) },
                 queries = item.queries.map { it.copy(
                     id = prefix + it.id,
                     accessPathIds = it.accessPathIds.map { path -> prefix + path },
                     mappedEntityIds = it.mappedEntityIds.map { entity -> prefix + entity },
+                    mappedReads = it.mappedReads.map { read -> read.copy(entityId = prefix + read.entityId) },
+                    polymorphicReads = it.polymorphicReads.map { read -> read.copy(rootEntityId = prefix + read.rootEntityId) },
+                    discriminatorWrites = it.discriminatorWrites.map { write -> write.copy(entityId = prefix + write.entityId) },
                 ) },
                 unresolvedQueries = item.unresolvedQueries.map { it.copy(id = prefix + it.id) },
                 accessPaths = item.accessPaths.map { it.copy(id = prefix + it.id, queryIds = it.queryIds.map { query -> prefix + query }) },

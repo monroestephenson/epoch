@@ -40,6 +40,7 @@ data class EntityContract(
     val generatedIdentifier: String? = null,
     val identifierSequence: String? = null,
     val identifierAllocationSize: Int? = null,
+    val hierarchy: HierarchyContract? = null,
 )
 
 data class ColumnContract(
@@ -72,10 +73,25 @@ data class ColumnContract(
     val converterBytecodeSha256: String? = null,
     /** A supported explicit unbounded string declaration; missing length alone is not evidence. */
     val lengthUnbounded: Boolean = false,
+    /** Positive direct decoder fact, independent of write transformations and generated values. */
+    val readDomainComplete: Boolean = false,
 )
 
 data class ColumnReference(val table: String, val column: String)
 data class ResultColumn(val name: String, val typeName: String? = null)
+data class MappedColumnRead(val entityId: String, val column: ColumnReference)
+data class PolymorphicRead(val rootEntityId: String, val unrestricted: Boolean = false)
+data class DiscriminatorWrite(val entityId: String, val column: ColumnReference, val value: String)
+data class HierarchyContract(
+    val rootEntityId: String?,
+    val strategy: String,
+    val concrete: Boolean,
+    val discriminator: ColumnReference? = null,
+    val discriminatorType: String? = null,
+    val entityValue: String? = null,
+    val acceptedValues: List<String> = emptyList(),
+    val complete: Boolean = false,
+)
 
 data class QueryContract(
     val id: String,
@@ -98,6 +114,12 @@ data class QueryContract(
     val observationFrames: List<String> = emptyList(),
     /** Exact entity/table mapping entries from which this ORM statement was generated. */
     val mappedEntityIds: List<String> = emptyList(),
+    /** Actual selected Hibernate decoder bindings, never predicate-only dependencies. */
+    val mappedReads: List<MappedColumnRead> = emptyList(),
+    val mappedReadCoverageComplete: Boolean = false,
+    val polymorphicReads: List<PolymorphicRead> = emptyList(),
+    /** Literal discriminator values supplied by actual supported generated INSERT statements. */
+    val discriminatorWrites: List<DiscriminatorWrite> = emptyList(),
 )
 
 data class SchemaSnapshot(
@@ -252,13 +274,15 @@ data class RuleSummary(
     val acceptedBaselineCount: Int = 0,
 )
 
-/** Scientific verdicts for both rollout directions, independently reported. */
+/** Independently reported schema rollout directions and new-write/old-read data compatibility. */
 data class BidirectionalReport(
     val schemaVersion: Int = 1,
     val oldOnNew: CompatibilityReport,
     val newOnOld: CompatibilityReport,
     val verdict: Verdict,
     val gateVerdict: Verdict? = null,
+    /** New mapped writes assessed against old mapped readers on the final deployment schema. */
+    val dataCompatibility: CompatibilityReport? = null,
 )
 
 enum class AccessPathStatus { STATIC, OBSERVED, DECLARED, UNRESOLVED }
