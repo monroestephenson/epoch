@@ -32,6 +32,9 @@ internal object SqlDependencies {
     fun inspect(sql: String, defaultSchema: String = "public", nativeSql: Boolean = false, sourceId: String? = null): Dependencies {
         return try {
             val statement = CCJSqlParserUtil.parse(sql)
+            if (ScopedSqlDependencies.required(statement)) {
+                return ScopedSqlDependencies.inspect(statement, defaultSchema, nativeSql)
+            }
             val aliases = linkedMapOf<String, String>()
             val references = mutableListOf<Pair<String?, String>>()
             var complete = statement is Select || statement is Insert || statement is Update || statement is Delete
