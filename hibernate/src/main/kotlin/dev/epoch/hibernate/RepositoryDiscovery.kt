@@ -265,7 +265,8 @@ object RepositoryDiscovery {
                 val calls = mutableMapOf<MethodInsnNode, DatabaseCall>()
                 fun classify(instruction: MethodInsnNode, receiver: ConstantValue? = null): DatabaseCall? {
                     val id = sites.getValue(instruction).id
-                    val resolution = try { classifier.classifyReceivers(instruction, receiver?.referenceTypes) }
+                    val resolution = try { classifier.classifyReceivers(instruction, receiver?.referenceTypes,
+                        receiver?.dispatchUncertain == true || receiver?.nullReference == true) }
                     catch (failure: Throwable) {
                         val reason = diagnostics.capture(id, "Database API owner could not be classified", failure)
                         ApiResolution(null, listOf(reason))
@@ -606,7 +607,9 @@ object RepositoryDiscovery {
 
 private data class ConstantValue(val basic: BasicValue, val constants: Set<Any>? = null, val unresolvedReason: String? = null,
                                  val origins: Set<QueryOrigin>? = null,
-                                 val referenceTypes: Set<RepositoryType.ClassType>? = RepositoryDomains.descriptor(basic.type)) : Value {
+                                 val referenceTypes: Set<RepositoryType.ClassType>? = RepositoryDomains.descriptor(basic.type),
+                                 val dispatchUncertain: Boolean = false,
+                                 val nullReference: Boolean = false) : Value {
     val constant: Any? get() = constants?.singleOrNull()
     override fun getSize() = basic.size
 }
@@ -650,23 +653,30 @@ private class ConstantInterpreter(private val fields: Map<String, Any>, private 
             is LdcInsnNode -> if (instruction.cst is String) setOf(RepositoryType.ClassType("java/lang/String")) else RepositoryDomains.descriptor(basic.type)
             else -> RepositoryDomains.descriptor(basic.type)
         }
-        return ConstantValue(basic, constant?.let(::setOf), referenceTypes = types)
+        // BasicInterpreter erases ACONST_NULL to its generic reference value.
+        // Keep a separate fact so NULL cannot become a spurious Object receiver.
+        val nullReference = instruction.opcode == Opcodes.ACONST_NULL
+        return ConstantValue(basic, constant?.let(::setOf), referenceTypes = if (nullReference) emptySet() else types,
+            nullReference = nullReference)
     }
     override fun copyOperation(instruction: AbstractInsnNode, value: ConstantValue) = value
     override fun unaryOperation(instruction: AbstractInsnNode, value: ConstantValue) =
         base.unaryOperation(instruction, value.basic)?.let {
             when {
-                instruction.opcode == Opcodes.CHECKCAST -> ConstantValue(it, value.constants, value.unresolvedReason, value.origins,
-                    castTypes(value, (instruction as TypeInsnNode).desc))
+                instruction.opcode == Opcodes.CHECKCAST -> {
+                    val target = (instruction as TypeInsnNode).desc
+                    val known = value.referenceTypes
+                    val preserved = !known.isNullOrEmpty() && known.all { type ->
+                        headers.hierarchy(type.name).let { graph -> graph.complete && target in graph.nodes }
+                    }
+                    ConstantValue(it, value.constants, value.unresolvedReason, value.origins,
+                        if (value.nullReference) emptySet() else if (preserved) known else RepositoryDomains.descriptor(Type.getObjectType(target)),
+                        !value.nullReference && (value.dispatchUncertain || !preserved), value.nullReference)
+                }
                 instruction is FieldInsnNode && instruction.opcode == Opcodes.GETFIELD -> ConstantValue(it, referenceTypes = fieldTypes(instruction))
                 else -> ConstantValue(it)
             }
         }
-    private fun castTypes(value: ConstantValue, target: String): Set<RepositoryType.ClassType>? {
-        val known = value.referenceTypes
-        return if (!known.isNullOrEmpty() && known.all { type -> headers.hierarchy(type.name).let { it.complete && target in it.nodes } }) known
-        else RepositoryDomains.descriptor(Type.getObjectType(target))
-    }
     override fun binaryOperation(instruction: AbstractInsnNode, left: ConstantValue, right: ConstantValue) =
         base.binaryOperation(instruction, left.basic, right.basic)?.let { ConstantValue(it) }
     override fun ternaryOperation(instruction: AbstractInsnNode, a: ConstantValue, b: ConstantValue, c: ConstantValue) =
@@ -674,14 +684,19 @@ private class ConstantInterpreter(private val fields: Map<String, Any>, private 
     override fun naryOperation(instruction: AbstractInsnNode, values: MutableList<out ConstantValue>): ConstantValue? {
         val basic = base.naryOperation(instruction, values.map { it.basic }) ?: return null
         val called = (instruction as? MethodInsnNode)?.let { call -> classifier.classifyReceivers(call,
-            values.firstOrNull()?.takeIf { call.opcode != Opcodes.INVOKESTATIC }?.referenceTypes).call }
+            values.firstOrNull()?.takeIf { call.opcode != Opcodes.INVOKESTATIC }?.referenceTypes,
+            values.firstOrNull()?.takeIf { call.opcode != Opcodes.INVOKESTATIC }?.let { it.dispatchUncertain || it.nullReference } == true).call }
         val produced = (instruction as? MethodInsnNode)?.let { origins.factory(it, called) }
         val references = when (instruction) {
             is MethodInsnNode -> RepositoryDomains.descriptor(Type.getReturnType(instruction.desc))
             is InvokeDynamicInsnNode -> RepositoryDomains.descriptor(Type.getReturnType(instruction.desc))
             else -> RepositoryDomains.descriptor(basic.type)
         }
-        val queryOrigins = produced?.let(::setOf) ?: (instruction as? MethodInsnNode)
+        // A call on a proven NULL receiver cannot return a query. Its empty set
+        // must not erase a successful factory origin while ASM converges branches.
+        val nullCall = instruction is MethodInsnNode && instruction.opcode != Opcodes.INVOKESTATIC &&
+            values.firstOrNull()?.nullReference == true
+        val queryOrigins = if (nullCall) emptySet() else produced?.let(::setOf) ?: (instruction as? MethodInsnNode)
             ?.takeIf { origins.returnsReceiver(it) }?.let { values.firstOrNull()?.origins }
         val evaluated: Evaluation = when {
             instruction is MethodInsnNode && called?.translation == "JDBC_SQL" && instruction.name == "prepareStatement" ->
@@ -707,11 +722,26 @@ private class ConstantInterpreter(private val fields: Map<String, Any>, private 
         if (left == right) return left
         val basic = base.merge(left.basic, right.basic)
         val constants = if (left.constants == null || right.constants == null) null else (left.constants + right.constants).takeIf { it.size <= MAX_VARIANTS }
-        val origins = if (left.origins == null || right.origins == null) null else (left.origins + right.origins).takeIf { it.size <= MAX_VARIANTS }
-        val types = if (left.referenceTypes == null || right.referenceTypes == null) null else (left.referenceTypes + right.referenceTypes).takeIf { it.size <= MAX_VARIANTS }
+        val origins = when {
+            left.nullReference -> right.origins
+            right.nullReference -> left.origins
+            left.origins == null || right.origins == null -> null
+            else -> (left.origins + right.origins).takeIf { it.size <= MAX_VARIANTS }
+        }
+        // NULL contributes no possible successful invocation target. Unknown or bounded-out
+        // alternatives must remain explicit, rather than becoming the call owner's default.
+        val types = when {
+            left.nullReference -> right.referenceTypes
+            right.nullReference -> left.referenceTypes
+            left.referenceTypes == null || right.referenceTypes == null -> null
+            else -> (left.referenceTypes + right.referenceTypes).takeIf { it.size <= MAX_VARIANTS }
+        }
+        val dispatchUncertain = left.dispatchUncertain || right.dispatchUncertain ||
+            (types == null && !(left.nullReference && right.nullReference))
         val exceeded = left.constants != null && right.constants != null && constants == null
         return ConstantValue(basic, constants, if (exceeded) "Query string alternatives exceed the $MAX_VARIANTS-variant bytecode bound"
-            else listOfNotNull(left.unresolvedReason, right.unresolvedReason).sorted().firstOrNull(), origins, types)
+            else listOfNotNull(left.unresolvedReason, right.unresolvedReason).sorted().firstOrNull(), origins, types, dispatchUncertain,
+            left.nullReference && right.nullReference)
     }
 
     private data class Evaluation(val constants: Set<Any>? = null, val reason: String? = null)

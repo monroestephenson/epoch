@@ -24,6 +24,12 @@ internal object ScopedSqlDependencies {
         val detector = object : TablesNamesFinder<Void>() {
             private var selects = 0
             override fun <S : Any?> visit(item: WithItem<*>, context: S): Void? { needed = true; return null }
+            override fun <S : Any?> visit(table: Table, context: S): Void? {
+                // Relation column aliases rename by catalog position even without WITH.
+                // The flat collector must not turn those output names into physical columns.
+                if (!table.alias?.aliasColumns.isNullOrEmpty()) needed = true
+                return super.visit(table, context)
+            }
             override fun <S : Any?> visit(select: ParenthesedSelect, context: S): Void? { needed = true; return null }
             override fun <S : Any?> visit(select: LateralSubSelect, context: S): Void? { needed = true; return null }
             override fun <S : Any?> visit(select: SetOperationList, context: S): Void? { needed = true; return null }
@@ -293,8 +299,15 @@ internal object ScopedSqlDependencies {
             val alias = table.alias?.name?.let(SqlDependencies::identifier)
             val keys = if (alias != null) listOf(alias) else listOfNotNull(SqlDependencies.identifier(table.name),
                 (binding as? Physical)?.table)
-            scope.relations += binding
-            keys.distinct().forEach { key -> alias(scope, key, binding) }
+            val effective = if (!table.alias?.aliasColumns.isNullOrEmpty()) {
+                unsupported("Relation column aliases require catalog/output position facts that are not established")
+                // Preserve known physical relations, but no column on this renamed output
+                // may be guessed as an identically named physical column. Other aliases
+                // retain their independent established references.
+                Virtual(null)
+            } else binding
+            scope.relations += effective
+            keys.distinct().forEach { key -> alias(scope, key, effective) }
         }
         private fun alias(scope: Scope, key: String, binding: Binding) {
             if (key in scope.ambiguousAliases || scope.aliases.putIfAbsent(key, binding) != null) {

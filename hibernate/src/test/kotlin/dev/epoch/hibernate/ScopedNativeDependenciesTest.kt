@@ -163,4 +163,38 @@ class ScopedNativeDependenciesTest {
         assertFalse(ColumnReference("public.badges", "id") in result.columns)
     }
 
+    @Test fun `physical relation column alias lists never fabricate physical column names`() {
+        for (sql in listOf(
+            "select a.renamed_id from public.accounts a(renamed_id)",
+            "select renamed_id from public.accounts a(renamed_id)",
+            "with c as (select a.renamed_id from public.accounts a(renamed_id)) select c.renamed_id from c",
+            "with c as (select a.\"Renamed\" from public.accounts a(\"Renamed\")) select c.\"Renamed\" from c",
+        )) {
+            val result = inspect(sql)
+            assertFalse(result.complete, "$sql: $result")
+            assertEquals(listOf("public.accounts"), result.tables, "$sql: $result")
+            assertTrue(result.columns.isEmpty(), "Relation output aliases are not physical columns: $sql: $result")
+            assertTrue(result.failureReason.orEmpty().contains("Relation column aliases"), result.toString())
+        }
+    }
+
+    @Test fun `CTE reference column aliases remain virtual and require explicit output position support`() {
+        val result = inspect("with c as (select a.id from public.accounts a) select v.renamed_id from c v(renamed_id)")
+        assertFalse(result.complete, result.toString())
+        assertEquals(listOf("public.accounts"), result.tables)
+        assertEquals(listOf(ColumnReference("public.accounts", "id")), result.columns)
+        assertTrue(result.failureReason.orEmpty().contains("Relation column aliases"), result.toString())
+        noVirtual(result, "c", "v")
+    }
+
+    @Test fun `unsupported relation column aliases retain independent qualified dependencies`() {
+        val result = inspect("with c as (select a.renamed_id, b.account_id from public.accounts a(renamed_id) " +
+            "join public.badges b on b.account_id = a.renamed_id) select c.account_id from c")
+        assertFalse(result.complete, result.toString())
+        assertEquals(listOf("public.accounts", "public.badges"), result.tables)
+        assertTrue(ColumnReference("public.badges", "account_id") in result.columns, result.toString())
+        assertFalse(result.columns.any { it.table == "public.accounts" }, result.toString())
+        noVirtual(result, "c")
+    }
+
 }

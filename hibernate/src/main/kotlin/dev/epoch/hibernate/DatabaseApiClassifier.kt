@@ -15,7 +15,12 @@ internal data class ApiResolution(val call: DatabaseCall?, val ancestryGaps: Lis
 
 internal class DatabaseApiClassifier(private val headers: RepositoryHeaders) {
     /** Do not discard a known override when control flow merges several receiver types. */
-    fun classifyReceivers(call: MethodInsnNode, receivers: Set<RepositoryType.ClassType>?): ApiResolution {
+    fun classifyReceivers(call: MethodInsnNode, receivers: Set<RepositoryType.ClassType>?, uncertain: Boolean = false): ApiResolution {
+        if (call.opcode != org.objectweb.asm.Opcodes.INVOKESTATIC && uncertain) {
+            val declared = classify(call)
+            return declared.copy(call = declared.call?.copy(role = DatabaseApiRole.UNSUPPORTED, queryCapable = true,
+                translation = null, reason = "Receiver alternatives are incomplete after a merge or cast; framework dispatch is not established"))
+        }
         if (call.opcode == org.objectweb.asm.Opcodes.INVOKESTATIC || receivers.isNullOrEmpty()) return classify(call)
         val alternatives = receivers.sortedBy { it.name }.map { it.name to classify(call, it.name) }
         val gaps = alternatives.flatMap { it.second.ancestryGaps }.distinct().sorted()

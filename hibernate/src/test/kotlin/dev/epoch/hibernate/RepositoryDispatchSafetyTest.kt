@@ -213,6 +213,124 @@ class RepositoryDispatchSafetyTest {
         }
     }
 
+    @Test fun `a nullable alternative cannot erase a known application override`() {
+        val manager = "audit/NullableCustomManager"
+        writeManager(manager, overrideQuery = true)
+        write("audit/ConditionalCaller", conditionalCaller(manager, unknownAlternative = false))
+        val result = discover()
+        val paths = result.accessPaths.filter { it.className == "audit.ConditionalCaller" }
+        assertEquals(2, paths.size, result.toString())
+        assertTrue(paths.all { it.status == AccessPathStatus.UNRESOLVED }, paths.toString())
+        assertTrue(result.hqlQueries.keys.none { it.startsWith("audit.ConditionalCaller#") }, result.toString())
+    }
+
+    @Test fun `nullable inherited framework receivers retain their supported successful query path`() {
+        val manager = "audit/NullableInheritedManager"
+        writeManager(manager, overrideQuery = false)
+        write("audit/ConditionalCaller", conditionalCaller(manager, unknownAlternative = false))
+        val result = discover()
+        val paths = result.accessPaths.filter { it.className == "audit.ConditionalCaller" }
+        assertEquals(2, paths.size, result.toString())
+        assertTrue(paths.all { it.status == AccessPathStatus.STATIC }, paths.toString())
+        assertEquals(1, result.hqlQueries.keys.count { it.startsWith("audit.ConditionalCaller#") })
+    }
+
+    @Test fun `an Object alternative and cast cannot erase a known application override`() {
+        val manager = "audit/CastCustomManager"
+        writeManager(manager, overrideQuery = true)
+        write("audit/ConditionalCaller", conditionalCaller(manager, unknownAlternative = true))
+        val result = discover()
+        val paths = result.accessPaths.filter { it.className == "audit.ConditionalCaller" }
+        assertEquals(2, paths.size, result.toString())
+        assertTrue(paths.all { it.status == AccessPathStatus.UNRESOLVED }, paths.toString())
+        assertTrue(result.hqlQueries.keys.none { it.startsWith("audit.ConditionalCaller#") }, result.toString())
+    }
+
+    @Test fun `bounded out receiver alternatives do not fall back to framework dispatch`() {
+        val managers = (0..16).map { "audit/BoundManager$it" }
+        managers.forEachIndexed { index, manager -> writeManager(manager, overrideQuery = index == 0) }
+        write("audit/BoundCaller", ClassWriter(0).apply {
+            visit(Opcodes.V17, Opcodes.ACC_PUBLIC, "audit/BoundCaller", null, "java/lang/Object", null)
+            val descriptor = managers.joinToString("", "(", "I)V") { "L$it;" }
+            visitMethod(Opcodes.ACC_PUBLIC or Opcodes.ACC_STATIC, "run", descriptor, null, null).apply {
+                val labels = managers.map { Label() }
+                val joined = Label()
+                visitCode(); visitVarInsn(Opcodes.ILOAD, managers.size)
+                visitTableSwitchInsn(0, managers.lastIndex, labels.first(), *labels.toTypedArray())
+                labels.forEachIndexed { index, label ->
+                    visitLabel(label); visitFrame(Opcodes.F_SAME, 0, null, 0, null)
+                    visitVarInsn(Opcodes.ALOAD, index); visitJumpInsn(Opcodes.GOTO, joined)
+                }
+                visitLabel(joined); visitFrame(Opcodes.F_SAME1, 0, null, 1, arrayOf("jakarta/persistence/EntityManager"))
+                visitLdcInsn("from Customer")
+                visitMethodInsn(Opcodes.INVOKEINTERFACE, "jakarta/persistence/EntityManager", "createQuery", "(Ljava/lang/String;)Ljakarta/persistence/Query;", true)
+                visitMethodInsn(Opcodes.INVOKEINTERFACE, "jakarta/persistence/Query", "getResultList", "()Ljava/util/List;", true)
+                visitInsn(Opcodes.POP); visitInsn(Opcodes.RETURN); visitMaxs(2, managers.size + 1); visitEnd()
+            }; visitEnd()
+        })
+        val result = discover()
+        val paths = result.accessPaths.filter { it.className == "audit.BoundCaller" }
+        assertEquals(2, paths.size, result.toString())
+        assertTrue(paths.all { it.status == AccessPathStatus.UNRESOLVED }, paths.toString())
+        assertTrue(result.hqlQueries.keys.none { it.startsWith("audit.BoundCaller#") }, result.toString())
+    }
+
+    private fun conditionalCaller(manager: String, unknownAlternative: Boolean) = ClassWriter(0).apply {
+        visit(Opcodes.V17, Opcodes.ACC_PUBLIC, "audit/ConditionalCaller", null, "java/lang/Object", null)
+        val descriptor = if (unknownAlternative) "(L$manager;Ljava/lang/Object;Z)V" else "(L$manager;Z)V"
+        visitMethod(Opcodes.ACC_PUBLIC or Opcodes.ACC_STATIC, "run", descriptor, null, null).apply {
+            val alternative = Label(); val joined = Label()
+            visitCode(); visitVarInsn(Opcodes.ILOAD, if (unknownAlternative) 2 else 1); visitJumpInsn(Opcodes.IFEQ, alternative)
+            visitVarInsn(Opcodes.ALOAD, 0); visitJumpInsn(Opcodes.GOTO, joined)
+            visitLabel(alternative); visitFrame(Opcodes.F_SAME, 0, null, 0, null)
+            if (unknownAlternative) visitVarInsn(Opcodes.ALOAD, 1) else visitInsn(Opcodes.ACONST_NULL)
+            visitLabel(joined); visitFrame(Opcodes.F_SAME1, 0, null, 1,
+                arrayOf(if (unknownAlternative) "java/lang/Object" else "jakarta/persistence/EntityManager"))
+            if (unknownAlternative) visitTypeInsn(Opcodes.CHECKCAST, "jakarta/persistence/EntityManager")
+            visitLdcInsn("from Customer")
+            visitMethodInsn(Opcodes.INVOKEINTERFACE, "jakarta/persistence/EntityManager", "createQuery", "(Ljava/lang/String;)Ljakarta/persistence/Query;", true)
+            visitMethodInsn(Opcodes.INVOKEINTERFACE, "jakarta/persistence/Query", "getResultList", "()Ljava/util/List;", true)
+            visitInsn(Opcodes.POP); visitInsn(Opcodes.RETURN); visitMaxs(2, if (unknownAlternative) 3 else 2); visitEnd()
+        }; visitEnd()
+    }
+
+    @Test fun `a direct known NULL receiver cannot create an executable query contract`() {
+        assertKnownNullInvocation(cast = false)
+    }
+
+    @Test fun `casts and local copies cannot turn a known NULL receiver into executable SQL`() {
+        assertKnownNullInvocation(cast = true)
+    }
+
+    private fun assertKnownNullInvocation(cast: Boolean) {
+        val owner = "audit/KnownNullCaller"
+        write(owner, ClassWriter(0).apply {
+            visit(Opcodes.V17, Opcodes.ACC_PUBLIC, owner, null, "java/lang/Object", null)
+            visitMethod(Opcodes.ACC_PUBLIC or Opcodes.ACC_STATIC, "run", "()V", null, null).apply {
+                visitCode(); visitInsn(Opcodes.ACONST_NULL)
+                if (cast) {
+                    visitVarInsn(Opcodes.ASTORE, 0); visitVarInsn(Opcodes.ALOAD, 0)
+                    visitTypeInsn(Opcodes.CHECKCAST, "java/lang/Object")
+                    visitTypeInsn(Opcodes.CHECKCAST, "jakarta/persistence/EntityManager")
+                }
+                visitLdcInsn("from Customer")
+                visitMethodInsn(Opcodes.INVOKEINTERFACE, "jakarta/persistence/EntityManager", "createQuery", "(Ljava/lang/String;)Ljakarta/persistence/Query;", true)
+                visitMethodInsn(Opcodes.INVOKEINTERFACE, "jakarta/persistence/Query", "getResultList", "()Ljava/util/List;", true)
+                visitInsn(Opcodes.POP); visitInsn(Opcodes.RETURN); visitMaxs(2, if (cast) 1 else 0); visitEnd()
+            }; visitEnd()
+        })
+        val result = discover()
+        val paths = result.accessPaths.filter { it.className == "audit.KnownNullCaller" }
+        assertEquals(2, paths.size, result.toString())
+        assertTrue(paths.all { it.status == AccessPathStatus.UNRESOLVED && !it.reason.isNullOrBlank() }, paths.toString())
+        assertTrue(result.hqlQueries.isEmpty(), result.hqlQueries.toString())
+        assertTrue(result.nativeQueries.isEmpty(), result.nativeQueries.toString())
+        val inventory = requireNotNull(result.apiInventory)
+        assertTrue(inventory.failedSources.isEmpty(), inventory.toString())
+        assertTrue(inventory.ownerGaps.isEmpty(), "NULL is not missing bytecode or ancestry: $inventory")
+        assertEquals(2, inventory.invocations.size, inventory.toString())
+    }
+
     private fun writeManager(name: String, overrideQuery: Boolean, extraInterface: String? = null) = write(name, ClassWriter(0).apply {
         visit(Opcodes.V17, Opcodes.ACC_PUBLIC or Opcodes.ACC_ABSTRACT, name, null, "java/lang/Object",
             listOfNotNull("jakarta/persistence/EntityManager", extraInterface).toTypedArray())
