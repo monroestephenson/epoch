@@ -7,6 +7,7 @@ dependencies {
     implementation("org.ow2.asm:asm-tree:9.7.1")
     implementation("org.ow2.asm:asm-analysis:9.7.1")
     implementation("org.jetbrains.kotlin:kotlin-metadata-jvm:2.1.21")
+    implementation("org.slf4j:slf4j-api:2.0.17")
     testImplementation("org.springframework.data:spring-data-jpa:3.4.5")
 }
 
@@ -17,6 +18,23 @@ val hibernate749Runtime by configurations.creating
 val panacheRuntime by configurations.creating { isTransitive = false }
 // Compile application fixtures independently of main/test, whose Hibernate API is 6.6.
 val hibernate7Fixtures by sourceSets.creating
+// Actual independent application artifacts exercise normal multi-module runtime classpaths.
+val hibernate7EntityFixtureJar by tasks.registering(Jar::class) {
+    archiveClassifier.set("hibernate7-entity-fixture")
+    from(hibernate7Fixtures.output) { include("dev/epoch/jarfixture/entity/**") }
+}
+val hibernate7RepositoryFixtureJar by tasks.registering(Jar::class) {
+    archiveClassifier.set("hibernate7-repository-fixture")
+    from(hibernate7Fixtures.output) { include("dev/epoch/jarfixture/repository/**") }
+}
+val hibernate7JarFixtures by configurations.creating {
+    isCanBeResolved = false
+    isCanBeConsumed = true
+}
+artifacts {
+    add(hibernate7JarFixtures.name, hibernate7EntityFixtureJar)
+    add(hibernate7JarFixtures.name, hibernate7RepositoryFixtureJar)
+}
 dependencies {
     hibernate7Runtime("org.hibernate.orm:hibernate-core:7.1.4.Final")
     hibernate70Runtime("org.hibernate.orm:hibernate-core:7.0.10.Final")

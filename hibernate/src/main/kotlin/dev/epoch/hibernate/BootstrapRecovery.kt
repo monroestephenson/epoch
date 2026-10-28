@@ -229,9 +229,6 @@ internal object BootstrapRecovery {
         return result
     }
 
-    fun rethrowFatal(error: Throwable) {
-        if (error is VirtualMachineError || error is ThreadDeath) throw error
-        if (error is InterruptedException) { Thread.currentThread().interrupt(); throw error }
-    }
+    fun rethrowFatal(error: Throwable) = ExtractionFailurePolicy.rethrowNonRecoverable(error)
     fun describe(error: Throwable): String = "${error.javaClass.simpleName}: ${error.message ?: "no additional detail"}"
 }

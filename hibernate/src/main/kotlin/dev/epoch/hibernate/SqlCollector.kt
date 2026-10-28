@@ -39,10 +39,15 @@ class SqlCollector : StatementInspector {
     companion object {
         private val mapper = jacksonObjectMapper()
         private val writeLock = Any()
-        internal fun query(sql: String): QueryContract {
+        internal fun queryId(sql: String): String {
             val hash = MessageDigest.getInstance("SHA-256").digest(sql.toByteArray()).joinToString("") { "%02x".format(it) }
-            val deps = SqlDependencies.inspect(sql)
-            return QueryContract("runtime.$hash", SqlOperationClassifier.operation(sql), sql,
+            return "runtime.$hash"
+        }
+        internal fun query(sql: String, unresolved: MutableList<UnresolvedQuery>? = null): QueryContract {
+            val id = queryId(sql)
+            val deps = SqlDependencies.inspect(sql, sourceId = id)
+            deps.failureReason?.let { unresolved?.add(UnresolvedQuery(id, it)) }
+            return QueryContract(id, SqlOperationClassifier.operation(sql), sql,
                 tables = deps.tables, columns = deps.columns, writeColumns = deps.writes,
                 source = QuerySource.RUNTIME_OBSERVED, verificationStatus = VerificationStatus.OBSERVED,
                 dependenciesComplete = false, explicitColumnList = false, targetTable = deps.target)

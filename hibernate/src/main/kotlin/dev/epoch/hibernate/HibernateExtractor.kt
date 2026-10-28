@@ -15,12 +15,7 @@ import org.hibernate.persister.entity.AbstractEntityPersister
 import org.hibernate.query.sqm.tree.select.SqmSelectStatement
 import org.hibernate.query.sql.internal.ParameterParser
 import org.hibernate.query.sql.internal.ParameterRecognizerImpl
-import org.hibernate.sql.ast.spi.AbstractSqlAstWalker
-import org.hibernate.sql.ast.tree.expression.ColumnReference as SqlColumnReference
 import org.hibernate.sql.ast.tree.expression.JdbcParameter
-import org.hibernate.sql.ast.tree.expression.SelfRenderingExpression
-import org.hibernate.sql.ast.tree.from.NamedTableReference
-import org.hibernate.sql.ast.tree.predicate.SelfRenderingPredicate
 import org.hibernate.sql.exec.spi.JdbcParameterBinder
 import org.hibernate.sql.exec.spi.JdbcParameterBindings
 import org.hibernate.sql.model.PreparableMutationOperation
@@ -73,12 +68,12 @@ class HibernateExtractor {
             val observedQueries = mutableListOf<QueryContract>()
             val runtimeFailures = mutableListOf<UnresolvedQuery>()
             for ((sql, records) in observations.groupBy { it.sql }.toSortedMap()) {
-                try {
+                QueryExtraction.record(SqlCollector.queryId(sql), "Observed SQL extraction failed", observedQueries, runtimeFailures) {
+                    val limitations = mutableListOf<UnresolvedQuery>()
                     val matching = result.queries.filter { it.sql == sql }.map { it.parameterTypes }.distinct().singleOrNull()
-                    observedQueries += SqlCollector.query(sql).copy(parameterTypes = matching.orEmpty(),
+                    val query = SqlCollector.query(sql, limitations).copy(parameterTypes = matching.orEmpty(),
                         observationFrames = records.flatMap { it.callSites }.distinct().sorted())
-                } catch (failure: IllegalArgumentException) {
-                    runtimeFailures += UnresolvedQuery("runtime.unsupported", "Observed SQL is unsupported: ${failure.message}")
+                    ExtractedSql(query, limitations)
                 }
             }
             val unresolved = (result.unresolvedQueries + failures + discovery?.unresolved.orEmpty() + runtimeFailures)
@@ -361,8 +356,8 @@ class HibernateExtractor {
             val override = entityOverride(request, p.mappedClass)
             if (override?.resultMappingOnly == true || override?.exclude == true) continue
             val operations = operations(request, p)
-            fun capture(id: String, operation: Operation, sql: String, tables: List<String>, binders: List<JdbcParameterBinder>) {
-                val deps = SqlDependencies.inspect(sql, request.hibernateProperties["hibernate.default_schema"] ?: "public")
+            fun capture(id: String, operation: Operation, sql: String, tables: List<String>, binders: List<JdbcParameterBinder>): ExtractedSql {
+                val deps = SqlDependencies.inspect(sql, request.hibernateProperties["hibernate.default_schema"] ?: "public", sourceId = id)
                 val references = deps.tables.ifEmpty { tables }.distinct().sorted()
                 // Hibernate knows the mutation target even when its SQL uses an unsupported MERGE
                 // form. Retaining provenance does not establish complete dependencies or behavior.
@@ -371,13 +366,14 @@ class HibernateExtractor {
                     if (operation == Operation.SELECT) table in references
                     else table == target && table in tables
                 }.values.sorted()
-                queries += QueryContract(id, operation, sql, deps.tables.ifEmpty { tables }.distinct().sorted(), deps.columns, deps.writes,
+                val query = QueryContract(id, operation, sql, deps.tables.ifEmpty { tables }.distinct().sorted(), deps.columns, deps.writes,
                     parameterTypes = parameterTypes(binders), source = QuerySource.HIBERNATE_MAPPING,
                     dependenciesComplete = deps.complete, explicitColumnList = true,
                     targetTable = target, mappedEntityIds = origins)
-                if (!deps.complete) unresolved += UnresolvedQuery(id, "Generated SQL has an unsupported dependency expression or unresolved table alias")
+                return ExtractedSql(query, if (deps.complete) emptyList() else listOf(UnresolvedQuery(id,
+                    deps.failureReason ?: "Generated SQL has an unsupported dependency expression or unresolved table alias")))
             }
-            if (Operation.SELECT in operations) try {
+            if (Operation.SELECT in operations) QueryExtraction.record("${p.entityName}.findById", "Hibernate loader translation failed", queries, unresolved) {
                 val influencers = LoadQueryInfluencers(factory)
                 val loader = SingleIdEntityLoaderStandardImpl<Any>(p, influencers)
                 val resolve = loader.javaClass.methods.single { it.name == "resolveLoadPlan" }
@@ -386,25 +382,31 @@ class HibernateExtractor {
                 val jdbc = HibernateSqlOperations.loadPlanSelect(plan)
                 capture("${p.entityName}.findById", Operation.SELECT, jdbc.sqlString,
                     HibernateSqlOperations.affectedTableNames(jdbc).map(::qualified), jdbc.parameterBinders)
-            } catch (e: ReflectiveOperationException) {
-                unresolved += UnresolvedQuery("${p.entityName}.findById", "Hibernate loader SPI accessor failed: ${e.javaClass.simpleName}: ${e.message}")
-            } catch (e: RuntimeException) {
-                unresolved += UnresolvedQuery("${p.entityName}.findById", "Hibernate loader translation failed: ${e.javaClass.simpleName}: ${e.message}")
             }
-            val coordinators = listOf(Operation.INSERT to p.insertCoordinator, Operation.UPDATE to p.updateCoordinator, Operation.DELETE to p.deleteCoordinator)
-            for ((operation, coordinator) in coordinators) {
+            for (operation in listOf(Operation.INSERT, Operation.UPDATE, Operation.DELETE)) {
                 if (operation !in operations) continue
-                val group = coordinator?.staticMutationOperationGroup
-                if (group == null || group.numberOfOperations == 0) {
-                    unresolved += UnresolvedQuery("${p.entityName}.$operation", "No exhaustive static Hibernate mutation plan is available")
-                    continue
-                }
-                for (i in 0 until group.numberOfOperations) {
-                    val mutation = group.getOperation(i) as? PreparableMutationOperation
-                    if (mutation == null || mutation.isCallable) {
-                        unresolved += UnresolvedQuery("${p.entityName}.$operation.$i", "Non-preparable or callable mutation is unsupported")
-                    } else capture("${p.entityName}.${operation.name.lowercase()}.$i", operation, mutation.sqlString,
-                        listOf(qualified(mutation.tableDetails.tableName)), mutation.parameterBinders)
+                val plan = QueryExtraction.attempt("${p.entityName}.$operation", "Hibernate mutation plan extraction failed", unresolved) {
+                    val coordinator = when (operation) {
+                        Operation.INSERT -> p.insertCoordinator
+                        Operation.UPDATE -> p.updateCoordinator
+                        Operation.DELETE -> p.deleteCoordinator
+                        else -> error("Unexpected mutation operation $operation")
+                    }
+                    val group = coordinator?.staticMutationOperationGroup
+                    val count = group?.numberOfOperations ?: 0
+                    if (count == 0) unresolved += UnresolvedQuery("${p.entityName}.$operation", "No exhaustive static Hibernate mutation plan is available")
+                    group to count
+                } ?: continue
+                val (group, count) = plan
+                for (i in 0 until count) {
+                    val id = "${p.entityName}.${operation.name.lowercase()}.$i"
+                    QueryExtraction.record(id, "Hibernate mutation SQL extraction failed", queries, unresolved) {
+                        val mutation = group?.getOperation(i) as? PreparableMutationOperation
+                        if (mutation == null || mutation.isCallable) ExtractedSql(limitations = listOf(UnresolvedQuery(id,
+                            "Non-preparable or callable mutation is unsupported")))
+                        else capture(id, operation, mutation.sqlString,
+                            listOf(qualified(mutation.tableDetails.tableName)), mutation.parameterBinders)
+                    }
                 }
             }
         }
@@ -412,7 +414,7 @@ class HibernateExtractor {
         val session = factory.openSession()
         try {
             fun hql(id: String, text: String, source: QuerySource, variant: String? = null) {
-                try {
+                QueryExtraction.record(id, "Hibernate fixed HQL translation failed", queries, unresolved) {
                     val q = session.createQuery(text)
                     // QuerySqmImpl was renamed in 7; bridge the stable runtime accessors without binding to its implementation class.
                     fun property(name: String): Any = q.javaClass.getMethod(name).invoke(q)
@@ -433,22 +435,22 @@ class HibernateExtractor {
                         else -> error("Unsupported Hibernate SQM statement ${sqm.javaClass.name}")
                     }
                     val jdbc = HibernateSqlOperations.translate(factory, ast, options)
-                    val deps = SqlDependencies.inspect(jdbc.sqlString, request.hibernateProperties["hibernate.default_schema"] ?: "public")
-                    val astDependencies = DependencyWalker()
+                    val deps = SqlDependencies.inspect(jdbc.sqlString, request.hibernateProperties["hibernate.default_schema"] ?: "public", sourceId = id)
+                    val astDependencies = SqlAstDependencies()
                     ast.accept(astDependencies)
                     val complete = deps.complete && astDependencies.complete
-                    queries += QueryContract(id, SqlOperationClassifier.operation(jdbc.sqlString), jdbc.sqlString,
+                    val query = QueryContract(id, SqlOperationClassifier.operation(jdbc.sqlString), jdbc.sqlString,
                         tables = deps.tables, columns = deps.columns, writeColumns = deps.writes,
                         parameterTypes = parameterTypes(jdbc.parameterBinders), source = source,
                         dependenciesComplete = complete, variant = variant, targetTable = deps.target)
-                    if (!complete) unresolved += UnresolvedQuery(id, "HQL includes opaque SQL expressions or unresolved table aliases")
+                    val limitations = mutableListOf<UnresolvedQuery>()
+                    if (!complete) limitations += UnresolvedQuery(id, deps.failureReason ?:
+                        astDependencies.limitations.takeIf { it.isNotEmpty() }?.joinToString("; ") ?:
+                        "HQL includes opaque SQL expressions or unresolved table aliases")
                     val metadata = property("getParameterMetadata") as org.hibernate.query.spi.ParameterMetadataImplementor
                     if (metadata.registrations.any { it.allowsMultiValuedBinding() })
-                        unresolved += UnresolvedQuery(id, "Collection-valued HQL parameter cardinalities must be explicitly enumerated")
-                } catch (e: ReflectiveOperationException) {
-                    unresolved += UnresolvedQuery(id, "Hibernate query runtime accessor is unsupported: ${e.javaClass.simpleName}: ${e.message}")
-                } catch (e: RuntimeException) {
-                    unresolved += UnresolvedQuery(id, "Hibernate could not translate this fixed HQL to a supported SQL template: ${e.javaClass.simpleName}: ${e.message}")
+                        limitations += UnresolvedQuery(id, "Collection-valued HQL parameter cardinalities must be explicitly enumerated")
+                    ExtractedSql(query, limitations)
                 }
             }
             val named = factory.queryEngine.namedObjectRepository
@@ -459,21 +461,19 @@ class HibernateExtractor {
                 variants.distinct().sorted().forEachIndexed { i, text -> hql("$id.variant.$i", text, QuerySource.DYNAMIC_VARIANT, i.toString()) }
             }
             fun native(id: String, sql: String, source: QuerySource) {
-                val recognizer = ParameterRecognizerImpl()
-                try {
+                QueryExtraction.record(id, "Native SQL parsing/classification failed", queries, unresolved) {
+                    val recognizer = ParameterRecognizerImpl()
                     ParameterParser.parse(sql, recognizer)
                     recognizer.complete()
                     val adjusted = recognizer.adjustedSqlString
-                    val dependencies = SqlDependencies.inspect(adjusted, request.hibernateProperties["hibernate.default_schema"] ?: "public", nativeSql = true)
-                    queries += QueryContract(id, SqlOperationClassifier.operation(adjusted), adjusted, source = source,
+                    val dependencies = SqlDependencies.inspect(adjusted, request.hibernateProperties["hibernate.default_schema"] ?: "public", nativeSql = true, sourceId = id)
+                    val query = QueryContract(id, SqlOperationClassifier.operation(adjusted), adjusted, source = source,
                         tables = dependencies.tables, columns = dependencies.columns, writeColumns = dependencies.writes,
                         targetTable = dependencies.target,
                         parameterTypes = request.nativeQueryParameterTypes[id] ?: List((recognizer.javaClass.getMethod("getParameterList").invoke(recognizer) as? List<*>)?.size ?: 0) { "OTHER" },
                         dependenciesComplete = dependencies.complete, explicitColumnList = dependencies.explicitColumnList)
-                    if (!dependencies.complete) unresolved += UnresolvedQuery(id,
-                        "Native SQL is retained for PostgreSQL preparation, but wildcard/nested/function/conflict variants or ambiguous alias dependencies are not complete; declare a supported explicit-column template or retain this unresolved access path")
-                } catch (e: Exception) {
-                    unresolved += UnresolvedQuery(id, "Native SQL parsing/classification failed: ${e.message}")
+                    ExtractedSql(query, if (dependencies.complete) emptyList() else listOf(UnresolvedQuery(id,
+                        dependencies.failureReason ?: "Native SQL is retained for PostgreSQL preparation, but wildcard/nested/function/conflict variants or ambiguous alias dependencies are not complete; declare a supported explicit-column template or retain this unresolved access path")))
                 }
             }
             named.visitNativeQueryMementos { native(it.registrationName, it.sqlString, QuerySource.NAMED_NATIVE) }
@@ -515,47 +515,56 @@ class HibernateExtractor {
             if (p.hasWhereRestrictions() || factory.definedFilterNames.isNotEmpty())
                 unresolved += UnresolvedQuery(role, "Collection filters/restrictions require explicit configuration variants")
             val collectionQueries = mutableListOf<QueryContract>()
-            fun capture(suffix: String, operation: Operation, sql: String, binders: List<JdbcParameterBinder>) {
-                val deps = SqlDependencies.inspect(sql, request.hibernateProperties["hibernate.default_schema"] ?: "public")
-                collectionQueries += QueryContract("$role.$suffix", operation, sql, deps.tables, deps.columns, deps.writes,
+            fun capture(suffix: String, operation: Operation, sql: String, binders: List<JdbcParameterBinder>): ExtractedSql {
+                val id = "$role.$suffix"
+                val deps = SqlDependencies.inspect(sql, request.hibernateProperties["hibernate.default_schema"] ?: "public", sourceId = id)
+                val query = QueryContract(id, operation, sql, deps.tables, deps.columns, deps.writes,
                     parameterTypes = parameterTypes(binders), source = QuerySource.HIBERNATE_MAPPING,
                     dependenciesComplete = deps.complete, targetTable = deps.target,
                     mappedEntityIds = if (if (operation == Operation.SELECT) table in deps.tables else deps.target == table)
                         listOf("$role@collection") else emptyList())
-                if (!deps.complete) unresolved += UnresolvedQuery("$role.$suffix", "Collection SQL dependency resolution is incomplete")
+                return ExtractedSql(query, if (deps.complete) emptyList() else listOf(UnresolvedQuery(id,
+                    deps.failureReason ?: "Collection SQL dependency resolution is incomplete")))
             }
-            try {
+            QueryExtraction.record("$role.load", "Hibernate collection loader translation failed", collectionQueries, unresolved) {
                 val loader = org.hibernate.loader.ast.internal.CollectionLoaderSingleKey(p.attributeMapping, LoadQueryInfluencers(factory), factory)
                 val jdbc = HibernateSqlOperations.translate(factory, loader.sqlAst, org.hibernate.query.spi.QueryOptions.NONE)
                 capture("load", Operation.SELECT, jdbc.sqlString, jdbc.parameterBinders)
-                val writable = p.isMutable && (owner == null || operations(request, owner).any { it != Operation.SELECT })
-                if (writable && !p.isInverse) {
+            }
+            val writable = QueryExtraction.attempt("$role.mutations", "Hibernate collection write metadata failed", unresolved) {
+                p.isMutable && !p.isInverse && (owner == null || operations(request, owner).any { it != Operation.SELECT })
+            } == true
+            if (writable) {
+                val rows = QueryExtraction.attempt("$role.mutations", "Hibernate collection mutation SPI failed", unresolved) {
                     // This protected SPI is the source of Hibernate's actual row mutations; no SQL is synthesized.
                     val method = org.hibernate.persister.collection.BasicCollectionPersister::class.java.getDeclaredMethod("getRowMutationOperations")
                     method.isAccessible = true
-                    val rows = method.invoke(p) as org.hibernate.persister.collection.mutation.RowMutationOperations
-                    val mutations = listOf(
-                        Triple("insert", Operation.INSERT, if (rows.hasInsertRow()) rows.insertRowOperation else null),
-                        Triple("update", Operation.UPDATE, if (rows.hasUpdateRow()) rows.updateRowOperation else null),
-                        Triple("delete", Operation.DELETE, if (rows.hasDeleteRow()) rows.deleteRowOperation else null),
-                    )
-                    mutations.forEach { (suffix, operation, mutation) ->
-                        if (mutation != null) {
-                            if (mutation.isCallable) unresolved += UnresolvedQuery("$role.$suffix", "Callable collection mutation is unsupported")
-                            else capture(suffix, operation, mutation.sqlString, mutation.parameterBinders)
+                    method.invoke(p) as org.hibernate.persister.collection.mutation.RowMutationOperations
+                }
+                if (rows != null) for (operation in listOf(Operation.INSERT, Operation.UPDATE, Operation.DELETE)) {
+                    val suffix = operation.name.lowercase()
+                    QueryExtraction.record("$role.$suffix", "Hibernate collection mutation extraction failed", collectionQueries, unresolved) {
+                        val mutation = when (operation) {
+                            Operation.INSERT -> if (rows.hasInsertRow()) rows.insertRowOperation else null
+                            Operation.UPDATE -> if (rows.hasUpdateRow()) rows.updateRowOperation else null
+                            Operation.DELETE -> if (rows.hasDeleteRow()) rows.deleteRowOperation else null
+                            else -> error("Unexpected collection mutation $operation")
+                        }
+                        when {
+                            mutation == null -> null
+                            mutation.isCallable -> ExtractedSql(limitations = listOf(UnresolvedQuery("$role.$suffix", "Callable collection mutation is unsupported")))
+                            else -> capture(suffix, operation, mutation.sqlString, mutation.parameterBinders)
                         }
                     }
-                    if (p.needsRemove()) {
+                }
+                QueryExtraction.record("$role.deleteAll", "Hibernate collection delete-all translation failed", collectionQueries, unresolved) {
+                    if (!p.needsRemove()) null else {
                         val ast = p.generateDeleteAllAst(org.hibernate.sql.model.ast.MutatingTableReference(p.collectionTableMapping))
                         val mutation = factory.jdbcServices.jdbcEnvironment.sqlAstTranslatorFactory.buildModelMutationTranslator(ast, factory)
                             .translate(JdbcParameterBindings.NO_BINDINGS, org.hibernate.query.spi.QueryOptions.NONE)
                         capture("deleteAll", Operation.DELETE, mutation.sqlString, mutation.parameterBinders)
                     }
                 }
-            } catch (failure: ReflectiveOperationException) {
-                unresolved += UnresolvedQuery(role, "Collection mutation SPI could not be accessed: ${BootstrapRecovery.describe(failure)}")
-            } catch (failure: RuntimeException) {
-                unresolved += UnresolvedQuery(role, "Collection SQL translation failed: ${BootstrapRecovery.describe(failure)}")
             }
             queries += collectionQueries
             val observedColumns = collectionQueries.flatMap { it.columns }.filter { it.table == table }.map { it.column }.toSet()
@@ -578,23 +587,6 @@ class HibernateExtractor {
                         BootColumnBounds.Key("$role@collection", table, name) in unbounded)
             }.sortedBy { it.name }, collectionQueries.map { it.operation }.toSet().ifEmpty { setOf(Operation.SELECT) })
         }
-    }
-
-    private class DependencyWalker : AbstractSqlAstWalker() {
-        val tables = linkedMapOf<String, String>()
-        val columns = linkedSetOf<Pair<String, String>>()
-        var complete = true
-        override fun visitNamedTableReference(tableReference: NamedTableReference) {
-            val key = tableReference.identificationVariable ?: tableReference.tableExpression
-            val value = qualified(tableReference.tableExpression)
-            if (tables.put(key, value)?.let { it != value } == true) complete = false
-        }
-        override fun visitColumnReference(columnReference: SqlColumnReference) {
-            if (columnReference.isColumnExpressionFormula) complete = false
-            else columns += (columnReference.qualifier ?: "") to identifier(columnReference.columnExpression)
-        }
-        override fun visitSelfRenderingExpression(expression: SelfRenderingExpression) { complete = false }
-        override fun visitSelfRenderingPredicate(predicate: SelfRenderingPredicate) { complete = false }
     }
 
     companion object {

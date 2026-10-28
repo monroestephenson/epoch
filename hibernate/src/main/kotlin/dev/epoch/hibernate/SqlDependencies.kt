@@ -27,9 +27,9 @@ import net.sf.jsqlparser.util.TablesNamesFinder
 internal object SqlDependencies {
     data class Dependencies(val tables: List<String>, val columns: List<ColumnReference>,
                             val writes: List<ColumnReference>, val target: String?, val complete: Boolean,
-                            val explicitColumnList: Boolean = true)
+                            val explicitColumnList: Boolean = true, val failureReason: String? = null)
 
-    fun inspect(sql: String, defaultSchema: String = "public", nativeSql: Boolean = false): Dependencies {
+    fun inspect(sql: String, defaultSchema: String = "public", nativeSql: Boolean = false, sourceId: String? = null): Dependencies {
         return try {
             val statement = CCJSqlParserUtil.parse(sql)
             val aliases = linkedMapOf<String, String>()
@@ -170,7 +170,10 @@ internal object SqlDependencies {
             val columns = (references.mapNotNull { (alias, column) -> resolve(alias, column) } + writes)
                 .distinct().sortedWith(compareBy({ it.table }, { it.column }))
             Dependencies(tables, columns, writes.distinct().sortedWith(compareBy({ it.table }, { it.column })), target, complete, explicitColumns)
-        } catch (_: Exception) { Dependencies(emptyList(), emptyList(), emptyList(), null, false) }
+        } catch (error: Throwable) {
+            Dependencies(emptyList(), emptyList(), emptyList(), null, false,
+                failureReason = QueryExtraction.failure(sourceId ?: "unattributed SQL", "SQL dependency parsing failed", error))
+        }
     }
 
     fun identifier(value: String): String {

@@ -48,6 +48,9 @@ internal object IsolatedHibernateRuntime {
             findLoadedClass(name)?.let { return@synchronized it }
             val shared = name.startsWith("java.") || name.startsWith("javax.") || name.startsWith("jdk.") || name.startsWith("sun.") ||
                 name.startsWith("kotlin.") || name.startsWith("dev.epoch.core.") || name.startsWith("org.slf4j.") ||
+                // The adapter owns ASM as a complete family. An app may supply only asm-core;
+                // mixing its ClassVisitor with the parent's asm-tree ClassNode breaks every scan.
+                name.startsWith("org.objectweb.asm.") ||
                 name == ExtractionRequest::class.java.name || name == EntityOverride::class.java.name
             val type = if (shared) super.loadClass(name, false) else try { findClass(name) }
                 catch (missing: ClassNotFoundException) {
