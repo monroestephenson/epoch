@@ -5,12 +5,21 @@ import java.net.URI
 
 /** Migration-wide evidence has a file location, never an invented causal SQL line. */
 fun sarifReport(reports: List<Pair<String, CompatibilityReport>>, migrationPrefix: String = ""): Map<String, Any> {
+    data class Entry(val direction: String, val finding: Finding, val changes: List<FindingChange> = emptyList(),
+                     val groupId: String? = null)
     val entries = reports.flatMap { (direction, report) ->
-        (report.baseline?.findings.orEmpty() + report.migrations.flatMap { it.findings })
-            .filter { it.verdict != Verdict.SAFE }.map { direction to it }
-    }.sortedWith(compareBy({ severity(it.second.verdict) }, { it.first }, { it.second.ruleId }, { it.second.objectName }))
-    val rules = entries.map { it.second.ruleId }.distinct().sorted()
-    val results = entries.map { (direction, finding) ->
+        val baselineGroups = FindingGroupIndex(report.baseline?.findings.orEmpty(), report.baseline?.findingGroups)
+        report.baseline?.findings.orEmpty().mapIndexed { index, finding ->
+            Entry(direction, finding, groupId = baselineGroups.forFinding(index)?.id)
+        } + report.migrations.flatMap { step ->
+            val changes = FindingChangeIndex(step)
+            val groups = FindingGroupIndex(step.findings, step.findingGroups)
+            step.findings.mapIndexed { index, finding -> Entry(direction, finding, changes.forFinding(finding), groups.forFinding(index)?.id) }
+        }
+    }.filter { it.finding.verdict != Verdict.SAFE }
+        .sortedWith(compareBy({ severity(it.finding.verdict) }, { it.direction }, { it.finding.ruleId }, { it.finding.objectName }))
+    val rules = entries.map { it.finding.ruleId }.distinct().sorted()
+    val results = entries.map { (direction, finding, changes, groupId) ->
         buildMap<String, Any> {
             put("ruleId", finding.ruleId)
             put("level", if (finding.verdict == Verdict.BREAKING) "error" else "warning")
@@ -18,14 +27,20 @@ fun sarifReport(reports: List<Pair<String, CompatibilityReport>>, migrationPrefi
                 append("[$direction] ${finding.message}\n${finding.evidence}")
                 append("\nNext evidence: ${finding.mitigation ?: unknownEvidence(finding)}")
             }))
-            put("properties", mapOf("verdict" to finding.verdict.name, "object" to finding.objectName,
-                "contractIds" to finding.affectedContractIds, "baseline" to (finding.migration == null),
-                "locationPrecision" to when {
+            put("properties", buildMap<String, Any> {
+                put("verdict", finding.verdict.name)
+                put("object", finding.objectName)
+                put("contractIds", finding.affectedContractIds)
+                put("baseline", finding.migration == null)
+                put("locationPrecision", when {
                     finding.migration?.filename?.endsWith(".sql") == true -> "migration-file"
                     direction == "new-writes-old-reads" -> "contract"
                     finding.migration == null -> "baseline"
                     else -> "schema"
-                }))
+                })
+                if (changes.isNotEmpty()) put("findingChanges", changes)
+                if (groupId != null) put("findingGroupId", groupId)
+            })
             finding.migration?.takeIf { it.filename.endsWith(".sql") }?.let { migration ->
                 val path = listOf(migrationPrefix.trimEnd('/'), migration.filename).filter(String::isNotBlank).joinToString("/")
                 put("locations", listOf(mapOf("physicalLocation" to mapOf(

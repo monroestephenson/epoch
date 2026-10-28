@@ -279,35 +279,47 @@ fun renderReport(report: CompatibilityReport, summaryOnly: Boolean = false, allD
             }
     }
     if (ruleRows.isNotEmpty()) {
-        appendLine("Rule summary (baseline / migrations / accepted baseline):")
+        appendLine("Rule summary (baseline / migration observations / accepted baseline):")
         ruleRows.sortedWith(compareBy({ severity(it.verdict) }, { it.ruleId })).forEach { row ->
             appendLine("  ${row.verdict} ${row.ruleId}: ${row.baselineCount} / ${row.migrationCount} / ${row.acceptedBaselineCount}")
         }
     }
     var remaining = if (summaryOnly) 0 else if (allDetails) Int.MAX_VALUE else 20
     var omitted = 0
-    fun finding(f: Finding) {
-        if (remaining == 0) { omitted++; return }
-        remaining--
+    var omittedGroups = 0
+    fun finding(f: Finding, changes: List<FindingChange> = emptyList()) {
         appendLine("  ${f.verdict} [${f.ruleId}] ${f.objectName}: ${f.message}")
+        appendFindingOrigins(changes, allDetails)
         if (f.affectedContractIds.isNotEmpty()) appendLine(renderAffectedIds(f.affectedContractIds, allDetails))
         appendLine("    Evidence: ${f.evidence}")
         if (f.verdict == Verdict.UNKNOWN) appendLine("    Next evidence: ${f.mitigation ?: unknownEvidence(f)}")
         else f.mitigation?.let { appendLine("    Mitigation: $it") }
+    }
+    fun section(findings: List<Finding>, groups: List<FindingGroup>?, changes: FindingChangeIndex? = null) {
+        val entries = findingDisplayEntries(findings, groups, changes, allDetails)
+        entries.forEach { entry ->
+            if (remaining == 0) { omitted += entry.members.size; if (entry.group != null) omittedGroups++; return@forEach }
+            remaining--
+            val group = entry.group
+            if (group == null) finding(entry.members.single(), entry.changes)
+            else appendFindingGroup(group, entry.members, entry.changes)
+        }
     }
     // Prioritize migration detail so a large baseline cannot bury new findings.
     for (step in report.migrations.sortedBy { severity(it.verdict) }) {
         appendLine()
         appendLine("${step.migration.version} ${step.migration.filename}: ${step.verdict} (${step.findings.size} findings)")
         if (step.catalogChanged == false) appendLine("  No changes in the inspected catalog; data and procedural effects are assessed separately.")
-        step.findings.sortedBy { severity(it.verdict) }.forEach(::finding)
+        appendFindingTransitions(step)
+        section(step.findings, step.findingGroups, FindingChangeIndex(step))
     }
     report.baseline?.takeIf { it.findings.isNotEmpty() }?.let {
         appendLine()
         appendLine("Baseline findings (predate pending migrations):")
-        it.findings.sortedBy { f -> severity(f.verdict) }.forEach(::finding)
+        section(it.findings, it.findingGroups)
     }
-    if (omitted > 0 && !summaryOnly) appendLine("$omitted findings omitted from terminal output; use report --details or inspect JSON.")
+    if (omitted > 0 && !summaryOnly) appendLine("$omitted findings omitted from terminal output" +
+        (if (omittedGroups > 0) " (including $omittedGroups shared-source groups)" else "") + "; use report --details or inspect JSON.")
     appendLine()
     appendLine(if (report.complete) "Result: ${report.verdict}" else "Partial evidence: ${report.verdict} (verification incomplete; exit 3)")
     report.gateVerdict?.let { appendLine("Migration gate with accepted baseline: $it (not a whole-contract safety proof)") }

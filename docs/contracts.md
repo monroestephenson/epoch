@@ -165,9 +165,29 @@ A report also preserves `accessPaths` and provides per-method discovery counts. 
 
 Contracts and reports may also contain `apiInventory` (inventory schema version 1). It records raw known-family invocations and roles, query-capable path links, declaration IDs, separate unresolved method-reference paths, selected packages/classes, failed sources and unresolved owner groups. `completeWithinDeclaredScope` describes inventory extent only; unreadable code, failed data flow or unresolved ancestry cannot be counted as zero calls or complete coverage. Legacy contracts without this field retain discovered-method reporting. See [the inventory guide](repository-api-inventory.md) for denominators and the call-site ID migration.
 
-Each migration contains its version/filename, delta verdict, and findings. Each finding has `ruleId`, `objectName`, `message`, `evidence`, `affectedContractIds`, optional migration attribution, and optional mitigation. `ruleSummary` groups counts by rule and verdict: `baselineCount`, `migrationCount`, and `acceptedBaselineCount`.
+Each migration contains its version/filename, baseline-relative verdict, and findings. Each finding has `ruleId`, `objectName`, `message`, `evidence`, `affectedContractIds`, optional migration attribution, and optional mitigation. `ruleSummary` groups raw counts by rule and verdict: `baselineCount`, `migrationCount`, and `acceptedBaselineCount`. `migrationCount` counts observations across checked steps: an unchanged continuing failure contributes at each step where it is reported.
 
 Optional `migrations[].catalogChanged` records the immediately preceding and resulting inspected catalogs: true or false when observed, null when unavailable. False prints an explicit no-catalog-change message. It does not prove that no data changed, waive procedural uncertainty, or change baseline-relative finding attribution. Contract and report `schemaVersion` remains 1; the new fields have conservative defaults.
+
+Optional transition and display-group fields also retain report `schemaVersion: 1`:
+
+| Field | Meaning |
+| --- | --- |
+| `migrations[].findingChanges` | Null/absent for reports without episode evidence; an empty list means annotation found no active or ending episode. |
+| `findingChanges[].ruleId`, `.objectName`, `.verdict` | The rule/object/verdict identity being followed. SAFE explanations do not create episodes. |
+| `findingChanges[].affectedContractIds` | Caller identities sharing this transition/origin. An empty list represents an unscoped finding; it does not mean every contract entry. |
+| `findingChanges[].kind` | `NEW`, `PERSISTING`, or `RESOLVED`. RESOLVED means no longer reported in this checked state, not proof of safety. |
+| `findingChanges[].firstObserved` | `{version, filename}` of the first checked state in the continuous episode, including for a later RESOLVED transition. This is separate from each finding's current migration evidence. |
+| `baseline.findingGroups`, `migrations[].findingGroups` | Optional presentation indexes within that section. Raw `findings` remain complete and authoritative. |
+| `findingGroups[].id`, `.ruleId`, `.verdict` | Stable shared-source identity and the one rule/verdict represented by its members. This ID is not an accepted-baseline finding fingerprint. |
+| `findingGroups[].kind` | `SHARED_CATALOG_DEPENDENCY`, `IDENTICAL_SQL_TEMPLATE`, or `INVENTORY`. |
+| `findingGroups[].sourceIds` | Exact source identities shared by the group; SQL-template identity includes typed/variant/dependency/decoder facts. |
+| `findingGroups[].findingIndices` | Zero-based indexes into the same section's original `findings` array. Object names, caller IDs and each member's full evidence are retained there. |
+
+Episodes track `(verdict, ruleId, objectName, affectedContractId)` across successive checked states. A newly affected caller or recurrence after an absent state starts a new episode. Baseline identities are removed per caller before annotation, preserving new caller debt when a grouped cause grows. Invalid-baseline object exclusions remain unchanged. Groups are limited to three behavior/rename rules and never span sections, migrations, directions, rules or verdicts. Malformed/conflicting display indexes fall back to raw rows; legacy metadata absence does not invent history. See [report interpretation](reporting.md) for exact grouping scope and count denominators.
+
+The optional fields do not alter baseline acceptance fingerprints, compatibility gates or current evidence attribution. JSON remains lossless rather than compact: every raw finding is still serialized, even when terminal output presents one shared-source group.
+
 
 For catalog API users, `SchemaSnapshot.behaviorGraph` records versioned, stable object dependencies and relation/operation attachments, with separate dependency, semantic and planning facts. Missing or incomplete graphs cannot establish the new scoped behavior proofs; legacy nonempty behavior inventories retain conservative handling. `TableSchema.indexValidity` and `indexReadiness` retain PostgreSQL's actual index flags. These are inspected snapshot/cache facts, not descriptor switches for overriding coverage; see [behavior scopes](verification.md#operation-specific-database-behavior).
 

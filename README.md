@@ -68,7 +68,7 @@ Read [the descriptor and contract format](docs/contracts.md), [verification boun
 
 ## Baseline health, scale, and multiple persistence units
 
-Reports separate preexisting baseline health from findings introduced by migrations. Default terminal output includes per-rule counts and limits individual details; use `report --summary` or `report --details` to choose the level of detail. Existing baseline findings have no pending-migration attribution.
+Reports separate preexisting baseline health from findings introduced by migrations. Each checked step can identify NEW, PERSISTING and no-longer-reported finding episodes; first-observed state is separate from current migration evidence. Default terminal output collapses established shared sources for three behavior/rename rules, while per-rule counts and full JSON retain raw observations. Use `report --summary` or `report --details` to choose the level of detail. Existing baseline findings have no pending-migration attribution. See [reading reports](docs/reporting.md) for origins, grouping limits and count denominators.
 
 Generate per-unit extraction inputs with `db-compat descriptors --quarkus-properties application.properties --classpath build/classes/kotlin/main --output-directory generated-descriptors`, or use `--persistence-xml`. Supply the complete runtime classpath using repeated `--classpath`; [the configuration guide](docs/persistence-unit-descriptors.md) documents profiles, supported settings and unresolved configuration.
 

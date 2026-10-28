@@ -299,7 +299,7 @@ class DataContractCompatibility {
         val verdict = CompatibilityEngine.aggregate(ordered.map { it.verdict })
         return CompatibilityReport(applicationVersion = "${old.applicationVersion} <- ${new.applicationVersion}",
             scope = VerificationScope.STRUCTURAL_CONTRACT, verdict = verdict,
-            migrations = listOf(MigrationReport(assessment, verdict, ordered)), limitations = listOf(
+            migrations = FindingEpisodes.annotate(listOf(MigrationReport(assessment, verdict, ordered))), limitations = listOf(
                 "New-writes-old-reads compares supported direct mapped data domains on the final deployment schema, separately from schema compatibility.",
                 "A catalog row-domain witness is not execution against current row contents; uniqueness occupancy, application validation, arbitrary converters, and general behavioral equivalence are outside this proof.",
                 "Only actual decoded reader and generated producer provenance is accepted. Unsupported or incomplete relevant paths remain UNKNOWN.",

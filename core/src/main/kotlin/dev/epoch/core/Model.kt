@@ -227,6 +227,19 @@ data class Finding(
     val mitigation: String? = null,
 )
 
+enum class FindingChangeKind { NEW, PERSISTING, RESOLVED }
+
+/** RESOLVED means no longer reported at this checked state, not a separate proof of safety. */
+data class FindingChange(
+    val ruleId: String,
+    val objectName: String,
+    val verdict: Verdict,
+    val affectedContractIds: List<String>,
+    val kind: FindingChangeKind,
+    /** First checked state in this contiguous episode, not an inferred causal SQL statement. */
+    val firstObserved: MigrationInfo,
+)
+
 data class MigrationReport(
     val migration: MigrationInfo,
     val verdict: Verdict,
@@ -239,6 +252,10 @@ data class MigrationReport(
     val operational: OperationalAssessment? = null,
     /** Immediate before/after catalog observation; null means no comparison was recorded. */
     val catalogChanged: Boolean? = null,
+    /** null for legacy reports; empty when annotation ran without any active or ending episode. */
+    val findingChanges: List<FindingChange>? = null,
+    /** Optional display groups; raw findings and their evidence remain authoritative. */
+    val findingGroups: List<FindingGroup>? = null,
 )
 
 data class CompatibilityReport(
@@ -280,6 +297,8 @@ data class BaselineReport(
     val plannedQueries: Int? = null,
     val reusedQueries: Int? = null,
     val planningParallelism: Int? = null,
+    /** Presentation indexes only; never part of accepted-baseline finding fingerprints. */
+    val findingGroups: List<FindingGroup>? = null,
 )
 
 data class AcceptedBaseline(

@@ -762,7 +762,8 @@ class CompatibilityEngine {
             finding(Verdict.SAFE, "STRUCTURAL_CONTRACT_PRESERVED", "contract", "The supported structural dependencies are preserved.", "All declared baseline tables and columns remain compatible under the supported catalog rules.")
         }
         val stable = findings.map { if (it.verdict == Verdict.UNKNOWN && it.mitigation == null) it.copy(mitigation = unknownMitigation(it.ruleId)) else it }.distinct().sortedWith(compareBy({ severity(it.verdict) }, { it.ruleId }, { it.objectName }, { it.affectedContractIds.joinToString() }, { it.evidence }))
-        return MigrationReport(migration, aggregate(stable.map { it.verdict }), stable)
+        return MigrationReport(migration, aggregate(stable.map { it.verdict }), stable,
+            findingGroups = FindingGrouping(contract, baseline, rawAfter).group(stable))
     }
 
     /** Baseline evidence is independent of any pending migration and is emitted only once. */
@@ -785,6 +786,7 @@ class CompatibilityEngine {
             verdict = aggregate(findings.map { it.verdict } + Verdict.SAFE),
             findings = findings,
             fingerprint = BaselineFingerprints.baseline(contract, snapshot, findings, fingerprintContext),
+            findingGroups = FindingGrouping(normalizeIdentifiers(contract), snapshot, snapshot).group(findings),
         )
     }
 
@@ -794,17 +796,7 @@ class CompatibilityEngine {
         baseline: BaselineReport? = null,
         acceptedBaseline: AcceptedBaseline? = null,
     ): CompatibilityReport {
-        val baselineIdentities = baseline?.findings.orEmpty().map(BaselineFingerprints::identity).toSet()
-        val invalidBaselineObjects = baseline?.findings.orEmpty()
-            .filter { it.ruleId.startsWith("INVALID_BASELINE_") }.map { it.ruleId to it.objectName }.toSet()
-        val deltas = if (baseline == null) steps else steps.map { step ->
-            val findings = step.findings.filter {
-                BaselineFingerprints.identity(it) !in baselineIdentities &&
-                    (it.ruleId to it.objectName) !in invalidBaselineObjects &&
-                    !(step.catalogChanged == false && it.verdict == Verdict.SAFE)
-            }
-            step.copy(verdict = aggregate(findings.map { it.verdict } + Verdict.SAFE), findings = findings)
-        }
+        val deltas = FindingEpisodes.annotate(if (baseline == null) steps else FindingEpisodes.subtractBaseline(steps, baseline))
         val verdicts = deltas.map { it.verdict } + listOfNotNull(baseline?.verdict)
         val limitations = buildList {
             add("SAFE is limited to the declared structural contract; it does not prove application behavior or operational migration safety.")
