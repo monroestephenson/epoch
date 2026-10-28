@@ -94,6 +94,19 @@ Nullability has distinct sources:
 
 For example, Kotlin `var x: String` can have `declaredNonNull=true` and `hibernateNullable=true`, while `var y: String?` can have `declaredNonNull=false` even if `@Column(nullable=false)` makes `hibernateNullable=false`. Unannotated Java references, ambiguous metadata, and unresolved generic types do not imply nullable inputs. Declared facts attach to supported basic attributes and basic identifiers; the nullability of an association, component, or collection object does not establish each underlying JDBC column's nullability. A declared member fact also does not prove an arbitrary converter's SQL output. Missing nullability evidence does not by itself invalidate complete SQL extraction.
 
+Enum and converter metadata retain the distinction between source declarations and database encodings:
+
+| Column field | Evidence |
+| --- | --- |
+| `enumMode` | `STRING` or `ORDINAL` for the recognized effective Hibernate mapping. An explicit JDBC-type override can differ from the source `@Enumerated` annotation; unknown/custom semantics remain `null`. |
+| `enumConstants` | The complete Java/Kotlin constant names in declaration order. |
+| `enumRelationalValues` | Database values aligned with `enumConstants`, when the encoding is supported. The existing `enumValues` remains a sorted relational value set. |
+| `enumEncoding` | `NAME`, `ORDINAL`, or `EXPLICIT`; explicit Hibernate 7 `@EnumeratedValue` codes are distinguished from ordinary names/ordinals. |
+| `converterClass` | The actual JPA AttributeConverter class supplied by Hibernate, including auto-applied converters. |
+| `converterBytecodeSha256` | Lowercase SHA-256 of the converter class bytes from its defining artifact, or `null` when unavailable. Multi-release JARs use the runtime-selected entry. |
+
+Epoch does not invoke arbitrary application converters to manufacture a finite input proof. Unsupported conversion retains known declaration/artifact facts without guessing an enum encoding. A converter fingerprint describes one class artifact, not its inherited/helper code, configuration, or semantic behavior. Matching hashes do not prove behavioral equivalence; a changed hash alone does not prove incompatibility. Explicit enum codes can also remain stable when declaration order changes, so ordinal mode alone is insufficient to infer a data-format change.
+
 Query entries record:
 
 - `id`, `operation`, and `sql` with JDBC `?` placeholders rather than captured parameter values.

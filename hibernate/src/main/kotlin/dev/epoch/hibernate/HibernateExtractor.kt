@@ -286,7 +286,9 @@ class HibernateExtractor {
                 entities += EntityContract(
                     id = if (selectables.keys.map { it.first }.distinct().size == 1) p.entityName else "${p.entityName}@$table",
                     table = table,
-                    columns = entries.map { (key, s) -> ColumnContract(
+                    columns = entries.map { (key, s) ->
+                        val valueMetadata = MappingValueMetadata.inspect(s.jdbcMapping)
+                        ColumnContract(
                         name = key.second,
                         typeName = jdbcName(s.jdbcMapping),
                         nullable = s.isNullable && key !in primitiveColumns,
@@ -294,11 +296,17 @@ class HibernateExtractor {
                         updatable = s.isUpdateable && key.second !in p.identifierColumnNames.map(::identifier),
                         generated = p.generator is org.hibernate.id.IdentityGenerator && table == qualified(p.identifierTableMapping.tableName) && key.second in p.identifierColumnNames.map(::identifier),
                         length = s.length, precision = s.precision, scale = s.scale,
-                        enumValues = enumValues(s.jdbcMapping),
+                        enumValues = valueMetadata.enumValues,
                         logicalJavaType = logicalType(s.jdbcMapping).name,
                         inputDomainComplete = inputDomainComplete(s.jdbcMapping),
                         declaredNonNull = declaredNullability[key]?.singleOrNull(),
                         hibernateNullable = s.isNullable,
+                        enumMode = valueMetadata.enumMode,
+                        enumConstants = valueMetadata.enumConstants,
+                        enumRelationalValues = valueMetadata.enumRelationalValues,
+                        enumEncoding = valueMetadata.enumEncoding,
+                        converterClass = valueMetadata.converterClass,
+                        converterBytecodeSha256 = valueMetadata.converterBytecodeSha256,
                     ) }.sortedBy { it.name },
                     operations = operations,
                     generatedIdentifier = generatedId,
@@ -505,10 +513,14 @@ class HibernateExtractor {
             if (observedColumns.any { it !in selectables }) unresolved += UnresolvedQuery(role,
                 "Collection SQL includes columns without complete selectable metadata: ${(observedColumns - selectables.keys).sorted()}")
             entities += EntityContract("$role@collection", table, selectables.map { (name, s) ->
+                val valueMetadata = MappingValueMetadata.inspect(s.jdbcMapping)
                 ColumnContract(name, jdbcName(s.jdbcMapping), s.isNullable, s.isInsertable, s.isUpdateable,
-                    length = s.length, precision = s.precision, scale = s.scale, enumValues = enumValues(s.jdbcMapping),
+                    length = s.length, precision = s.precision, scale = s.scale, enumValues = valueMetadata.enumValues,
                     logicalJavaType = logicalType(s.jdbcMapping).name, inputDomainComplete = inputDomainComplete(s.jdbcMapping),
-                    hibernateNullable = s.isNullable)
+                    hibernateNullable = s.isNullable, enumMode = valueMetadata.enumMode,
+                    enumConstants = valueMetadata.enumConstants, enumRelationalValues = valueMetadata.enumRelationalValues,
+                    enumEncoding = valueMetadata.enumEncoding, converterClass = valueMetadata.converterClass,
+                    converterBytecodeSha256 = valueMetadata.converterBytecodeSha256)
             }.sortedBy { it.name }, collectionQueries.map { it.operation }.toSet().ifEmpty { setOf(Operation.SELECT) })
         }
     }
@@ -569,18 +581,6 @@ class HibernateExtractor {
                 "java.util.UUID", "java.time.LocalDate", "java.time.LocalDateTime", "java.time.OffsetDateTime",
                 "java.time.LocalTime", "java.time.OffsetTime", "java.time.Instant", "java.util.Date",
                 "java.sql.Date", "java.sql.Timestamp", "java.sql.Time", "[B")
-        }
-        private fun enumValues(mapping: org.hibernate.metamodel.mapping.JdbcMapping): List<String> {
-            val javaType = logicalType(mapping)
-            if (!javaType.isEnum) return emptyList()
-            val converter = mapping.valueConverter
-            // Hibernate's enum JavaType supplies a factual finite Java domain. Convert with Hibernate's own converter.
-            return javaType.enumConstants.map { value ->
-                if (converter != null) {
-                    @Suppress("UNCHECKED_CAST")
-                    (converter as org.hibernate.type.descriptor.converter.spi.BasicValueConverter<Any, Any>).toRelationalValue(value).toString()
-                } else if (mapping.jdbcType.isInteger) (value as Enum<*>).ordinal.toString() else (value as Enum<*>).name
-            }.sorted()
         }
         private fun parameterTypes(binders: List<JdbcParameterBinder>): List<String> = binders.map {
             val parameter = it as? JdbcParameter

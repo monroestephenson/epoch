@@ -20,6 +20,8 @@ enum class Verdict { SAFE, BREAKING, UNKNOWN }
 enum class Operation { SELECT, INSERT, UPDATE, DELETE }
 enum class QuerySource { HIBERNATE_MAPPING, NAMED_HQL, NAMED_NATIVE, STATIC, RUNTIME_OBSERVED, DYNAMIC_VARIANT }
 enum class VerificationStatus { EXTRACTED, OBSERVED, UNSUPPORTED }
+enum class EnumMode { STRING, ORDINAL }
+enum class EnumEncoding { NAME, ORDINAL, EXPLICIT }
 
 data class Coverage(
     val complete: Boolean = false,
@@ -58,6 +60,16 @@ data class ColumnContract(
     val declaredNonNull: Boolean? = null,
     /** Raw Hibernate selectable nullability, independent of Kotlin/Java declaration facts. */
     val hibernateNullable: Boolean? = null,
+    /** Supported Hibernate enum mapping mode; null for unknown/custom conversion semantics. */
+    val enumMode: EnumMode? = null,
+    /** Java/Kotlin declaration order, not a sorted set. */
+    val enumConstants: List<String> = emptyList(),
+    /** Database values aligned with enumConstants; empty when conversion is unsupported. */
+    val enumRelationalValues: List<String> = emptyList(),
+    val enumEncoding: EnumEncoding? = null,
+    val converterClass: String? = null,
+    /** SHA-256 of the converter's defining class artifact; not a semantic equivalence proof. */
+    val converterBytecodeSha256: String? = null,
 )
 
 data class ColumnReference(val table: String, val column: String)
