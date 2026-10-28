@@ -36,8 +36,8 @@ class DeclaredNullabilityTest {
             assertFact(fields.getValue("schema_required"), "hibernateNullable", false)
             assertFact(fields.getValue("id"), "declaredNonNull", true)
             assertFact(fields.getValue("inherited_required"), "declaredNonNull", true)
-            assertTrue(fields.getValue("parent_id").path("declaredNonNull").isNull,
-                "Association nullability is not a declaration for each foreign-key leaf: $fields")
+            assertFact(fields.getValue("parent_id"), "declaredNonNull", true)
+            assertFact(fields.getValue("parent_id"), "inputDomainComplete", false)
 
             val properties = entities.single { it.path("table").asText() == "public.kotlin_property_nullability" }.path("columns")
                 .associateBy { it.path("name").asText() }

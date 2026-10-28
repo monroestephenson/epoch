@@ -305,11 +305,16 @@ class HibernateExtractor {
             }
             val primitiveColumns = mutableSetOf<Pair<String, String>>()
             val generatedColumns = mutableSetOf<Pair<String, String>>()
+            val associationInputColumns = mutableSetOf<Pair<String, String>>()
             val declaredNullability = mutableMapOf<Pair<String, String>, MutableSet<Boolean?>>()
             fun recordDeclaration(attribute: AttributeMapping) {
-                // A component/container/association declaration does not describe every JDBC leaf.
+                // A component/container declaration does not describe every JDBC leaf. A direct
+                // owning ManyToOne to one standard primary identifier can preserve the reference
+                // declaration, separately from the lifecycle-dependent JDBC input domain.
                 val value = if (attribute is BasicValuedModelPart)
                     DeclaredNullability.of(attribute.propertyAccess?.getter?.member) else null
+                val association = dataMetadata<AssociationNullability.Fact?>("${p.entityName}.${attribute.attributeName}",
+                    "Association declaration metadata unavailable", null) { AssociationNullability.inspect(attribute) }
                 // Hibernate's state-array position links this property (including component leaves)
                 // to its actual generator. An audit timestamp must not hide unrelated input domains.
                 val generated = p.entityMetamodel.generators?.getOrNull(attribute.stateArrayPosition)?.let { generator ->
@@ -319,7 +324,11 @@ class HibernateExtractor {
                 attribute.forEachSelectable { _, selectable ->
                     if (!selectable.isFormula) {
                         val key = qualified(p.physicalTableNameForMutation(selectable)) to identifier(selectable.selectionExpression)
-                        declaredNullability.getOrPut(key) { linkedSetOf() } += value
+                        declaredNullability.getOrPut(key) { linkedSetOf() } +=
+                            (association?.takeIf { it.appliesTo(selectable) }?.declaredNonNull ?: value)
+                        if (attribute is org.hibernate.metamodel.mapping.EntityAssociationMapping &&
+                            (Operation.INSERT in operations && selectable.isInsertable ||
+                                Operation.UPDATE in operations && selectable.isUpdateable)) associationInputColumns += key
                         if (generated) generatedColumns += key
                     }
                 }
@@ -362,6 +371,10 @@ class HibernateExtractor {
                         val updatable = s.isUpdateable && key.second !in p.identifierColumnNames.map(::identifier)
                         val custom = customMutations[table]
                         val directInput = inputDomainComplete(s.jdbcMapping, valueMetadata) &&
+                            // A non-null entity reference may undergo transient/deleted-reference
+                            // nullification or deferred key assignment. Its source declaration alone
+                            // cannot prove every SQL binding used by Hibernate's lifecycle.
+                            key !in associationInputColumns &&
                             // Mapping nullability is a declaration; disabled runtime checks cannot prove NULL exclusion.
                             (factory.sessionFactoryOptions.isCheckNullability || s.isNullable ||
                                 declaredNullability[key]?.singleOrNull() == true || key in primitiveColumns) &&
