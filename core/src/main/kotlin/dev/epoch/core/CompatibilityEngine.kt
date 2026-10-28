@@ -236,12 +236,17 @@ class CompatibilityEngine {
             table.relationSecurity?.let { security ->
                 !security.userTriggers && !security.userRules && !security.rowSecurity && !security.inheritance
             } == true
-        fun omittedValueIsNull(tableName: String, table: TableSchema, columnName: String): Boolean {
+        // The value assigned to this omitted column is a local catalog fact. An opaque
+        // CHECK/index or another column's default is not a row transformation. Their
+        // rejection/behavior proofs remain separate from this assignment proof.
+        fun catalogOmittedValueIsNull(table: TableSchema, columnName: String): Boolean {
             val column = table.columns[columnName] ?: return false
-            return writeEffectsKnown(tableName) && ordinaryWriteSemantics(table) && column.nullable &&
+            return ordinaryWriteSemantics(table) && column.nullable &&
                 column.typeAcceptsImplicitNull == true && column.defaultExpression == null &&
                 column.identity.isNullOrEmpty() && column.generated.isNullOrEmpty()
         }
+        fun omittedValueIsNull(tableName: String, table: TableSchema, columnName: String) =
+            writeEffectsKnown(tableName) && catalogOmittedValueIsNull(table, columnName)
         fun referencesConflict(table: String) = contract.queries.filter {
             queryTarget(it) == table && Regex("\\bON\\s+CONFLICT\\b", RegexOption.IGNORE_CASE).containsMatchIn(it.sql)
         }.map { it.id }
@@ -444,13 +449,13 @@ class CompatibilityEngine {
                     }
                     if (b.nullable && b.defaultExpression == null && b.identity.isNullOrEmpty() && b.generated.isNullOrEmpty() && shapeQueries.isEmpty() && columnReferences.isEmpty()) {
                         val omissions = omittingInserts(tableName, columnName).filter { it in validBaselineIds }
-                        if (omissions.isNotEmpty() && (!ordinaryWriteSemantics(old) || !omittedValueIsNull(tableName, new, columnName))) {
+                        if (omissions.isNotEmpty() && (!ordinaryWriteSemantics(old) || !catalogOmittedValueIsNull(new, columnName))) {
                             unknown("OMITTED_COLUMN_VALUE_UNPROVEN", objectName,
                                 "The value of a new column omitted by old INSERTs is not established as an accepted NULL.",
                                 "type=${b.type}; typeAcceptsImplicitNull=${b.typeAcceptsImplicitNull}; baseline relation=${old.relationSecurity}; target relation=${new.relationSecurity}. Type-level defaults, domain constraints, or opaque writes require separate proof.", omissions)
                         } else {
                             finding(Verdict.SAFE, "NULLABLE_COLUMN_ADDED", objectName, "Nullable column addition preserves explicit-column operations.",
-                                "New column is outside old dependencies; any omitted INSERT value is a catalog-proven NULL with no default, generation, or opaque write behavior.", tableReferences)
+                                "New column is outside old dependencies; any omitted INSERT value is a catalog-proven NULL with no column/type default, generation, trigger, rule, row-level security, or inheritance. Other expression and constraint proofs remain separate.", tableReferences)
                         }
                     }
                     continue
@@ -615,9 +620,11 @@ class CompatibilityEngine {
             }
         }
         val preservedForeignKeyRoots = ForeignKeyBehaviorProofs.preservedRoots(baseline, after, rawAfter, provenViews)
+        val renamedBehaviorRoots = BehaviorAttachmentIdentity.renamedRoots(baseline, after, rawAfter, provenViews)
+        val preservedBehaviorRoots = renamedBehaviorRoots.keys + renamedBehaviorRoots.values
         val reachedBehaviorIds = (baselineScopes.reached.keys + targetScopes.reached.keys).toSortedSet()
         for (name in reachedBehaviorIds) {
-            if (name in preservedForeignKeyRoots || name.startsWith("view:") && name.removePrefix("view:") in provenViews) continue
+            if (name in preservedForeignKeyRoots || name in preservedBehaviorRoots || name.startsWith("view:") && name.removePrefix("view:") in provenViews) continue
             val oldNode = baseline.behaviorGraph?.nodes?.get(name)
             val newNode = rawAfter.behaviorGraph?.nodes?.get(name)
             val a = oldNode?.definition ?: baseline.behaviors[name]
@@ -631,19 +638,31 @@ class CompatibilityEngine {
                 "Reached database-side behavior changed outside the supported equivalence model.", "Baseline=$a; target=$b.", ids)
         }
         if (behaviorChanges.hasChanges) {
+            val normalizedChanges = if (provenViews.isEmpty()) behaviorChanges else BehaviorChanges(baseline, after)
+            val oldRelationNames = provenViews.entries.associate { it.value to it.key }
             val causes = linkedMapOf<BehaviorUncertainty, MutableSet<String>>()
             for ((scopeSet, snapshot) in listOf(baselineScopes to baseline, targetScopes to rawAfter)) {
                 scopeSet.entries.forEach { entry -> entry.scope.uncertainties.forEach { cause ->
-                    val node = snapshot.behaviorGraph?.nodes?.get(cause.nodeId)
-                    if (node?.dependenciesComplete != true || cause.nodeId in behaviorChanges.changedNodeIds ||
-                        behaviorChanges.intersects(entry.scope.references)) {
-                        causes.getOrPut(cause) { sortedSetOf() } += entry.id
+                    val boundedSyntax = cause.nodeId in entry.scope.boundedQueryUncertaintyIds
+                    val syntaxAffected = boundedSyntax && (behaviorChanges.intersects(entry.scope.queryDependencyReferences) ||
+                        entry.scope.semanticNodeIds.any { it in behaviorChanges.changedNodeIds })
+                    val boundary = scopeSet.resolver.dependencyBoundary(cause.nodeId)
+                    val relevant = if (boundedSyntax) syntaxAffected else if (boundary == null) true else
+                        !boundary.complete || boundary.nodeIds.any {
+                            it !in preservedBehaviorRoots && it !in preservedForeignKeyRoots && it in behaviorChanges.changedNodeIds
+                        } || normalizedChanges.intersects(boundary.references.mapTo(linkedSetOf()) {
+                            it.copy(name = oldRelationNames[it.name] ?: it.name)
+                        })
+                    if (relevant) {
+                        // Normalize only proven attachment identity. Opaque function/name lookup
+                        // still emits uncertainty; old/new attachment labels do not duplicate it.
+                        val original = renamedBehaviorRoots[cause.nodeId]
+                        val normalizedCause = if (original == null) cause else cause.copy(nodeId = original)
+                        causes.getOrPut(normalizedCause) { sortedSetOf() } += entry.id
                     }
                 } }
             }
             val indirect = linkedMapOf<Pair<String, BehaviorAccess>, MutableSet<String>>()
-            val normalizedChanges = if (provenViews.isEmpty()) behaviorChanges else BehaviorChanges(baseline, after)
-            val oldRelationNames = provenViews.entries.associate { it.value to it.key }
             for ((scopes, snapshot) in listOf(baselineScopes to baseline, targetScopes to rawAfter)) {
                 val preservedReferenceRoots = snapshot.behaviorGraph?.nodes.orEmpty().filterKeys { it in preservedForeignKeyRoots }
                     .flatMap { (id, node) -> node.references.map { it to id } }.groupBy({ it.first }, { it.second })

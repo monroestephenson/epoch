@@ -50,6 +50,9 @@ data class QueryBehaviorFacts(
     val defaultAssignmentsComplete: Boolean = false,
     val unresolvedReasons: List<String> = emptyList(),
     val builtinFunctionCalls: Set<String> = emptySet(),
+    /** Independently proven absence of hidden relation access, even when semantic syntax
+     * support is incomplete. Legacy/missing facts never establish this boundary. */
+    val dependencyCoverageComplete: Boolean = false,
 )
 
 data class BehaviorUncertainty(val nodeId: String, val reason: String)
@@ -64,4 +67,14 @@ data class OperationBehaviorScope(
     val planningUncertainties: List<BehaviorUncertainty> = emptyList(),
     val planningMayEvaluate: Boolean = false,
     val writeTransformations: Set<String> = emptySet(),
+    /** Only synthetic query-syntax causes may use this positively bounded dependency set. */
+    val boundedQueryUncertaintyIds: Set<String> = emptySet(),
+    val queryDependencyReferences: Set<BehaviorReference> = emptySet(),
+)
+
+/** Exact dependency closure for one cause; separate from all roots reached by its caller. */
+data class BehaviorDependencyBoundary(
+    val complete: Boolean,
+    val nodeIds: Set<String>,
+    val references: Set<BehaviorReference>,
 )

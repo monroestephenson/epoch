@@ -19,13 +19,14 @@ class BehaviorQuerySyntax {
     private data class Key(
         val sql: String, val operation: Operation, val target: String?, val tables: Set<String>,
         val writes: Set<ColumnReference>, val parameters: List<String>, val results: List<String>,
+        val dependenciesComplete: Boolean,
     )
     private val cache = ConcurrentHashMap<Key, QueryBehaviorFacts>()
 
     fun inspect(query: QueryContract): QueryBehaviorFacts {
         val key = Key(query.sql, query.operation, query.targetTable,
             (query.tables + listOfNotNull(query.targetTable) + (query.columns + query.writeColumns).map { it.table }).toSet(),
-            query.writeColumns.toSet(), query.parameterTypes.toList(), query.resultColumns.mapNotNull { it.typeName })
+            query.writeColumns.toSet(), query.parameterTypes.toList(), query.resultColumns.mapNotNull { it.typeName }, query.dependenciesComplete)
         return cache.computeIfAbsent(key) { parse(it) }
     }
 
@@ -50,6 +51,8 @@ class BehaviorQuerySyntax {
 
     private class Collector(private val key: Key) {
         private val reasons = sortedSetOf<String>()
+        private var dependencyGap = false
+        private var cteNames = emptySet<String>()
         private val references = linkedSetOf<BehaviorReference>()
         private val defaults = linkedSetOf<ColumnReference>()
         private val functions = sortedSetOf<String>()
@@ -58,7 +61,8 @@ class BehaviorQuerySyntax {
         private var depth = 0
         private var visited = 0
 
-        fun problem(reason: String) { reasons += reason }
+        fun problem(reason: String) { reasons += reason; dependencyGap = true }
+        private fun semanticProblem(reason: String) { reasons += reason }
 
         fun finish(): QueryBehaviorFacts {
             val declared = key.tables.map(::canonicalQualified).toSet()
@@ -71,6 +75,7 @@ class BehaviorQuerySyntax {
                 defaultColumns = defaults.sortedWith(compareBy({ it.table }, { it.column })).toCollection(linkedSetOf()),
                 defaultAssignmentsComplete = assignmentsComplete,
                 unresolvedReasons = reasons.toList(), builtinFunctionCalls = functions.toSet(),
+                dependencyCoverageComplete = key.dependenciesComplete && !dependencyGap,
             )
         }
 
@@ -103,12 +108,32 @@ class BehaviorQuerySyntax {
             }
         }
 
-        private fun withItems(items: List<WithItem<*>>?) {
-            if (!items.isNullOrEmpty()) problem("CTE and potentially writable nested statement effects are not exhaustively enumerated.")
+        private fun withItems(items: List<WithItem<*>>?, readonly: Boolean = false) {
+            if (items.isNullOrEmpty()) return
+            if (!readonly || items.any { it.isRecursive }) {
+                problem("CTE and potentially writable nested statement effects are not exhaustively enumerated.")
+                return
+            }
+            semanticProblem("CTE semantics remain outside the supported verification model.")
+            val declaredHere = mutableSetOf<String>()
+            for (item in items) {
+                val name = item.alias?.name?.let(::identifier)
+                if (name == null || !declaredHere.add(name)) {
+                    problem("CTE relation scope has an absent or duplicate declaration.")
+                    continue
+                }
+                val body = item.parenthesedStatement as? ParenthesedSelect
+                if (body == null) problem("Writable CTE effects are not exhaustively enumerated.")
+                else select(body)
+                // Nonrecursive body can see preceding CTEs but not its own declaration.
+                cteNames = cteNames + name
+            }
         }
 
         private fun table(table: Table?): String? {
             if (table == null) return null
+            if (table.schemaName.isNullOrBlank() && table.databaseName.isNullOrBlank() &&
+                identifier(table.name) in cteNames) return null
             val name = qualified(table.fullyQualifiedName)
             if (name == null) problem("The SQL relation identifier cannot be resolved unambiguously.")
             else actualTables += name
@@ -119,7 +144,7 @@ class BehaviorQuerySyntax {
             when (item) {
                 null -> Unit
                 is Table -> table(item)
-                is ParenthesedSelect -> { problem("Derived or nested query effects are not exhaustively enumerated."); select(item.select) }
+                is ParenthesedSelect -> { semanticProblem("Derived or nested query effects are not exhaustively enumerated."); select(item) }
                 else -> problem("The FROM item has unsupported relation or function semantics.")
             }
         }
@@ -135,8 +160,9 @@ class BehaviorQuerySyntax {
 
         private fun select(select: Select) {
             if (++depth > MAX_DEPTH) { problem("SQL nesting exceeds the supported depth."); depth--; return }
+            val previousCtes = cteNames
             try {
-                withItems(select.withItemsList)
+                withItems(select.withItemsList, readonly = true)
                 when (select) {
                     is PlainSelect -> {
                         from(select.fromItem)
@@ -153,7 +179,7 @@ class BehaviorQuerySyntax {
                             problem("The SELECT contains unsupported data effects or query variants.")
                     }
                     is Values -> select.expressions?.forEach(::expression)
-                    is ParenthesedSelect -> { problem("Nested query effects are not exhaustively enumerated."); this.select(select.select) }
+                    is ParenthesedSelect -> { semanticProblem("Nested query effects are not exhaustively enumerated."); this.select(select.select) }
                     else -> problem("Set-operation or specialized SELECT effects are not exhaustively enumerated.")
                 }
                 select.orderByElements.orEmpty().forEach { expression(it.expression) }
@@ -165,7 +191,7 @@ class BehaviorQuerySyntax {
                     if (fetch.fetchParameters.orEmpty().any { it.equals("TIES", true) }) problem("FETCH WITH TIES is outside the bounded pagination model.")
                 }
                 if (select.limitBy != null) problem("LIMIT BY is outside the supported pagination model.")
-            } finally { depth-- }
+            } finally { cteNames = previousCtes; depth-- }
         }
 
         private fun insert(insert: Insert) {
@@ -301,7 +327,8 @@ class BehaviorQuerySyntax {
                     }
                     is WhenClause -> { expression(value.whenExpression); expression(value.thenExpression) }
                     is ExpressionList<*> -> value.forEach(::expression)
-                    is Select -> { problem("Subquery effects are not exhaustively enumerated."); select(value) }
+                    is ExistsExpression -> { semanticProblem("EXISTS semantics remain outside the supported verification model."); expression(value.rightExpression) }
+                    is Select -> { semanticProblem("Subquery effects are not exhaustively enumerated."); select(value) }
                     else -> problem("Unsupported SQL expression ${value.javaClass.simpleName}.")
                 }
             } finally { depth-- }

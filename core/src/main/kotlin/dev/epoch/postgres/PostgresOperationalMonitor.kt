@@ -51,9 +51,9 @@ internal class PostgresOperationalMonitor(baseline: SchemaSnapshot, sizes: Table
                         if (step.intent.timeoutSetting == "LOCAL") OperationalTimeoutOrigin.MIGRATION_LOCAL else OperationalTimeoutOrigin.MIGRATION_SESSION
                     else if (step.intent.intents.any { it.kind == OperationalActionKind.UNKNOWN } || opaque.isNotEmpty()) knownTimeout = null
                     val beforeLocks = locks(step.before)
-                    val afterLocks = locks(after)
+                    val afterLocks = locks(after, step.before)
                     val beforeKeys = step.before.locks.map { it.oid to it.mode }.toSet()
-                    val newLocks = after.locks.filter { (it.oid to it.mode) !in beforeKeys }.mapNotNull { lock(after, it) }
+                    val newLocks = after.locks.filter { (it.oid to it.mode) !in beforeKeys }.mapNotNull { lock(after, it, step.before) }
                     val rewrites = after.relations.values.mapNotNull { relation ->
                         val old = step.before.relations[relation.oid]
                         if (relation.kind !in setOf("table", "materialized_view") || old == null || old.filenode == 0L || relation.filenode == 0L || old.filenode == relation.filenode) null
@@ -89,10 +89,15 @@ internal class PostgresOperationalMonitor(baseline: SchemaSnapshot, sizes: Table
     }
     private fun relation(value: Relation) = OperationalRelation(value.name, value.kind,
         if (completeBaselineIdentity) value.oid in baselineNames else null, baselineNames[value.oid])
-    private fun locks(observation: Observation) = observation.locks.mapNotNull { lock(observation, it) }.distinct().sortedWith(lockOrder)
-    private fun lock(observation: Observation, held: HeldLock): OperationalLock? {
-        val rel = observation.relations[held.oid] ?: return null
-        val table = if (rel.kind in setOf("index", "partitioned_index")) rel.owner?.let(observation.relations::get) else rel
+    private fun locks(observation: Observation, before: Observation? = null) = observation.locks
+        .mapNotNull { lock(observation, it, before) }.distinct().sortedWith(lockOrder)
+    private fun lock(observation: Observation, held: HeldLock, before: Observation? = null): OperationalLock? {
+        // DROP can remove pg_class rows while its transaction still holds the relation locks.
+        // Use the exact same OID's observed prior identity, never a name guessed from SQL.
+        val rel = observation.relations[held.oid] ?: before?.relations?.get(held.oid) ?: return null
+        val table = if (rel.kind in setOf("index", "partitioned_index")) rel.owner?.let { owner ->
+            observation.relations[owner] ?: before?.relations?.get(owner)
+        } else rel
         return OperationalLock(rel.name, rel.kind, held.mode, table?.let(::relation))
     }
 
@@ -140,6 +145,9 @@ internal class PostgresOperationalMonitor(baseline: SchemaSnapshot, sizes: Table
                 complete = intent.complete && next != null && index?.plain == true && index.columns.all { builtinColumn(next, it) }, noOp = noOp,
                 evidence = "Index ${intent.detail}; valid=${index?.valid}; ready=${index?.ready}; concurrent=${intent.concurrent}; prior index present=$existed."))
         }
+        if (intent.ifExists && oid == null && intent.complete)
+            return listOf(action(OperationalActionKind.METADATA_CHANGE, confirmed = true, complete = true, noOp = true,
+                evidence = "ALTER TABLE IF EXISTS skipped the catalog-absent relation ${intent.table}."))
         if (old == null || next == null || target == null) return listOf(action(evidence = "Target relation/column observations are incomplete."))
         val oldColumn = intent.detail?.let(old.columns::get)
         val newColumn = intent.detail?.let(next.columns::get)
@@ -172,6 +180,7 @@ internal class PostgresOperationalMonitor(baseline: SchemaSnapshot, sizes: Table
             OperationalActionKind.METADATA_CHANGE -> {
                 var confirmed = false
                 var complete = intent.complete
+                var noOp = false
                 when (intent.modifier) {
                     "RENAME_TABLE" -> confirmed = physical?.name?.substringAfterLast('.') == intent.replacement && old.relation.oid == next.relation.oid
                     "RENAME_COLUMN" -> confirmed = oldColumn != null && intent.detail !in next.columns && intent.replacement in next.columns
@@ -180,14 +189,15 @@ internal class PostgresOperationalMonitor(baseline: SchemaSnapshot, sizes: Table
                     "DROP_DEFAULT" -> confirmed = oldColumn != null && newColumn != null && newColumn.defaultExpression == null
                     "SET_DEFAULT" -> { confirmed = oldColumn != null && newColumn?.defaultExpression != null; complete = complete && newColumn?.let { RuleProofs.constantDefault(it.defaultExpression, it.type) } == true }
                     "ADD_COLUMN" -> {
-                        confirmed = oldColumn == null && newColumn != null
-                        complete = complete && newColumn?.let { it.nullable && intent.detail in next.builtinColumns && builtin(it.type) && it.generated == null && it.identity == null &&
-                            (it.defaultExpression == null || RuleProofs.constantDefault(it.defaultExpression, it.type)) } == true
+                        noOp = intent.ifNotExists && oldColumn != null && oldColumn == newColumn
+                        confirmed = oldColumn == null && newColumn != null || noOp
+                        complete = complete && (noOp || newColumn?.let { it.nullable && intent.detail in next.builtinColumns && builtin(it.type) && it.generated == null && it.identity == null &&
+                            (it.defaultExpression == null || RuleProofs.constantDefault(it.defaultExpression, it.type)) } == true)
                     }
                     else -> complete = false
                 }
-                val result = mutableListOf(action(confirmed = confirmed, complete = complete,
-                    evidence = "Catalog corroborates ${intent.modifier} on ${target.name}${intent.detail?.let { ".$it" }.orEmpty()}=$confirmed."))
+                val result = mutableListOf(action(confirmed = confirmed, complete = complete, noOp = noOp,
+                    evidence = "Catalog corroborates ${intent.modifier} on ${target.name}${intent.detail?.let { ".$it" }.orEmpty()}=$confirmed; existing IF NOT EXISTS no-op=$noOp."))
                 if (intent.modifier == "ADD_COLUMN") for ((name, constraint) in next.constraints) {
                     if (name in old.constraints) continue
                     val kind = when (constraint.schema.type) { "c" -> OperationalActionKind.ADD_CHECK; "f" -> OperationalActionKind.ADD_FOREIGN_KEY; else -> OperationalActionKind.UNKNOWN }

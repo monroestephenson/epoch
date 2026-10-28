@@ -103,7 +103,7 @@ Verification has per-migration and global deadlines (`--migration-timeout-second
 
 ## Operational migration report
 
-Verification also reports a separate operational `SAFE`, `RISKY`, or `UNKNOWN` result for pending migrations. It observes Flyway's actual statements, held relation locks, storage rewrites, and lock-timeout settings in the disposable database. The supported model identifies scans that block ordinary writes and rewrites of existing storage. Operational `SAFE` does not promise production latency, no locks, or sufficient I/O capacity; compatibility verdicts remain independent.
+Verification also reports a separate operational `SAFE`, `RISKY`, or `UNKNOWN` result for pending migrations. It observes Flyway's actual statements, held relation locks, storage rewrites, and lock-timeout settings in the disposable database. The supported model identifies old-table write-blocking locks, blocking scans and rewrites; catalog-confirmed commands supply separately labeled required-lock evidence when autocommit releases locks before sampling. Operational `SAFE` does not promise production latency, no locks, or sufficient I/O capacity; compatibility verdicts remain independent.
 
 ```sh
 db-compat verify --contract contract.json \
@@ -113,6 +113,8 @@ db-compat verify --contract contract.json \
 ```
 
 Both flags are optional. Caller-supplied [table-size estimates](docs/ci.md#table-size-estimates) grade known risks; small estimates never turn `RISKY` into `SAFE`. Without `--fail-on-operational`, exit codes follow the selected compatibility policy. With it, a passing compatibility gate additionally requires measured operational `SAFE`; other operational outcomes return `4`. This also applies when `--fail-on breaking` permits UNKNOWN compatibility. Runtime/incomplete `3` and compatibility failures under the selected policy take precedence. `verify-release` and saved `report` replay support the same gate; legacy reports without operational evidence fail that optional gate.
+
+A nullable-column addition can be structurally SAFE while its unprotected old-table lock is operationally RISKY. An explicit migration-authored `lock_timeout` can bound acquisition waiting for supported ordinary commands; the verifier's injected timeout does not count. Acquisition protection never proves short lock holding or waives scan/rewrite risks. See [timeout policy and an example](docs/ci.md#operational-ci-gate).
 
 See [operational proof boundaries and rules](docs/verification.md#operational-migration-assessment) for supported concurrent-index and split-transaction validation patterns. Only forward deployment migrations contribute to this result. Operational details are in JSON and terminal reports; SARIF currently exports compatibility findings only. The separate `lint` command remains unchanged and provides static review hints.
 

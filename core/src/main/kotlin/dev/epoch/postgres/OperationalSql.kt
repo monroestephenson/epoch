@@ -17,6 +17,7 @@ internal data class OperationalIntent(
     val notValid: Boolean = false,
     val ifNotExists: Boolean = false,
     val complete: Boolean = false,
+    val ifExists: Boolean = false,
 )
 internal data class OperationalSql(
     val intents: List<OperationalIntent>,
@@ -67,12 +68,13 @@ internal data class OperationalSql(
             }
             offset = 0
             if (take("ALTER") && take("TABLE")) {
-                if (take("IF")) { if (!take("EXISTS")) return unknown("ALTER TABLE") }
+                val guarded = take("IF")
+                if (guarded && !take("EXISTS")) return unknown("ALTER TABLE")
                 take("ONLY")
                 val name = qualified(tokens, offset) ?: return unknown("ALTER TABLE")
                 offset = name.second
                 val parts = splitClauses(tokens.drop(offset)) ?: return unknown("ALTER TABLE")
-                return OperationalSql(parts.map { alter(name.first, it) }, "ALTER TABLE")
+                return OperationalSql(parts.map { alter(name.first, it).copy(ifExists = guarded) }, "ALTER TABLE")
             }
             return unknown(tokens.firstOrNull()?.text?.uppercase())
             } catch (_: Exception) { unknown() }
@@ -125,9 +127,15 @@ internal data class OperationalSql(
                     if (at(3, "CHECK")) return intent(OperationalActionKind.ADD_CHECK, id(2), notValid = notValid)
                     if (at(3, "FOREIGN") && at(4, "KEY")) return intent(OperationalActionKind.ADD_FOREIGN_KEY, id(2), notValid = notValid)
                 }
-                val i = if (at(1, "COLUMN")) 2 else 1
+                var i = if (at(1, "COLUMN")) 2 else 1
+                val guarded = at(i, "IF")
+                if (guarded) {
+                    if (!at(i + 1, "NOT") || !at(i + 2, "EXISTS"))
+                        return intent(OperationalActionKind.UNKNOWN, complete = false)
+                    i += 3
+                }
                 if (id(i) != null && t.size > i + 1 && !at(i, "CONSTRAINT") && !at(i, "PRIMARY") && !at(i, "UNIQUE"))
-                    return intent(OperationalActionKind.METADATA_CHANGE, id(i), modifier = "ADD_COLUMN")
+                    return intent(OperationalActionKind.METADATA_CHANGE, id(i), modifier = "ADD_COLUMN").copy(ifNotExists = guarded)
             }
             return intent(OperationalActionKind.UNKNOWN, complete = false)
         }

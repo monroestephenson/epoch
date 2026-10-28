@@ -24,6 +24,11 @@ class MigrationClassifier {
         val statements = Parser.parseJdbcSql(sql, true, false, true, false, false)
         statements.mapNotNull { parsed ->
             val text = parsed.nativeSql.trim()
+            // JSQLParser does not cover every PostgreSQL SET scope. The token parser
+            // establishes this exact literal assignment; the substring is only a fast
+            // prefilter, never evidence that the statement is supported.
+            if (text.contains("lock_timeout", ignoreCase = true) &&
+                OperationalSql.inspect(text).timeoutSetting != null) return@mapNotNull null
             // JSQLParser 5.1 lacks PostgreSQL's CONCURRENTLY modifier. It does not change
             // index semantics: remove only this leading grammar token before parsing the AST.
             if (supportedEnumChange(text, before, after)) return@mapNotNull null

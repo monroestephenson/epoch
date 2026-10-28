@@ -1,6 +1,6 @@
 package dev.epoch.core
 
-/** Independent from SQL compatibility and deliberately scoped to blocking scans and rewrites. */
+/** Independent from SQL compatibility; scoped to measured blocking exposure, scans and rewrites. */
 enum class OperationalVerdict { SAFE, RISKY, UNKNOWN }
 enum class OperationalSeverity { LOW, MEDIUM, HIGH }
 enum class OperationalTimeoutOrigin { VERIFIER, MIGRATION_SESSION, MIGRATION_LOCAL, UNKNOWN }
@@ -74,7 +74,9 @@ data class OperationalAssessment(
 /** Adapter-proven statement meaning. Missing proof fields must never imply a cheap operation. */
 internal enum class OperationalActionKind {
     CREATE_TABLE, CREATE_INDEX, SET_NOT_NULL, ADD_CHECK, ADD_FOREIGN_KEY,
-    VALIDATE_CONSTRAINT, ALTER_COLUMN_TYPE, METADATA_CHANGE, SETTINGS_CHANGE,
+    VALIDATE_CONSTRAINT, ALTER_COLUMN_TYPE,
+    /** Bounded ALTER TABLE metadata only; a confirmed action requires its normal table lock. */
+    METADATA_CHANGE, SETTINGS_CHANGE,
     DATA_CHANGE, UNKNOWN,
 }
 

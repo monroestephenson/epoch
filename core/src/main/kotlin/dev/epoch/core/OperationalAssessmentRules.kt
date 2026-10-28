@@ -27,6 +27,70 @@ object OperationalAssessmentRules {
         fun risk(relation: OperationalRelation, rule: String, message: String, evidence: String, mitigation: String) =
             add(OperationalVerdict.RISKY, rule, relation.name, message, evidence, relation, mitigation)
 
+        // Measured table locks establish exposure independently of recognizing a scan/rewrite.
+        // This only grades lock acquisition protection. A timeout never limits how long an
+        // acquired lock is held, and cannot waive the scan/rewrite rules below.
+        val authoredOrigins = setOf(OperationalTimeoutOrigin.MIGRATION_LOCAL, OperationalTimeoutOrigin.MIGRATION_SESSION)
+        val protectedAcquisition = facts.lockTimeoutBefore.milliseconds > 0 &&
+            facts.lockTimeoutBefore.origin in authoredOrigins &&
+            facts.lockTimeoutAfter.milliseconds == facts.lockTimeoutBefore.milliseconds &&
+            facts.lockTimeoutAfter.origin == facts.lockTimeoutBefore.origin &&
+            facts.opaqueEffects.isEmpty() && facts.actions.isNotEmpty() && facts.actions.all { action ->
+                action.kind in ordinaryCommandKinds && action.catalogConfirmed && action.effectsComplete &&
+                    action.target?.kind in tableKinds
+            }
+        val observedBlocking = (facts.heldLocksBefore + facts.heldLocksAfter + facts.newlyObservedLocks).distinct()
+            .filter { it.relationKind in tableKinds && it.mode in blockingModes }
+        // These are required PostgreSQL modes for this adapter's bounded, catalog-confirmed
+        // commands, not invented pg_locks observations. In particular METADATA_CHANGE is
+        // currently ALTER TABLE metadata only, never a generic arbitrary-DDL certification.
+        data class RequiredLock(val table: OperationalRelation, val mode: String, val command: String)
+        val requiredLocks = facts.actions.filter { it.catalogConfirmed }.flatMap { action ->
+            fun on(relations: List<OperationalRelation>, mode: String) = relations.filter { it.kind in tableKinds }
+                .map { RequiredLock(it, mode, action.kind.name) }
+            when (action.kind) {
+                OperationalActionKind.METADATA_CHANGE, OperationalActionKind.SET_NOT_NULL,
+                OperationalActionKind.ADD_CHECK, OperationalActionKind.ALTER_COLUMN_TYPE ->
+                    on(listOfNotNull(action.target), "AccessExclusiveLock")
+                OperationalActionKind.ADD_FOREIGN_KEY ->
+                    on(listOfNotNull(action.target) + action.relatedTables, "ShareRowExclusiveLock")
+                OperationalActionKind.CREATE_INDEX -> if (!action.concurrent)
+                    on(listOfNotNull(action.target), "ShareLock") else emptyList()
+                OperationalActionKind.CREATE_TABLE -> if (!action.noOp)
+                    on(action.relatedTables, "ShareRowExclusiveLock") else emptyList() // Actual inline-FK references.
+                else -> emptyList()
+            }
+        }.distinct()
+        val oldLocks = observedBlocking.filter { it.table?.preExisting == true }
+            .groupBy { identity(requireNotNull(it.table)) }
+        val oldRequired = requiredLocks.filter { it.table.preExisting == true }.groupBy { identity(it.table) }
+        if (!protectedAcquisition) for (baselineIdentity in (oldLocks.keys + oldRequired.keys).sorted()) {
+            val locks = oldLocks[baselineIdentity].orEmpty()
+            val required = oldRequired[baselineIdentity].orEmpty()
+            // Prefer the after-snapshot name when a table was renamed in this statement, while
+            // grading supplied size metadata using its original baseline identity.
+            val relation = (facts.heldLocksAfter + facts.newlyObservedLocks).mapNotNull { it.table }
+                .filter { it.preExisting == true && identity(it) == baselineIdentity }.sortedBy { it.name }.firstOrNull()
+                ?: required.map { it.table }.sortedBy { it.name }.firstOrNull()
+                ?: requireNotNull(locks.sortedWith(lockOrder).first().table)
+            val observed = locks.map { it.mode }.distinct().sorted().joinToString().ifEmpty { "none retained in the samples" }
+            val needed = required.map { "${it.mode} for ${it.command}" }.distinct().sorted().joinToString().ifEmpty { "not established" }
+            risk(relation, "OP_WRITE_BLOCKING_LOCK",
+                "A write-blocking lock on a pre-existing relation has no established migration-authored acquisition bound.",
+                "Observed modes=$observed; required modes from catalog-confirmed PostgreSQL commands=$needed; " +
+                    "sampled locked relations=${locks.map { it.relation }.distinct().sorted().joinToString().ifEmpty { "none" }}; " +
+                    "baseline=${relation.baselineName}; lock_timeout before=${facts.lockTimeoutBefore.milliseconds}ms (${facts.lockTimeoutBefore.origin}), " +
+                    "after=${facts.lockTimeoutAfter.milliseconds}ms (${facts.lockTimeoutAfter.origin}). Verifier timeouts are not deployment-authored protection. " +
+                    "Only a supported ordinary command without opaque effects can use a positive authored before-timeout; neither sampled nor required locks establish scan timing or hold duration.",
+                "Use an explicit migration-authored lock_timeout before the operation, keep lock-holding transactions short, and review unsupported procedural effects.")
+        }
+        val unknownObserved = observedBlocking.filter { it.table?.preExisting == null }.groupBy { it.relation }
+        val unknownRequired = requiredLocks.filter { it.table.preExisting == null }.groupBy { it.table.name }
+        for (name in (unknownObserved.keys + unknownRequired.keys).sorted()) unknown(name,
+            "A write-blocking lock has no established old/new table identity.",
+            "Observed modes=${unknownObserved[name].orEmpty().map { it.mode }.distinct().sorted().joinToString()}; " +
+                "required modes=${unknownRequired[name].orEmpty().map { it.mode }.distinct().sorted().joinToString()}; table identity is incomplete.")
+
         for (rewrite in facts.rewrittenTables.distinct().sortedBy { it.afterName }) when (rewrite.table.preExisting) {
             true -> risk(rewrite.table, "OP_TABLE_REWRITE", "The statement rewrote pre-existing relation storage.",
                 "Observed the same physical relation with changed nonzero storage identity; before=${rewrite.beforeName}; after=${rewrite.afterName}; baseline=${rewrite.table.baselineName}.",
@@ -246,6 +310,9 @@ object OperationalAssessmentRules {
     private val blockingModes = setOf("ShareLock", "ShareRowExclusiveLock", "ExclusiveLock", "AccessExclusiveLock")
     private val strongAlterKinds = setOf(OperationalActionKind.METADATA_CHANGE, OperationalActionKind.SET_NOT_NULL,
         OperationalActionKind.ADD_CHECK, OperationalActionKind.ADD_FOREIGN_KEY, OperationalActionKind.ALTER_COLUMN_TYPE)
+    private val ordinaryCommandKinds = setOf(OperationalActionKind.CREATE_TABLE, OperationalActionKind.CREATE_INDEX,
+        OperationalActionKind.SET_NOT_NULL, OperationalActionKind.ADD_CHECK, OperationalActionKind.ADD_FOREIGN_KEY,
+        OperationalActionKind.VALIDATE_CONSTRAINT, OperationalActionKind.ALTER_COLUMN_TYPE, OperationalActionKind.METADATA_CHANGE)
     private fun identity(relation: OperationalRelation) = relation.baselineName ?: relation.name
     private val lockOrder = compareBy<OperationalLock> { it.relation }.thenBy { it.relationKind }.thenBy { it.mode }
         .thenBy { it.table?.baselineName ?: "" }.thenBy { it.table?.name ?: "" }
@@ -253,8 +320,9 @@ object OperationalAssessmentRules {
     private val findingOrder = compareBy<OperationalRiskFinding> { rank(it.verdict) }.thenBy { it.migration.version }
         .thenBy { it.migration.filename }.thenBy { it.statementOrdinal }.thenBy { it.ruleId }.thenBy { it.objectName }.thenBy { it.evidence }
     val limitations: List<String> = listOf(
-        "Operational SAFE is limited to supported PostgreSQL write-blocking scan and storage-rewrite proofs; it does not guarantee production latency, lock waiting, I/O capacity, or general deployment safety.",
+        "Operational SAFE is limited to supported PostgreSQL lock-acquisition, write-blocking scan and storage-rewrite proofs; it does not guarantee production latency, lock hold duration, I/O capacity, or general deployment safety.",
         "Locks and lock_timeout are observed on the disposable migration connection. Verifier-injected timeouts do not establish deployment-authored protection; after-autocommit lock samples may be empty after locks were released.",
+        "Observed old-table write-blocking locks remain RISKY independently of SQL recognition unless a supported ordinary command has a positive migration-authored acquisition timeout. Catalog-confirmed bounded commands also establish required locks when autocommit releases them before sampling; required modes are labeled separately. Unsupported effects remain UNKNOWN alongside risk; timeouts never waive blocking scan or rewrite risks.",
         "Optional table sizes grade risk severity only. Missing estimates stay unknown, fixture sizes are not production evidence, and smaller estimates never turn RISKY into SAFE.",
     )
 }

@@ -32,6 +32,7 @@ internal class PostgresBehaviorGraph {
         private val types = mutableMapOf<Long, Type>()
         private val functions = mutableMapOf<Long, Function>()
         private val edges = mutableMapOf<Address, MutableList<Edge>>()
+        private val pinned = mutableSetOf<Address>()
         private val extensions = mutableMapOf<Long, Pair<String, String>>()
         private val roots = linkedMapOf<String, Root>()
         private val addresses = mutableMapOf<Address, String>()
@@ -41,6 +42,7 @@ internal class PostgresBehaviorGraph {
         private val allOperations = Operation.entries.toSet()
         private val writes = setOf(Operation.INSERT, Operation.UPDATE)
         private val builtinResolution = snapshot.expressionSearchPath.firstOrNull() == "pg_catalog"
+        private val expressionSyntax = BehaviorQuerySyntax()
 
         fun collect(): BehaviorGraph {
             inventory()
@@ -65,6 +67,15 @@ internal class PostgresBehaviorGraph {
         }
 
         private fun inventory() {
+            // Pins identify original system objects, not executable dependencies of a caller.
+            // Older PostgreSQL versions may omit pin rows; the original-object OID boundary
+            // below is used only for catalog kinds with a known system-object inventory.
+            connection.rows("""
+                SELECT c.relname AS target_catalog, d.refobjid, d.refobjsubid
+                FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_class c ON c.oid=d.refclassid
+                WHERE d.deptype='p'
+            """) { pinned += Address(it.getString("target_catalog"), it.getLong("refobjid"), it.getInt("refobjsubid")) }
+
             connection.rows("""
                 SELECT c.oid, n.nspname || '.' || c.relname AS name, c.relkind, c.relname
                 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
@@ -169,7 +180,8 @@ internal class PostgresBehaviorGraph {
                 val scalar = row.ints("conkey").all { builtinColumn(relation, it) }
                 val enum = schema.constraints[name]?.let(RuleProofs::enumCheck)
                 val safeEnum = enum != null && schema.columns[enum.first]?.type?.let { it == "text" || it.startsWith("character varying") } == true
-                val safe = builtinResolution && scalar && (safeEnum || CompatibilityViews.simpleExpression(expression, schema))
+                val safe = builtinResolution && scalar && (safeEnum || CompatibilityViews.simpleExpression(expression, schema) ||
+                    scalarExpression(expression, table))
                 val id = "check:$table.$name"
                 add(Root(id, Address("pg_constraint", row.getLong("oid")), "check", expression, safe, safe, !safe,
                     reason = if (safe) null else "CHECK expression dependency completeness is not established."),
@@ -213,16 +225,49 @@ internal class PostgresBehaviorGraph {
         }
 
         private fun indexRoots() {
-            connection.rows("SELECT indexrelid, indrelid FROM pg_catalog.pg_index") { row ->
-                val table = relations[row.getLong("indrelid")]?.name ?: return@rows
+            connection.rows("""
+                SELECT ix.indexrelid, ix.indrelid, pg_catalog.pg_get_expr(ix.indexprs,ix.indrelid) AS expressions,
+                       pg_catalog.pg_get_expr(ix.indpred,ix.indrelid) AS predicate,
+                       am.oid < 16384 AND NOT EXISTS (
+                           SELECT 1 FROM unnest(ix.indclass) op(oid)
+                           JOIN pg_catalog.pg_opclass oc ON oc.oid=op.oid
+                           JOIN pg_catalog.pg_namespace ons ON ons.oid=oc.opcnamespace
+                           JOIN pg_catalog.pg_opfamily family ON family.oid=oc.opcfamily
+                           JOIN pg_catalog.pg_namespace fns ON fns.oid=family.opfnamespace
+                           WHERE oc.oid>=16384 OR family.oid>=16384 OR ons.nspname<>'pg_catalog' OR fns.nspname<>'pg_catalog'
+                       ) AS builtin_implementation
+                FROM pg_catalog.pg_index ix JOIN pg_catalog.pg_class c ON c.oid=ix.indexrelid
+                JOIN pg_catalog.pg_am am ON am.oid=c.relam
+            """) { row ->
+                val relation = row.getLong("indrelid")
+                val table = relations[relation]?.name ?: return@rows
                 val schema = snapshot.tables[table] ?: return@rows
                 val name = relations[row.getLong("indexrelid")]?.localName ?: return@rows
                 if (name in schema.plainIndexes) return@rows
+                val address = Address("pg_class", row.getLong("indexrelid"))
+                val scalar = edges[address].orEmpty().filter { it.target.catalog == "pg_class" && it.target.sub > 0 }
+                    .all { builtinColumn(it.target.oid, it.target.sub) }
+                val expressions = row.getString("expressions")
+                val predicate = row.getString("predicate")
+                val bounded = builtinResolution && row.getBoolean("builtin_implementation") && scalar &&
+                    schema.indexValidity[name] == true && schema.indexReadiness[name] == true &&
+                    listOfNotNull(expressions, predicate).all { scalarExpression(it, table) }
                 val id = "index:$table.$name"
-                add(Root(id, Address("pg_class", row.getLong("indexrelid")), "index", schema.indexes[name] ?: return@rows,
-                    reason = "Index expressions, predicates or custom operator classes require additional behavior proofs."),
+                add(Root(id, address, "index", schema.indexes[name] ?: return@rows,
+                    bounded, bounded, !bounded,
+                    reason = if (bounded) null else "Index expressions, predicates or custom operator classes require additional behavior proofs."),
                     BehaviorAttachment(table, id, writes, objectName = "$table.$name"))
             }
+        }
+
+        /** Syntax proves only that an unchanged expression has no hidden object lookup.
+         * Actual pg_depend function/operator/type children remain independent vetoes. */
+        private fun scalarExpression(expression: String, table: String): Boolean {
+            val relation = table.split('.').takeIf { it.size == 2 }?.joinToString(".") {
+                "\"${it.replace("\"", "\"\"")}\""
+            } ?: return false
+            return expressionSyntax.inspect(QueryContract("catalog-expression", Operation.SELECT,
+                "SELECT $expression FROM $relation", tables = listOf(table), dependenciesComplete = true)).complete
         }
 
         private fun triggerRoots() {
@@ -390,6 +435,10 @@ internal class PostgresBehaviorGraph {
             }
         }
 
+        private fun systemDependency(address: Address): Boolean =
+            address in pinned || address.copy(sub = 0) in pinned ||
+                address.oid > 0 && address.oid < 16384 && address.catalog in SYSTEM_OBJECT_CATALOGS
+
         private fun buildNode(id: String): List<String> {
             val root = roots.getValue(id)
             val children = root.children.toMutableSet()
@@ -405,6 +454,21 @@ internal class PostgresBehaviorGraph {
                             if (extension == null) { complete = false; reasons += "Extension membership could not be resolved." }
                             else references += BehaviorReference(BehaviorReferenceKind.EXTENSION, extension.first)
                         }
+                        target.catalog == "pg_class" && systemDependency(target) -> {
+                            // A system relation's contents can expose application DDL. Retain
+                            // the observation without walking language/type implementation nodes.
+                            val relation = relations[target.oid]
+                            if (relation != null && relation.kind in setOf("r", "p", "v", "m", "f")) {
+                                val column = if (target.sub > 0) columns[target.oid to target.sub] else null
+                                references += BehaviorReference(if (column == null) BehaviorReferenceKind.RELATION else BehaviorReferenceKind.COLUMN,
+                                    relation.name, column, root.access)
+                                if (root.access != BehaviorAccess.METADATA) {
+                                    complete = false
+                                    reasons += "Observed system catalog relation ${relation.name} can expose application DDL beyond relation-local catalog dependencies."
+                                }
+                            }
+                        }
+                        systemDependency(target) -> Unit
                         target.catalog == "pg_class" -> {
                             val relation = relations[target.oid]
                             val column = if (target.sub > 0) columns[target.oid to target.sub] else null
@@ -437,6 +501,13 @@ internal class PostgresBehaviorGraph {
     }
 
     companion object {
+        // Namespace strings are deliberately not a boundary: an extension or application may
+        // create executable objects in pg_catalog, and those normal-OID objects stay reachable.
+        private val SYSTEM_OBJECT_CATALOGS = setOf("pg_class", "pg_type", "pg_proc", "pg_operator",
+            "pg_opclass", "pg_opfamily", "pg_collation", "pg_am", "pg_namespace", "pg_language",
+            "pg_cast", "pg_transform", "pg_ts_config", "pg_ts_dict", "pg_ts_parser", "pg_ts_template",
+            "pg_rewrite", "pg_constraint", "pg_attrdef")
+
         /** Positive direct-projection syntax. Catalog edges, rather than this parser, provide physical references. */
         internal fun functionFreeView(definition: String): Boolean = try {
             val select = CCJSqlParserUtil.parse(definition) as? PlainSelect

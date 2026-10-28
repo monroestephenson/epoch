@@ -10,17 +10,20 @@ class OperationalAssessmentRulesTest {
     private val old = OperationalRelation("public.accounts", "table", true, "public.accounts")
     private val fresh = OperationalRelation("public.fresh", "table", false)
     private val verifierTimeout = OperationalTimeout(30_000, "client", OperationalTimeoutOrigin.VERIFIER)
+    private val authoredTimeout = OperationalTimeout(750, "session", OperationalTimeoutOrigin.MIGRATION_LOCAL)
     private fun action(kind: OperationalActionKind, target: OperationalRelation? = old) = OperationalAction(kind,
         target = target, catalogConfirmed = true, effectsComplete = true, evidence = "Catalog confirms the requested operation.")
     private fun facts(action: OperationalAction, before: List<OperationalLock> = emptyList(), after: List<OperationalLock> = emptyList(),
-                      rewrites: List<OperationalRewrite> = emptyList(), autoCommit: Boolean = false, opaque: List<String> = emptyList()) =
-        OperationalStatementFacts(migration, 1, "actual Flyway statement;", autoCommit, verifierTimeout, verifierTimeout,
+                      rewrites: List<OperationalRewrite> = emptyList(), autoCommit: Boolean = false, opaque: List<String> = emptyList(),
+                      timeout: OperationalTimeout = verifierTimeout) =
+        OperationalStatementFacts(migration, 1, "actual Flyway statement;", autoCommit, timeout, timeout,
             before, after, after.filter { it !in before }, rewrites, listOf(action), opaque)
     private fun lock(table: OperationalRelation = old, mode: String = "AccessExclusiveLock", kind: String = "table") =
         OperationalLock(if (kind == "index") "${table.name}_idx" else table.name, kind, mode, table)
     private fun assess(action: OperationalAction, before: List<OperationalLock> = emptyList(), after: List<OperationalLock> = emptyList(),
                        rewrites: List<OperationalRewrite> = emptyList(), autoCommit: Boolean = false, opaque: List<String> = emptyList(),
-                       sizes: TableSizes? = null) = OperationalAssessmentRules.assess(facts(action, before, after, rewrites, autoCommit, opaque), sizes)
+                       sizes: TableSizes? = null, timeout: OperationalTimeout = verifierTimeout) =
+        OperationalAssessmentRules.assess(facts(action, before, after, rewrites, autoCommit, opaque, timeout), sizes)
     private fun rule(report: OperationalStatementReport, id: String, verdict: OperationalVerdict) =
         assertTrue(report.findings.any { it.ruleId == id && it.verdict == verdict }, report.toString())
 
@@ -48,14 +51,16 @@ class OperationalAssessmentRulesTest {
     @Test fun `SET NOT NULL needs actual prior invariant facts`() {
         val scan = action(OperationalActionKind.SET_NOT_NULL).copy(priorNotNull = false, priorValidatedNonNullCheck = false)
         rule(assess(scan), "OP_NOT_NULL_SCAN", OperationalVerdict.RISKY)
-        rule(assess(scan.copy(priorValidatedNonNullCheck = true)), "OP_VALIDATED_NOT_NULL", OperationalVerdict.SAFE)
-        rule(assess(scan.copy(priorNotNull = true)), "OP_VALIDATED_NOT_NULL", OperationalVerdict.SAFE)
-        assertEquals(OperationalVerdict.UNKNOWN, assess(scan.copy(priorValidatedNonNullCheck = null)).verdict)
+        rule(assess(scan.copy(priorValidatedNonNullCheck = true), timeout = authoredTimeout), "OP_VALIDATED_NOT_NULL", OperationalVerdict.SAFE)
+        rule(assess(scan.copy(priorNotNull = true), timeout = authoredTimeout), "OP_VALIDATED_NOT_NULL", OperationalVerdict.SAFE)
+        assertEquals(OperationalVerdict.UNKNOWN, assess(scan.copy(priorValidatedNonNullCheck = null), timeout = authoredTimeout).verdict)
     }
 
     @Test fun `validated no-op does not claim a new scan`() {
         val noOp = action(OperationalActionKind.VALIDATE_CONSTRAINT).copy(priorConstraintValidated = true)
-        val report = assess(noOp, before = listOf(lock()), after = listOf(lock()))
+        val authored = OperationalTimeout(750, "session", OperationalTimeoutOrigin.MIGRATION_LOCAL)
+        val report = OperationalAssessmentRules.assess(facts(noOp, before = listOf(lock()), after = listOf(lock()))
+            .copy(lockTimeoutBefore = authored, lockTimeoutAfter = authored))
         assertEquals(OperationalVerdict.SAFE, report.verdict)
         rule(report, "OP_METADATA_ONLY", OperationalVerdict.SAFE)
     }
@@ -63,7 +68,7 @@ class OperationalAssessmentRulesTest {
     @Test fun `NOT VALID defers row scans while ordinary immediate validation is risky`() {
         for (kind in listOf(OperationalActionKind.ADD_CHECK, OperationalActionKind.ADD_FOREIGN_KEY)) {
             rule(assess(action(kind)), "OP_CONSTRAINT_VALIDATION_BLOCKS_WRITES", OperationalVerdict.RISKY)
-            rule(assess(action(kind).copy(notValid = true)), "OP_DEFERRED_CONSTRAINT_VALIDATION", OperationalVerdict.SAFE)
+            rule(assess(action(kind).copy(notValid = true), timeout = authoredTimeout), "OP_DEFERRED_CONSTRAINT_VALIDATION", OperationalVerdict.SAFE)
         }
     }
 
@@ -85,8 +90,10 @@ class OperationalAssessmentRulesTest {
     @Test fun `after-only callback lock cannot establish that validation ran under it`() {
         val validate = action(OperationalActionKind.VALIDATE_CONSTRAINT).copy(priorConstraintValidated = false)
         val report = assess(validate, after = listOf(lock()), opaque = listOf("ddl_command_end trigger can acquire a lock after validation"))
-        assertEquals(OperationalVerdict.UNKNOWN, report.verdict)
-        assertFalse(report.findings.any { it.verdict == OperationalVerdict.RISKY })
+        assertEquals(OperationalVerdict.RISKY, report.verdict)
+        rule(report, "OP_WRITE_BLOCKING_LOCK", OperationalVerdict.RISKY)
+        rule(report, "OP_DATABASE_CALLBACK_UNPROVEN", OperationalVerdict.UNKNOWN)
+        assertFalse(report.findings.any { it.ruleId == "OP_VALIDATION_UNDER_RETAINED_LOCK" })
     }
 
     @Test fun `index locks are kept distinct from owning table locks`() {
@@ -141,15 +148,20 @@ class OperationalAssessmentRulesTest {
     }
 
     @Test fun `existing type change without a rewrite is not assumed scan free`() {
-        assertEquals(OperationalVerdict.UNKNOWN, assess(action(OperationalActionKind.ALTER_COLUMN_TYPE)).verdict)
-        // A merely observed strong lock does not prove an unobserved scan happened.
-        assertEquals(OperationalVerdict.UNKNOWN, assess(action(OperationalActionKind.ALTER_COLUMN_TYPE), before = listOf(lock())).verdict)
+        assertEquals(OperationalVerdict.UNKNOWN, assess(action(OperationalActionKind.ALTER_COLUMN_TYPE), timeout = authoredTimeout).verdict)
+        // The independent blocking exposure does not pretend an unobserved scan/rewrite occurred.
+        val observed = assess(action(OperationalActionKind.ALTER_COLUMN_TYPE), before = listOf(lock()))
+        assertEquals(OperationalVerdict.RISKY, observed.verdict)
+        rule(observed, "OP_WRITE_BLOCKING_LOCK", OperationalVerdict.RISKY)
+        rule(observed, "OP_STATEMENT_UNSUPPORTED", OperationalVerdict.UNKNOWN)
+        assertFalse(observed.findings.any { it.ruleId == "OP_TABLE_REWRITE" })
     }
 
     @Test fun `callbacks prevent intrinsic metadata SAFE but do not erase measured risk`() {
         val metadata = action(OperationalActionKind.METADATA_CHANGE)
         val unknown = assess(metadata, opaque = listOf("applicable event trigger public.observe_ddl"))
-        assertEquals(OperationalVerdict.UNKNOWN, unknown.verdict)
+        assertEquals(OperationalVerdict.RISKY, unknown.verdict)
+        rule(unknown, "OP_WRITE_BLOCKING_LOCK", OperationalVerdict.RISKY)
         rule(unknown, "OP_DATABASE_CALLBACK_UNPROVEN", OperationalVerdict.UNKNOWN)
         val risky = assess(metadata, rewrites = listOf(OperationalRewrite(old, old.name, old.name)), opaque = listOf("public.observe_ddl"))
         assertEquals(OperationalVerdict.RISKY, risky.verdict)
@@ -157,9 +169,12 @@ class OperationalAssessmentRulesTest {
 
     @Test fun `catalog confirmation and complete effects are positive SAFE prerequisites`() {
         val metadata = action(OperationalActionKind.METADATA_CHANGE)
-        assertEquals(OperationalVerdict.SAFE, assess(metadata).verdict)
+        assertEquals(OperationalVerdict.SAFE, assess(metadata, timeout = authoredTimeout).verdict)
         assertEquals(OperationalVerdict.UNKNOWN, assess(metadata.copy(catalogConfirmed = false)).verdict)
-        assertEquals(OperationalVerdict.UNKNOWN, assess(metadata.copy(effectsComplete = false)).verdict)
+        val incomplete = assess(metadata.copy(effectsComplete = false), timeout = authoredTimeout)
+        assertEquals(OperationalVerdict.RISKY, incomplete.verdict)
+        rule(incomplete, "OP_STATEMENT_UNSUPPORTED", OperationalVerdict.UNKNOWN)
+        rule(incomplete, "OP_WRITE_BLOCKING_LOCK", OperationalVerdict.RISKY)
     }
 
     @Test fun `renamed old rewrite looks up its baseline size and retains risk at every size`() {
@@ -192,7 +207,7 @@ class OperationalAssessmentRulesTest {
     }
 
     @Test fun `aggregation keeps established risk and incomplete windows cannot certify SAFE`() {
-        val safe = assess(action(OperationalActionKind.METADATA_CHANGE))
+        val safe = assess(action(OperationalActionKind.METADATA_CHANGE), timeout = authoredTimeout)
         val risky = assess(action(OperationalActionKind.CREATE_INDEX))
         val unknown = assess(action(OperationalActionKind.UNKNOWN))
         assertEquals(OperationalVerdict.RISKY, OperationalAssessmentRules.aggregate(listOf(safe, unknown, risky)).verdict)
@@ -230,8 +245,10 @@ class OperationalAssessmentRulesTest {
         val fk = action(OperationalActionKind.ADD_FOREIGN_KEY, fresh).copy(notValid = true, relatedTables = listOf(old))
         val compound = facts(validate, after = listOf(lock())).copy(actions = listOf(fk, validate))
         val report = OperationalAssessmentRules.assess(compound)
-        assertEquals(OperationalVerdict.UNKNOWN, report.verdict)
-        assertFalse(report.findings.any { it.verdict == OperationalVerdict.RISKY })
+        assertEquals(OperationalVerdict.RISKY, report.verdict)
+        rule(report, "OP_WRITE_BLOCKING_LOCK", OperationalVerdict.RISKY)
+        assertTrue(report.findings.any { it.verdict == OperationalVerdict.UNKNOWN })
+        assertFalse(report.findings.any { it.ruleId == "OP_VALIDATION_UNDER_COMPOUND_LOCK" })
     }
 
 }

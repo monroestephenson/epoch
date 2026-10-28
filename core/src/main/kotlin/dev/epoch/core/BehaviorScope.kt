@@ -11,6 +11,7 @@ class BehaviorScope(
         table.constraints.values.filter { it.type == "f" && it.referencedTable != null }.map { child to it }
     }.groupBy { it.second.referencedTable }
     private val closureCache = mutableMapOf<String, Set<String>>()
+    private val boundaryCache = mutableMapOf<String, BehaviorDependencyBoundary>()
     private val operationCache = mutableMapOf<ScopeKey, OperationBehaviorScope>()
     private val userFunctionsByName = graph?.nodes.orEmpty().filterValues { it.kind.equals("function", true) }.keys
         .groupBy { it.removePrefix("function:").substringBefore('(').substringAfterLast('.').lowercase() }
@@ -26,8 +27,14 @@ class BehaviorScope(
             query.writeColumns.filter { it.table == table }.map { it.column }.toSet(),
             facts.defaultColumns.filter { it.table == table }.map { it.column }.toSet(),
             facts.defaultAssignmentsComplete && query.explicitColumnList, true) }
-        return cachedCollect(seeds, facts, query.id, query.operation != Operation.SELECT,
+        val scope = cachedCollect(seeds, facts, query.id, query.operation != Operation.SELECT,
             query.parameterTypes + query.resultColumns.mapNotNull { it.typeName }.map(::jdbcResultType))
+        return if (!facts.complete && facts.dependencyCoverageComplete && query.dependenciesComplete) scope.copy(
+            boundedQueryUncertaintyIds = setOf("query:${query.id}"),
+            queryDependencyReferences = tables.mapTo(sortedSetOf(compareBy<BehaviorReference>({ it.kind.name }, { it.name }))) {
+                BehaviorReference(BehaviorReferenceKind.RELATION, it)
+            },
+        ) else scope
     }
 
     fun forMapping(entity: EntityContract, operation: Operation): OperationBehaviorScope {
@@ -43,6 +50,17 @@ class BehaviorScope(
     /** Exact attached objects permit rename checks without searching arbitrary SQL bodies. */
     fun expressionRoots(objectName: String): Set<String> = graph?.attachments.orEmpty()
         .filter { it.objectName == objectName }.mapTo(sortedSetOf()) { it.rootNodeId }
+
+    /** A joined query may reach many independent roots. A change relevant to one does
+     * not make every other complete root uncertain. Hidden dependencies remain explicit. */
+    fun dependencyBoundary(rootId: String): BehaviorDependencyBoundary? {
+        if (graph == null || graph.version != 1 || !graph.attachmentInventoryComplete || rootId !in graph.nodes) return null
+        return boundaryCache.getOrPut(rootId) {
+            val ids = closure(rootId)
+            val references = ids.flatMapTo(linkedSetOf()) { graph.nodes[it]?.references.orEmpty() }
+            BehaviorDependencyBoundary(ids.all { graph.nodes[it]?.dependenciesComplete == true }, ids, references)
+        }
+    }
 
     private data class Seed(
         val table: String, val operation: Operation, val columns: Set<String>, val writes: Set<String>,
@@ -161,6 +179,15 @@ class BehaviorScope(
                 val seed = seeds.removeFirst()
                 if (!visitedSeeds.add(seed)) continue
                 val table = snapshot.tables[seed.table]
+                if (seed.operation == Operation.SELECT && table == null &&
+                    (seed.table.startsWith("pg_catalog.") || seed.table.startsWith("information_schema."))) {
+                    // This is an actual SQL read, not a dependency on a language/type
+                    // implementation. Catalog row contents expose application DDL even when
+                    // the system relation definition is stable and baseline debt is accepted.
+                    uncertainty("catalog-relation:${seed.table}",
+                        "Observed system catalog relation ${seed.table} can expose application DDL beyond relation-local catalog dependencies.",
+                        seed.planning)
+                }
                 val backing = transparentViews[seed.table]
                 if (backing != null) seeds += seed.copy(table = backing)
                 attachments[seed.table].orEmpty().forEach { attachment ->

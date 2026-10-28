@@ -119,12 +119,29 @@ object CompatibilityViews {
     internal fun safeDefault(expression: String, type: String, snapshot: SchemaSnapshot): Boolean {
         if (RuleProofs.constantDefault(expression, type)) return true
         if (builtinType.matches(type) && Regex("NULL(?:::${Regex.escape(type)})?", RegexOption.IGNORE_CASE).matches(expression.trim())) return true
+        if (clockDefault(expression, type)) return true
         if (type !in integerTypes) return false
         val sequence = Regex("(?:pg_catalog\\.)?nextval\\('((?:[^']|'')*)'::(?:pg_catalog\\.)?regclass\\)")
             .matchEntire(expression.trim())?.groupValues?.get(1)?.replace("''", "'") ?: return false
         if (!Regex("$identifierPattern(?:\\.$identifierPattern)?").matches(sequence)) return false
         val parts = Regex(identifierPattern).findAll(sequence).map { identifierValue(it.value) }.toList()
         return (if (parts.size == 1) "public.${parts.single()}" else parts.joinToString(".")) in snapshot.sequences
+    }
+
+    /** SQL value functions and exact builtin zero-argument clocks have no relation-name
+     * lookup. Actual catalog dependencies still reject user overloads/custom codecs. This
+     * proves an unchanged default's dependency scope, not a constant value or new CHECK. */
+    internal fun clockDefault(expression: String, type: String): Boolean {
+        val sql = expression.trim().lowercase(java.util.Locale.ROOT)
+        val timestamp = Regex("timestamp(?:\\([0-6]\\))? (?:with|without) time zone").matches(type) || type == "timestamp"
+        val time = Regex("time(?:\\([0-6]\\))? (?:with|without) time zone").matches(type) || type == "time"
+        return when {
+            timestamp -> Regex("(?:current_timestamp|localtimestamp)(?:\\([0-6]\\))?").matches(sql) ||
+                Regex("(?:pg_catalog\\.)?(?:now|transaction_timestamp)\\(\\)").matches(sql)
+            time -> Regex("(?:current_time|localtime)(?:\\([0-6]\\))?").matches(sql)
+            type == "date" -> sql == "current_date"
+            else -> false
+        }
     }
 
     /** Positive fragments only: builtin scalar null checks, text literal comparisons, and integer arithmetic/comparisons. */

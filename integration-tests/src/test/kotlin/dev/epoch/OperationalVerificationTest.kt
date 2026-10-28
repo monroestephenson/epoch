@@ -68,6 +68,7 @@ class OperationalVerificationTest {
             ALTER TABLE accounts ADD CONSTRAINT accounts_positive CHECK (indexed >= 0);
             ALTER TABLE events ADD CONSTRAINT events_account FOREIGN KEY(account_id) REFERENCES accounts(id);
         """.trimIndent()), Step("""
+            SET LOCAL lock_timeout = '750ms';
             ALTER TABLE accounts ALTER COLUMN label SET NOT NULL;
             ALTER TABLE accounts ADD COLUMN after_reset text;
         """.trimIndent()), Step("""
@@ -100,11 +101,13 @@ class OperationalVerificationTest {
         assertRule(first.statements[5], "OP_CONSTRAINT_VALIDATION_BLOCKS_WRITES", OperationalVerdict.RISKY)
 
         val next = assessment(report, 1)
-        assertEquals(listOf(1, 2), next.statements.map { it.ordinal })
+        assertEquals(listOf(1, 2, 3), next.statements.map { it.ordinal })
         assertEquals(OperationalVerdict.SAFE, next.verdict, next.toString())
-        assertTrue(next.statements.first().findings.any { it.ruleId in setOf("OP_VALIDATED_NOT_NULL", "OP_METADATA_ONLY") }, next.toString())
-        assertTrue(next.statements.all { it.lockTimeoutBefore.milliseconds == 30_000L &&
-            it.lockTimeoutBefore.origin == OperationalTimeoutOrigin.VERIFIER }, next.toString())
+        assertTrue(next.statements[1].findings.any { it.ruleId in setOf("OP_VALIDATED_NOT_NULL", "OP_METADATA_ONLY") }, next.toString())
+        assertEquals(30_000L, next.statements.first().lockTimeoutBefore.milliseconds)
+        assertEquals(OperationalTimeoutOrigin.VERIFIER, next.statements.first().lockTimeoutBefore.origin)
+        assertTrue(next.statements.drop(1).all { it.lockTimeoutBefore.milliseconds == 750L &&
+            it.lockTimeoutBefore.origin == OperationalTimeoutOrigin.MIGRATION_LOCAL }, next.toString())
         val disabled = assessment(report, 2).statements[1]
         assertEquals(0L, disabled.lockTimeoutBefore.milliseconds)
         assertEquals(OperationalTimeoutOrigin.MIGRATION_LOCAL, disabled.lockTimeoutBefore.origin)
@@ -135,16 +138,17 @@ class OperationalVerificationTest {
         val add = "ALTER TABLE accounts ADD CONSTRAINT label_nn CHECK (label IS NOT NULL) NOT VALID;"
         val validate = "ALTER TABLE accounts VALIDATE CONSTRAINT label_nn;"
         val notNull = "ALTER TABLE accounts ALTER COLUMN label SET NOT NULL;"
-        val split = verify(baseline, Step(add), Step(validate), Step(notNull))
+        val timeout = "SET LOCAL lock_timeout='750ms';"
+        val split = verify(baseline, Step("$timeout\n$add"), Step("$timeout\n$validate"), Step("$timeout\n$notNull"))
         assertEquals(OperationalVerdict.SAFE, split.operationalVerdict, split.toString())
-        assertRule(assessment(split).statements.single(), "OP_DEFERRED_CONSTRAINT_VALIDATION", OperationalVerdict.SAFE)
-        val validation = assessment(split, 1).statements.single()
+        assertRule(assessment(split).statements.last(), "OP_DEFERRED_CONSTRAINT_VALIDATION", OperationalVerdict.SAFE)
+        val validation = assessment(split, 1).statements.last()
         assertRule(validation, "OP_NONBLOCKING_VALIDATION", OperationalVerdict.SAFE)
         assertTrue(validation.heldLocksBefore.none { it.relation == "public.accounts" && it.mode == "AccessExclusiveLock" }, validation.toString())
-        assertRule(assessment(split, 2).statements.single(), "OP_VALIDATED_NOT_NULL", OperationalVerdict.SAFE)
+        assertRule(assessment(split, 2).statements.last(), "OP_VALIDATED_NOT_NULL", OperationalVerdict.SAFE)
 
-        val grouped = verify(baseline, Step("$add\n$validate\n$notNull"))
-        val retained = assessment(grouped).statements[1]
+        val grouped = verify(baseline, Step("$timeout\n$add\n$validate\n$notNull"))
+        val retained = assessment(grouped).statements[2]
         assertRule(retained, "OP_VALIDATION_UNDER_RETAINED_LOCK", OperationalVerdict.RISKY)
         assertTrue(retained.heldLocksBefore.any { it.relation == "public.accounts" && it.mode == "AccessExclusiveLock" }, retained.toString())
         assertTrue(retained.heldLocksAfter.any { it.relation == "public.accounts" && it.mode == "AccessExclusiveLock" }, retained.toString())
@@ -199,12 +203,15 @@ class OperationalVerificationTest {
             Step("CREATE TABLE fresh_index (value integer); INSERT INTO fresh_index VALUES (1),(2); CREATE INDEX custom_ops ON fresh_index(value pg_catalog.epoch_int_ops);"))
         assertEquals(OperationalVerdict.UNKNOWN, assessment(report).verdict, report.toString())
         val cast = assessment(report, 2).statements.single()
-        assertEquals(OperationalVerdict.UNKNOWN, cast.verdict, cast.toString())
+        assertEquals(OperationalVerdict.RISKY, cast.verdict, cast.toString())
         assertTrue(cast.heldLocksAfter.any { it.relation == "public.control" && it.mode == "AccessExclusiveLock" }, cast.toString())
         assertTrue(cast.findings.any { it.ruleId == "OP_STATEMENT_UNSUPPORTED" }, cast.toString())
+        assertTrue(cast.findings.any { it.ruleId == "OP_WRITE_BLOCKING_LOCK" }, cast.toString())
         val index = assessment(report, 3).statements.last()
-        assertEquals(OperationalVerdict.UNKNOWN, index.verdict, index.toString())
+        assertEquals(OperationalVerdict.RISKY, index.verdict, index.toString())
         assertTrue(index.heldLocksAfter.any { it.relation == "public.control" && it.mode == "AccessExclusiveLock" }, index.toString())
+        assertTrue(index.findings.any { it.verdict == OperationalVerdict.UNKNOWN }, index.toString())
+        assertTrue(index.findings.any { it.ruleId == "OP_WRITE_BLOCKING_LOCK" }, index.toString())
     }
 
     @Test fun `new child FK validation cannot hide a retained write-blocking lock on an old parent`() {
@@ -261,10 +268,11 @@ class OperationalVerificationTest {
     @Test fun `Flyway preserves a dollar-quoted procedural statement as one unsupported operation`() {
         val report = verify("CREATE TABLE accounts (id bigint PRIMARY KEY);", Step("""
             DO ${'$'}${'$'} BEGIN PERFORM 1; PERFORM 2; END ${'$'}${'$'};
+            SET LOCAL lock_timeout = '750ms';
             ALTER TABLE accounts ADD COLUMN metadata text;
         """.trimIndent()))
         val measured = assessment(report)
-        assertEquals(listOf(1, 2), measured.statements.map { it.ordinal }, measured.toString())
+        assertEquals(listOf(1, 2, 3), measured.statements.map { it.ordinal }, measured.toString())
         val procedural = measured.statements.first()
         assertTrue(procedural.sql.trimStart().startsWith("DO "), procedural.toString())
         assertTrue("PERFORM 1; PERFORM 2;" in procedural.sql, procedural.toString())
@@ -281,7 +289,10 @@ class OperationalVerificationTest {
             Step("ALTER TABLE accounts ADD COLUMN metadata text;"))
         assertEquals(OperationalVerdict.SAFE, assessment(report).verdict, report.toString())
         assertTrue(assessment(report).findings.none { it.ruleId == "OP_DATABASE_CALLBACK_UNPROVEN" }, report.toString())
-        assertRule(assessment(report, 1).statements.single(), "OP_DATABASE_CALLBACK_UNPROVEN", OperationalVerdict.UNKNOWN)
+        val callback = assessment(report, 1).statements.single()
+        assertEquals(OperationalVerdict.RISKY, callback.verdict, callback.toString())
+        assertTrue(callback.findings.any { it.ruleId == "OP_DATABASE_CALLBACK_UNPROVEN" && it.verdict == OperationalVerdict.UNKNOWN })
+        assertTrue(callback.findings.any { it.ruleId == "OP_WRITE_BLOCKING_LOCK" && it.verdict == OperationalVerdict.RISKY })
     }
 
     @Test @Timeout(90)

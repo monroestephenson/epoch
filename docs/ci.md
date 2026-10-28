@@ -88,6 +88,19 @@ db-compat report --input artifacts/compatibility-report.json \
 
 An older saved report without operational fields returns 4 under that flag only after its compatibility policy passes. With `--new-contract`, all requested compatibility directions contribute first, while operational assessment comes solely from the actual forward migration sequence. Store JSON checkpoints and reports even on exit 4. `report --summary` shows operational rule counts; `--details` adds every retained statement and finding, timeout changes, held-after locks, and rewrites. JSON also retains before-statement and newly observed lock sets. Current SARIF exports compatibility findings only, so keep JSON for operational review. `lint` remains a separate static advisory command and does not satisfy the measured gate.
 
+`OP_WRITE_BLOCKING_LOCK` can make a structurally compatible metadata migration operationally RISKY. It uses actual old-table locks, including FK parents and retained dropped-table identities, or separately labeled required modes for catalog-confirmed supported commands when autocommit releases locks before sampling. Unsupported SQL can retain both measured RISKY evidence and UNKNOWN effects. Required modes are not fabricated lock samples.
+
+For supported ordinary metadata changes, configure acquisition protection in the migration itself:
+
+```sql
+SET LOCAL lock_timeout = '750ms';
+ALTER TABLE IF EXISTS accounts ADD COLUMN IF NOT EXISTS metadata text;
+```
+
+The positive authored timeout must precede the command and remain unchanged afterward; complete effects and absence of opaque callbacks are also required. `SET LOCAL` applies within its transaction; a nontransactional deployment needs deliberate session-scoped configuration. Literal lock-timeout settings do not themselves create structural uncertainty. Other settings, function calls and procedural effects retain their normal limits. Epoch's verifier-injected timeout does not count as migration-authored protection.
+
+This policy bounds acquisition waiting only. It does not limit lock hold duration or waive blocking scans, validation under retained locks, or rewrites. An existing-column no-op still acquires ALTER's lock. See the [operational proof boundaries](verification.md#operational-migration-assessment) before interpreting a SAFE metadata finding as an overall operational result.
+
 ## Table-size estimates
 
 `--table-sizes FILE` is optional metadata input for severity, and never supplies a database connection. Export estimates for the original baseline schema using your normal authorized read-only database workflow, then pass only the JSON file to Epoch. Epoch neither queries production nor interprets disposable fixture sizes as production volume.
@@ -170,7 +183,7 @@ Preserve this directory between trusted CI runs if desired. The cache must be ou
 
 Use `--planning-parallelism 4` to bound independent PostgreSQL planning workers. Baseline checks and already committed states can use separate connections. Checks within a transactional Flyway migration stay on its own connection so they see that migration's uncommitted DDL; opening worker connections there would check the wrong schema or block on migration locks.
 
-Each step computes its catalog changes once and retains the previous plans for unaffected complete dependencies. Incomplete SQL, hidden database behavior, and relevant constraint or type changes take the conservative re-check path. `replannedQueries` and `reusedQueries` show the work performed. A 10,000-statement contract with 100 statements affected per step needs 10,000 re-checks over 100 steps, rather than 1,000,000. Baseline contract-check caching is separate from the database dump cache and remains bound to the contract, baseline, catalog, and planner format.
+Each step computes its catalog changes once and retains the previous plans for unaffected complete dependencies. Incomplete SQL, hidden database behavior, and relevant constraint or type changes take the conservative re-check path. `replannedQueries` and `reusedQueries` show the work performed. A 10,000-statement contract with 100 statements affected per step needs 10,000 re-checks over 100 steps, rather than 1,000,000. Baseline contract-check caching is separate from the database dump cache and remains bound to the contract, baseline, catalog, and planner format. Graph/dependency-model changes invalidate older catalog and planning-cache formats instead of reusing obsolete proof inputs.
 
 Size CI from measured planning cost on the actual runner. For example, at 4 ms per statement, 10,000 serial checks cost about 40 seconds before startup, catalog inspection, and report output. Re-checking 100 statements adds roughly 0.4 seconds per transactional step at the same rate. These are arithmetic estimates, not latency promises. Start with 2–4 planning workers and leave memory and CPU for PostgreSQL as well as the JVM; increase the global timeout for large contracts. Do not multiply every migration by the entire contract size when dependencies are complete.
 
