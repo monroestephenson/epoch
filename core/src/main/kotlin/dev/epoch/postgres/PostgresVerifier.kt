@@ -170,7 +170,8 @@ class PostgresVerifier {
                                 val migration = MigrationInfo(info.version?.toString() ?: "repeatable", info.script)
                                 val after = catalog.inspect(context.connection)
                                 val effects = try {
-                                    MigrationClassifier().findings(Files.readString(Path.of(info.physicalLocation)), migration, priorSchema, after)
+                                    MigrationClassifier().findings(Files.readString(Path.of(info.physicalLocation)), migration, priorSchema, after,
+                                        CompatibilityViews.provenViewNames(baseline, after))
                                 } catch (failure: java.io.IOException) {
                                     listOf(Finding(Verdict.UNKNOWN, "MIGRATION_EFFECTS_UNAVAILABLE", migration.filename,
                                         "Could not read the exact migration resource for effect classification.",

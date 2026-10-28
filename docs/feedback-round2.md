@@ -6,7 +6,7 @@ This iteration addresses the second feedback report, which was based on syntheti
 
 PostgreSQL planning determines whether a concrete old SQL statement is structurally accepted. Catalog rules additionally inspect accepted inputs, generated values, result mappings, and database behavior. A successful `PREPARE` does not prove that a new constraint accepts all old inputs, or that a compatibility view preserves all behavior.
 
-Views are present in the relation catalog. Replacing a table with a view no longer produces a false missing-table `BREAKING` finding when PostgreSQL accepts the old SQL. View definition and relation-kind changes remain `UNKNOWN` unless their behavior falls within a supported proof.
+Views are present in the relation catalog. Replacing a table with a view no longer produces a false missing-table `BREAKING` finding when PostgreSQL accepts the old SQL. A full direct projection of the original renamed table can now receive `SAFE` under the [transparent-view proof](verification.md#compatibility-views); other view changes remain `UNKNOWN` unless a concrete incompatibility is established.
 
 Input-domain rules use explicit mapped nullability, length, precision/scale, and supported enum database values. A concrete counterexample requires that the baseline accepted that input. Existing CHECK/domain restrictions that make this implication uncertain prevent an unsupported proof. Unsupported expressions remain `UNKNOWN`.
 

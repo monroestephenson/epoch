@@ -7,21 +7,47 @@ import java.sql.ResultSet
 /** Reads PostgreSQL's catalogs; migration text is never the source of schema truth. */
 class PostgresCatalog {
     fun inspect(connection: Connection): SchemaSnapshot {
+        var expressionSearchPath = emptyList<String>()
+        connection.rows("SELECT current_schemas(true) AS schemas") { expressionSearchPath = it.strings("schemas") }
         val tables = sortedMapOf<String, TableSchema>()
         connection.rows("""
-            SELECT n.nspname || '.' || c.relname AS name, c.relkind
+            SELECT n.nspname || '.' || c.relname AS name, c.relkind, c.oid AS relation_oid,
+                   pg_get_userbyid(c.relowner) AS owner,
+                   c.relacl IS NOT NULL OR EXISTS (
+                       SELECT 1 FROM pg_attribute a WHERE a.attrelid=c.oid AND a.attnum > 0
+                         AND NOT a.attisdropped AND a.attacl IS NOT NULL
+                   ) AS explicit_privileges,
+                   c.relrowsecurity OR c.relforcerowsecurity AS row_security,
+                   EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgrelid=c.oid AND NOT t.tgisinternal) AS user_triggers,
+                   EXISTS (SELECT 1 FROM pg_rewrite r WHERE r.ev_class=c.oid AND r.rulename <> '_RETURN') AS user_rules,
+                   c.relispartition OR c.relkind='p' OR EXISTS (
+                       SELECT 1 FROM pg_inherits i WHERE i.inhrelid=c.oid OR i.inhparent=c.oid
+                   ) AS inheritance
             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
             WHERE c.relkind IN ('r','p','v','m') AND n.nspname NOT LIKE 'pg_%'
               AND n.nspname <> 'information_schema' AND c.relname <> 'flyway_schema_history'
             ORDER BY 1
-        """) { tables[it.getString("name")] = TableSchema(kind = when (it.getString("relkind")) { "v" -> "view"; "m" -> "materialized_view"; else -> "table" }) }
+        """) { row ->
+            tables[row.getString("name")] = TableSchema(
+                kind = when (row.getString("relkind")) { "v" -> "view"; "m" -> "materialized_view"; else -> "table" },
+                relationOid = row.getLong("relation_oid"),
+                relationSecurity = RelationSecurity(
+                    owner = row.getString("owner"), explicitPrivileges = row.getBoolean("explicit_privileges"),
+                    rowSecurity = row.getBoolean("row_security"), userTriggers = row.getBoolean("user_triggers"),
+                    userRules = row.getBoolean("user_rules"), inheritance = row.getBoolean("inheritance"),
+                ),
+            )
+        }
         connection.rows("""
             SELECT n.nspname || '.' || c.relname AS table_name, a.attname,
                    format_type(a.atttypid,a.atttypmod) AS type, a.attnotnull, row_number() OVER (PARTITION BY c.oid ORDER BY a.attnum) AS attnum,
-                   pg_get_expr(d.adbin,d.adrelid) AS default_expr, a.attidentity, a.attgenerated
+                   pg_get_expr(d.adbin,d.adrelid) AS default_expr, a.attidentity, a.attgenerated,
+                   cn.nspname || '.' || coll.collname AS collation
             FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
             JOIN pg_attribute a ON a.attrelid=c.oid
             LEFT JOIN pg_attrdef d ON d.adrelid=c.oid AND d.adnum=a.attnum
+            LEFT JOIN pg_collation coll ON coll.oid=a.attcollation
+            LEFT JOIN pg_namespace cn ON cn.oid=coll.collnamespace
             WHERE c.relkind IN ('r','p','v','m') AND a.attnum > 0 AND NOT a.attisdropped
               AND n.nspname NOT LIKE 'pg_%' AND n.nspname <> 'information_schema'
             ORDER BY 1,a.attnum
@@ -33,7 +59,45 @@ class PostgresCatalog {
                 defaultExpression = row.getString("default_expr"), ordinal = row.getInt("attnum"),
                 identity = row.getString("attidentity").takeIf { it.isNotEmpty() },
                 generated = row.getString("attgenerated").takeIf { it.isNotEmpty() },
+                collation = row.getString("collation"),
             )))
+        }
+        connection.rows("""
+            SELECT n.nspname || '.' || c.relname AS name, pg_get_viewdef(c.oid,true) AS definition,
+                   pg_relation_is_updatable(c.oid,false) AS updatable,
+                   pg_relation_is_updatable(c.oid,true) AS updatable_with_triggers,
+                   ARRAY(SELECT a.attname FROM pg_attribute a
+                         WHERE a.attrelid=c.oid AND a.attnum > 0 AND NOT a.attisdropped
+                           AND pg_column_is_updatable(c.oid,a.attnum,false) ORDER BY a.attnum) AS updatable_columns,
+                   ARRAY(SELECT a.attname FROM pg_attribute a
+                         WHERE a.attrelid=c.oid AND a.attnum > 0 AND NOT a.attisdropped
+                           AND pg_column_is_updatable(c.oid,a.attnum,true) ORDER BY a.attnum) AS trigger_updatable_columns,
+                   ARRAY(SELECT DISTINCT bn.nspname || '.' || b.relname
+                         FROM pg_rewrite r JOIN pg_depend d ON d.classid='pg_rewrite'::regclass AND d.objid=r.oid
+                         JOIN pg_class b ON d.refclassid='pg_class'::regclass AND b.oid=d.refobjid
+                         JOIN pg_namespace bn ON bn.oid=b.relnamespace
+                         WHERE r.ev_class=c.oid AND r.rulename='_RETURN' AND b.oid <> c.oid
+                           AND b.relkind IN ('r','p','v','m') ORDER BY 1) AS backing_relations,
+                   c.reloptions
+            FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+            WHERE c.relkind='v' AND n.nspname NOT LIKE 'pg_%' AND n.nspname <> 'information_schema'
+            ORDER BY 1
+        """) { row ->
+            val name = row.getString("name")
+            val table = tables[name] ?: return@rows
+            val definition = row.getString("definition")
+            val backingName = row.strings("backing_relations").singleOrNull()
+            val backing = backingName?.let(tables::get)
+            tables[name] = table.copy(view = ViewSchema(
+                definition = definition,
+                updatableMask = row.getInt("updatable"),
+                updatableMaskWithTriggers = row.getInt("updatable_with_triggers"),
+                updatableColumns = row.strings("updatable_columns").toSet(),
+                updatableColumnsWithTriggers = row.strings("trigger_updatable_columns").toSet(),
+                backingTable = backingName,
+                completeDirectProjection = backingName != null && backing != null && DirectViewProjection.complete(definition, backingName, table, backing),
+                options = row.strings("reloptions").sorted(),
+            ))
         }
         connection.rows("""
             SELECT n.nspname || '.' || c.relname AS table_name, co.conname, co.contype,
@@ -191,7 +255,7 @@ class PostgresCatalog {
             extensions[it.getString(1)] = it.getString(2)
         }
         return SchemaSnapshot(tables = tables, behaviors = behaviors, sequences = sequences, extensions = extensions,
-            sequenceOwners = sequenceOwners, enumTypes = enumTypes)
+            sequenceOwners = sequenceOwners, enumTypes = enumTypes, expressionSearchPath = expressionSearchPath)
     }
 }
 

@@ -8,6 +8,8 @@ import net.sf.jsqlparser.statement.alter.AlterExpression
 import net.sf.jsqlparser.statement.alter.AlterOperation
 import net.sf.jsqlparser.statement.create.index.CreateIndex
 import net.sf.jsqlparser.statement.create.table.CreateTable
+import net.sf.jsqlparser.statement.create.view.CreateView
+import net.sf.jsqlparser.statement.create.view.TemporaryOption
 import net.sf.jsqlparser.statement.drop.Drop
 import org.postgresql.core.Parser
 
@@ -16,6 +18,7 @@ class MigrationClassifier {
     fun findings(
         sql: String, migration: MigrationInfo,
         before: SchemaSnapshot? = null, after: SchemaSnapshot? = null,
+        provenCompatibilityViews: Set<String> = emptySet(),
     ): List<Finding> = try {
         // PostgreSQL's lexer handles dollar quotes, comments and semicolons inside literals.
         val statements = Parser.parseJdbcSql(sql, true, false, true, false, false)
@@ -36,6 +39,8 @@ class MigrationClassifier {
                     }
                     is CreateIndex -> true
                     is CreateTable -> statement.select == null
+                    is CreateView -> !statement.isMaterialized && statement.temporary == TemporaryOption.NONE &&
+                        tableName(statement.view) in provenCompatibilityViews
                     is Drop -> when (statement.type.uppercase()) {
                         "INDEX" -> true
                         // A dropped table that remains absent is represented by its catalog delta.

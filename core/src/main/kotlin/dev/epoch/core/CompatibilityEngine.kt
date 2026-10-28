@@ -12,7 +12,11 @@ class CompatibilityEngine {
         after: SchemaSnapshot,
         migration: MigrationInfo,
         additionalFindings: List<Finding> = emptyList(),
-    ): MigrationReport = verifyNormalized(normalizeIdentifiers(contract), baseline, after, migration, additionalFindings)
+    ): MigrationReport {
+        val normalized = CompatibilityViews.normalize(baseline, after)
+        return verifyNormalized(normalizeIdentifiers(contract), baseline, normalized.after, migration,
+            additionalFindings, normalized.provenViews, after)
+    }
 
     private fun verifyNormalized(
         contract: DatabaseContract,
@@ -20,6 +24,8 @@ class CompatibilityEngine {
         after: SchemaSnapshot,
         migration: MigrationInfo,
         additionalFindings: List<Finding> = emptyList(),
+        provenViews: Map<String, String> = emptyMap(),
+        rawAfter: SchemaSnapshot = after,
     ): MigrationReport {
         val findings = additionalFindings.map { it.copy(migration = migration) }.toMutableList()
         fun finding(verdict: Verdict, rule: String, objectName: String, message: String,
@@ -131,6 +137,53 @@ class CompatibilityEngine {
         val allWriteIds = contract.entities.filter { it.operations.any { op -> op != Operation.SELECT } }.map { it.id } +
             contract.queries.filter { it.operation != Operation.SELECT }.map { it.id }
 
+        provenViews.forEach { (name, backing) ->
+            finding(Verdict.SAFE, "TRANSPARENT_COMPATIBILITY_VIEW", name,
+                "The old relation name exposes the same backing table through a transparent, automatically writable view.",
+                "Complete ordered direct projection from $backing; original table identity retained; owners agree; no explicit privileges, row security, user triggers/rules, inheritance, view options, or view default overrides. Backing columns, defaults, generators, constraints and indexes remain subject to the ordinary delta rules.",
+                tableIds(name))
+        }
+        if (provenViews.isNotEmpty()) {
+            val relationNames = provenViews.entries.associate { (old, backing) -> backing to old }
+            (CompatibilityViews.expressionRisks(baseline) + CompatibilityViews.expressionRisks(rawAfter, relationNames))
+                .distinct().sortedWith(compareBy({ it.objectName }, { it.kind }, { it.expression })).forEach { risk ->
+                    unknown("RELATION_RENAME_EXPRESSION_UNPROVEN", risk.objectName,
+                        "A stored expression may observe the table rename and change old reads or writes despite successful planning.",
+                        "Unmodeled ${risk.kind} expression: ${risk.expression}; renamed relations: ${provenViews.toSortedMap()}. PREPARE does not evaluate row expressions, including expressions stored on other tables.",
+                        tableIds(risk.table))
+                }
+        }
+        rawAfter.tables.toSortedMap().forEach { (name, table) ->
+            val view = table.view ?: return@forEach
+            if (table.kind != "view" || baseline.tables[name]?.kind != "table") return@forEach
+            for ((operation, bit) in listOf(Operation.INSERT to 8, Operation.UPDATE to 4, Operation.DELETE to 16)) {
+                val entities = contract.entities.filter { it.table == name && operation in it.operations && it.id in validBaselineIds }
+                val queries = contract.queries.filter { queryTarget(it) == name && it.operation == operation && it.id in validBaselineIds }
+                val ids = entities.map { it.id } + queries.map { it.id }
+                if (ids.isEmpty()) continue
+                if (view.updatableMaskWithTriggers and bit == 0) {
+                    finding(Verdict.BREAKING, "VIEW_WRITE_UNSUPPORTED", name,
+                        "The replacement view rejects a previously valid $operation operation.",
+                        "PostgreSQL pg_relation_is_updatable reports $operation unsupported even with trigger support; automatic mask=${view.updatableMask}; mask with triggers=${view.updatableMaskWithTriggers}; required bit=$bit.",
+                        ids, "Keep an automatically writable compatibility view for the old write operation until old application versions are retired.")
+                    continue
+                }
+                if (operation == Operation.DELETE) continue
+                val columns = (entities.flatMap { entity -> entity.columns.filter { column ->
+                    if (operation == Operation.INSERT) column.insertable && (!column.generated || entity.identifierSequence != null)
+                    else column.updatable
+                }.map { it.name } } + queries.flatMap { it.writeColumns.map { column -> column.column } }).distinct().sorted()
+                columns.filter { it in table.columns && it !in view.updatableColumnsWithTriggers }.forEach { column ->
+                    val writers = entities.filter { entity -> entity.columns.any {
+                        it.name == column && if (operation == Operation.INSERT) it.insertable && (!it.generated || entity.identifierSequence != null) else it.updatable
+                    } }.map { it.id } + queries.filter { query -> query.writeColumns.any { it.column == column } }.map { it.id }
+                    unknown("VIEW_COLUMN_WRITE_UNPROVEN", "$name.$column",
+                        "PostgreSQL does not establish this view column as writable for the old $operation.",
+                        "pg_column_is_updatable is false even with trigger support. DEFAULT assignments can still be accepted; a known non-DEFAULT assignment or PostgreSQL planning failure is required to prove breakage.", writers)
+                }
+            }
+        }
+
         fun writesColumn(entity: EntityContract, column: ColumnContract) =
             (Operation.INSERT in entity.operations && column.insertable && !column.generated) ||
                 (Operation.UPDATE in entity.operations && column.updatable)
@@ -240,6 +293,11 @@ class CompatibilityEngine {
                     val writers = columnWriters(tableName, columnName).filter { it in validBaselineIds }
                     val mapped = contract.entities.filter { it.table == tableName && it.id in validBaselineIds }
                         .flatMap { entity -> entity.columns.filter { it.name == columnName && writesColumn(entity, it) }.map { entity.id to it } }
+                    if (a.collation != b.collation && (columnReferences.isNotEmpty() || writeIds(tableName).isNotEmpty())) unknown(
+                        "COLUMN_COLLATION_CHANGED", objectName,
+                        "Changed collation may alter comparisons, ordering, and uniqueness for old operations.",
+                        "Baseline collation=${a.collation}; target collation=${b.collation}; unchanged SQL types do not establish equivalent collation semantics.",
+                        columnReferences + writers)
                     if (a.type != b.type && (columnReferences.isNotEmpty() || writeIds(tableName).isNotEmpty())) {
                         val narrowed = if (new.kind == "table" && unconstrainedInput(old, columnName)) mapped.mapNotNull { (id, column) ->
                             RuleProofs.mappedNarrowing(column, a.type, b.type)?.let { id to it }
@@ -359,10 +417,12 @@ class CompatibilityEngine {
             val b = after.behaviors[name]
             if (a != b) unknown("DATABASE_BEHAVIOR_CHANGED", name, "Database-side behavior is outside the supported equivalence model.", "Baseline=$a; target=$b.")
         }
-        if (baseline.behaviors.isNotEmpty() && baseline != after) {
-            val changed = (baseline.tables.keys + after.tables.keys).filter { baseline.tables[it] != after.tables[it] }.sorted() +
-                (baseline.sequences.keys + after.sequences.keys).filter { baseline.sequences[it] != after.sequences[it] }.sorted() +
-                (baseline.enumTypes.keys + after.enumTypes.keys).filter { baseline.enumTypes[it] != after.enumTypes[it] }.sorted()
+        if (baseline.behaviors.isNotEmpty() && baseline != rawAfter) {
+            // A transparent view preserves the supported structural contract, but arbitrary
+            // preexisting code can still observe the real relation name or kind change.
+            val changed = (baseline.tables.keys + rawAfter.tables.keys).filter { baseline.tables[it] != rawAfter.tables[it] }.sorted() +
+                (baseline.sequences.keys + rawAfter.sequences.keys).filter { baseline.sequences[it] != rawAfter.sequences[it] }.sorted() +
+                (baseline.enumTypes.keys + rawAfter.enumTypes.keys).filter { baseline.enumTypes[it] != rawAfter.enumTypes[it] }.sorted()
             if (changed.isNotEmpty()) unknown("DATABASE_BEHAVIOR_DEPENDENCY_UNPROVEN", "database",
                 "New catalog changes can affect preexisting database-side behavior; accepting baseline health does not prove this interaction safe.",
                 "Changed objects: ${changed.distinct().joinToString()}; unanalyzed behavior: ${baseline.behaviors.keys.sorted().joinToString()}")
@@ -497,7 +557,9 @@ class CompatibilityEngine {
 
         private fun severity(verdict: Verdict) = when (verdict) { Verdict.BREAKING -> 0; Verdict.UNKNOWN -> 1; Verdict.SAFE -> 2 }
         private fun unknownMitigation(rule: String): String = when {
+            rule == "RELATION_RENAME_EXPRESSION_UNPROVEN" -> "Preserve relation-name-dependent expression behavior or verify the stored default, CHECK, generated expression, and index behavior with old operations on every affected table."
             rule.contains("COVERAGE") || rule.contains("QUERY") -> "Supply complete SQL templates, parameter/result types, and exhaustive variants for the affected access paths."
+            rule.contains("COLLATION") -> "Preserve the old column collation or verify equivalent comparison, ordering, and uniqueness behavior for the declared operations."
             rule.contains("TYPE") || rule.contains("NULLABILITY") -> "Declare the old input bounds and result mappings, then verify their inclusion in the target type and hydration domain."
             rule.contains("CONSTRAINT") || rule.contains("INDEX") -> "Provide accepted input constraints or a supported implication proof; replay a baseline-accepted counterexample to demonstrate breakage."
             rule.contains("BEHAVIOR") || rule.contains("RELATION") -> "Verify the affected view, trigger, function, or policy semantics explicitly; successful planning alone does not establish equivalence."

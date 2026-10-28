@@ -69,4 +69,33 @@ class MigrationClassifierTest {
         assertTrue(classifier.findings("ALTER TYPE status RENAME VALUE 'OLD' TO 'NEW'", migration, before, renamed).isEmpty())
         assertFalse(classifier.findings("ALTER TYPE status ADD VALUE 'NEW'", migration, before, renamed).isEmpty())
     }
+
+    @Test fun `create view is supported only for the catalog proven old relation name`() {
+        val classifier = MigrationClassifier()
+        val sql = "ALTER TABLE customer RENAME TO customer_archive; CREATE VIEW customer AS SELECT * FROM customer_archive"
+        assertTrue(classifier.findings(sql, migration, baseline, baseline, setOf("public.customer")).isEmpty())
+        assertTrue(classifier.findings(sql, migration, baseline, baseline).any { it.ruleId == "UNSUPPORTED_MIGRATION_EFFECT" })
+        assertTrue(classifier.findings("CREATE VIEW other AS SELECT * FROM customer_archive", migration,
+            baseline, baseline, setOf("public.customer")).any { it.ruleId == "UNSUPPORTED_MIGRATION_EFFECT" })
+        assertFalse(classifier.findings("CREATE MATERIALIZED VIEW customer AS SELECT * FROM customer_archive", migration,
+            baseline, baseline, setOf("public.customer")).isEmpty())
+        assertFalse(classifier.findings("CREATE TEMP VIEW customer AS SELECT * FROM customer_archive", migration,
+            baseline, baseline, setOf("public.customer")).isEmpty())
+    }
+
+    @Test fun `proven compatibility view never waives unrelated data statements`() {
+        val findings = MigrationClassifier().findings(
+            "ALTER TABLE customer RENAME TO customer_archive; CREATE VIEW customer AS SELECT * FROM customer_archive; UPDATE customer_archive SET name = 'changed'",
+            migration, baseline, baseline, setOf("public.customer"))
+        assertEquals(1, findings.size)
+        assertEquals("UNSUPPORTED_MIGRATION_EFFECT", findings.single().ruleId)
+        assertTrue(findings.single().evidence.contains("Update"))
+    }
+
+    @Test fun `proven quoted view names retain PostgreSQL identity semantics`() {
+        assertTrue(MigrationClassifier().findings("CREATE VIEW \"Customer\" AS SELECT * FROM customer_archive", migration,
+            baseline, baseline, setOf("public.Customer")).isEmpty())
+        assertFalse(MigrationClassifier().findings("CREATE VIEW \"Customer\" AS SELECT * FROM customer_archive", migration,
+            baseline, baseline, setOf("public.customer")).isEmpty())
+    }
 }

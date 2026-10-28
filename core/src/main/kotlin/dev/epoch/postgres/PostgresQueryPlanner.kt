@@ -4,6 +4,8 @@ import dev.epoch.core.*
 import org.postgresql.core.Parser
 import java.sql.Connection
 import java.sql.SQLException
+import java.sql.ResultSetMetaData
+import java.sql.Types
 import java.sql.SQLNonTransientConnectionException
 import java.sql.SQLRecoverableException
 import java.sql.SQLTransientConnectionException
@@ -171,12 +173,15 @@ internal class PostgresQueryPlanner {
                 val metadata = statement.metaData
                 if (metadata == null) emptyList() else (1..metadata.columnCount).map { column ->
                     ResultColumn(metadata.getColumnLabel(column),
-                        canonicalType(connection, metadata.getColumnTypeName(column)) ?: metadata.getColumnTypeName(column))
+                        resultType(connection, metadata, column))
                 }
             }
-            if (query.resultColumns.isNotEmpty()) {
+            // Declarations are resolved once at baseline. Later checks compare Describe's
+            // actual signature with that accepted baseline, so adding a same-named type
+            // cannot reinterpret an old declaration such as the JDBC "serial" alias.
+            if (query.resultColumns.isNotEmpty() && baselineParameterTypes == null) {
                 val expected = query.resultColumns.map { column ->
-                    column.copy(typeName = column.typeName?.let { canonicalType(connection, it) ?: it })
+                    column.copy(typeName = column.typeName?.let { canonicalResultType(connection, it) })
                 }
                 val matches = expected.size == results.size && expected.zip(results).all { (want, actual) ->
                     want.name == actual.name && (want.typeName == null || want.typeName == actual.typeName)
@@ -292,6 +297,30 @@ internal class PostgresQueryPlanner {
         listOf(query.id), migration = null,
         mitigation = "Supply a matching baseline and complete PostgreSQL parameter types using JDBC ? placeholders.",
     )
+
+    private fun resultType(connection: Connection, metadata: ResultSetMetaData, column: Int): String {
+        val reported = metadata.getColumnTypeName(column)
+        // PostgreSQL JDBC decorates integer result types as serial when the base column
+        // generates values. Views lose that decoration while retaining the same wire type.
+        // Require both the JDBC storage type and generation fact so a custom type with a
+        // serial-like name is not silently treated as a built-in integer.
+        val storage = when (metadata.getColumnType(column)) {
+            Types.SMALLINT -> "smallint".takeIf { reported == "smallserial" }
+            Types.INTEGER -> "integer".takeIf { reported == "serial" }
+            Types.BIGINT -> "bigint".takeIf { reported == "bigserial" }
+            else -> null
+        }
+        val physical = if (storage != null && metadata.isAutoIncrement(column)) storage else reported
+        return canonicalType(connection, physical) ?: physical
+    }
+
+    private fun canonicalResultType(connection: Connection, type: String): String =
+        canonicalType(connection, type) ?: when (type.lowercase()) {
+            "smallserial", "serial2" -> "smallint"
+            "serial", "serial4" -> "integer"
+            "bigserial", "serial8" -> "bigint"
+            else -> type
+        }
 
     private fun canonicalType(connection: Connection, type: String): String? {
         val cache = batchTypeCache

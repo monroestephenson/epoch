@@ -44,12 +44,20 @@ class VerificationRefinementTest {
         "Account", "public.accounts", listOf(ColumnContract("id", "bigint", nullable = false), column), operations,
     )
 
-    @Test fun `compatibility view does not fabricate a missing-table breaking finding`() {
+    @Test fun `transparent compatibility view preserves all four old CRUD operations`() {
+        val update = QueryContract("Account.update", Operation.UPDATE, "UPDATE accounts SET label = ? WHERE id = ?",
+            tables = listOf("public.accounts"), columns = listOf("id", "label").map { ColumnReference("public.accounts", it) },
+            writeColumns = listOf(ColumnReference("public.accounts", "label")), parameterTypes = listOf("text", "bigint"),
+            dependenciesComplete = true, targetTable = "public.accounts")
+        val delete = QueryContract("Account.delete", Operation.DELETE, "DELETE FROM accounts WHERE id = ?",
+            tables = listOf("public.accounts"), columns = listOf(ColumnReference("public.accounts", "id")),
+            parameterTypes = listOf("bigint"), dependenciesComplete = true, targetTable = "public.accounts")
         val report = verify("CREATE TABLE accounts (id bigint PRIMARY KEY, label text);",
-            contract(read("id", "label"), insert()),
-            "ALTER TABLE accounts RENAME TO accounts_v2; CREATE VIEW accounts AS SELECT id, label FROM accounts_v2;",
+            contract(read("id", "label"), insert(), update, delete),
+            "ALTER TABLE accounts RENAME TO accounts_v2; CREATE VIEW accounts AS SELECT * FROM accounts_v2;",
         )
-        assertEquals(Verdict.UNKNOWN, report.verdict, report.toString())
+        assertEquals(Verdict.SAFE, report.verdict, report.toString())
+        assertTrue(report.migrations.single().findings.any { it.ruleId == "TRANSPARENT_COMPATIBILITY_VIEW" }, report.toString())
         assertFalse(report.migrations.flatMap { it.findings }.any { it.verdict == Verdict.BREAKING }, report.toString())
         assertFalse(report.migrations.flatMap { it.findings }.any { it.ruleId == "POSTGRES_SQL_REJECTED" }, report.toString())
     }
@@ -68,9 +76,10 @@ class VerificationRefinementTest {
             INSERT INTO accounts (label) VALUES ('actual-old-insert');
             DELETE FROM accounts WHERE label = 'actual-old-insert';
         """.trimIndent())
-        // PostgreSQL actually executes the old INSERT above. View catalog columns
-        // do not expose the backing identity/default even though writes use them.
+        // PostgreSQL executes the old INSERT, and the view preserves its generation/defaults.
+        // The migration's actual DML still requires separate behavioral verification.
         assertEquals(Verdict.UNKNOWN, report.verdict, report.toString())
+        assertTrue(report.migrations.flatMap { it.findings }.any { it.ruleId == "UNSUPPORTED_MIGRATION_EFFECT" }, report.toString())
         assertTrue(report.migrations.flatMap { it.findings }.none { it.verdict == Verdict.BREAKING }, report.toString())
         assertTrue(report.migrations.flatMap { it.findings }.none { it.ruleId == "POSTGRES_SQL_REJECTED" }, report.toString())
     }

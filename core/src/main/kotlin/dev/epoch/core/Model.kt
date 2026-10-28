@@ -1,5 +1,7 @@
 package dev.epoch.core
 
+import com.fasterxml.jackson.annotation.JsonIgnore
+
 /** Versioned, factual coverage of a declared SQL contract, never a whole application proof. */
 data class DatabaseContract(
     val schemaVersion: Int = 1,
@@ -87,6 +89,8 @@ data class SchemaSnapshot(
     val extensions: Map<String, String> = emptyMap(),
     val sequenceOwners: Map<String, ColumnReference> = emptyMap(),
     val enumTypes: Map<String, List<String>> = emptyMap(),
+    /** Actual current_schemas(true), including implicit schemas, for interpreting deparsed expressions. */
+    val expressionSearchPath: List<String> = emptyList(),
 )
 
 data class TableSchema(
@@ -98,6 +102,34 @@ data class TableSchema(
     val plainIndexes: Set<String> = emptySet(),
     val indexColumns: Map<String, List<String>> = emptyMap(),
     val indexMethods: Map<String, String> = emptyMap(),
+    val view: ViewSchema? = null,
+    val relationSecurity: RelationSecurity? = null,
+    /** Live-database identity for rename proofs; never a portable catalog or fingerprint fact. */
+    @get:JsonIgnore val relationOid: Long? = null,
+)
+
+/** Conservative guards for proving a compatibility view without a full permission model. */
+data class RelationSecurity(
+    val owner: String,
+    /** Includes explicit relation privileges and explicit privileges on any live column. */
+    val explicitPrivileges: Boolean,
+    val rowSecurity: Boolean,
+    val userTriggers: Boolean,
+    val userRules: Boolean,
+    val inheritance: Boolean = false,
+)
+
+/** PostgreSQL capability bits are UPDATE=4, INSERT=8 and DELETE=16. */
+data class ViewSchema(
+    val definition: String,
+    val updatableMask: Int,
+    val updatableMaskWithTriggers: Int,
+    val updatableColumns: Set<String>,
+    val updatableColumnsWithTriggers: Set<String>,
+    val backingTable: String? = null,
+    /** Definition shape only; identity, permissions and behavior need separate proof. */
+    val completeDirectProjection: Boolean = false,
+    val options: List<String> = emptyList(),
 )
 
 data class ColumnSchema(
@@ -107,6 +139,8 @@ data class ColumnSchema(
     val identity: String? = null,
     val generated: String? = null,
     val ordinal: Int = 0,
+    /** Stable schema-qualified collation name; null for non-collatable types. */
+    val collation: String? = null,
 )
 
 data class ConstraintSchema(
