@@ -1,5 +1,7 @@
 # Descriptors and database contracts
 
+`db-compat descriptors` can generate per-unit inputs from supported Quarkus properties or standard `persistence.xml`; see [persistence-unit descriptors](persistence-unit-descriptors.md). Configuration completeness is separate from query coverage, and unsupported settings remain explicit extraction debt.
+
 ## Extraction descriptor
 
 `extract` consumes an `ExtractionRequest` JSON document and loads already compiled application classes. It discovers annotated entities and inventories supported repository/database call sites in compiled Java/Kotlin bytecode. It does not compile or start the application. Discovery defaults on; unsupported or dynamic access paths remain unresolved.

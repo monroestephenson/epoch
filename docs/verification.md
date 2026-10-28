@@ -22,6 +22,8 @@ Literal `SET [LOCAL|SESSION] lock_timeout` statements change migration acquisiti
 
 Reports place preexisting problems in `baseline.findings` with `migration: null`; they are not repeated for every pending migration. The overall compatibility verdict still includes baseline health. A reviewed accepted-baseline policy can change the separate migration gate, but it does not turn unproven compatibility into proof.
 
+For multiple persistence units, [configuration-derived descriptors](persistence-unit-descriptors.md) preserve each unit's entity inventory and supported mapping settings. Combine their extracted contracts only when they share the database represented by the supplied baseline; descriptor generation does not establish database topology or repository ownership.
+
 The baseline must reproduce the schema against which the old contract was valid. A mapping or query that was already invalid at baseline cannot support a `SAFE` conclusion. The disposable database starts without a copy of production data; data-specific failures and effects require separate tests with representative data.
 
 ## Verdicts

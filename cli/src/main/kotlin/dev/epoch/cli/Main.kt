@@ -21,7 +21,7 @@ internal val json by lazy { jacksonObjectMapper().enable(SerializationFeature.IN
 
 @Command(name = "db-compat", mixinStandardHelpOptions = true, version = ["epoch 0.3.0-SNAPSHOT"],
     description = ["Deterministic PostgreSQL compatibility checks for an explicit Hibernate SQL contract."],
-    subcommands = [Extract::class, Verify::class, VerifyRelease::class, Report::class, Lint::class])
+    subcommands = [Extract::class, Verify::class, VerifyRelease::class, Report::class, Lint::class, Descriptors::class])
 class Main : Runnable {
     @Option(names = ["-v", "--verbose"], scope = CommandLine.ScopeType.INHERIT,
         description = ["Enable library INFO logs and full error stack traces (default: quiet libraries, concise failures)"])

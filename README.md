@@ -70,6 +70,8 @@ Read [the descriptor and contract format](docs/contracts.md), [verification boun
 
 Reports separate preexisting baseline health from findings introduced by migrations. Default terminal output includes per-rule counts and limits individual details; use `report --summary` or `report --details` to choose the level of detail. Existing baseline findings have no pending-migration attribution.
 
+Generate per-unit extraction inputs with `db-compat descriptors --quarkus-properties application.properties --classpath build/classes/kotlin/main --output-directory generated-descriptors`, or use `--persistence-xml`. Supply the complete runtime classpath using repeated `--classpath`; [the configuration guide](docs/persistence-unit-descriptors.md) documents profiles, supported settings and unresolved configuration.
+
 For several persistence units sharing one database, repeat `--contract`. The baseline is constructed once. Add `--baseline-cache DIR` to reuse a checksummed baseline dump across runs; every run still uses a fresh disposable PostgreSQL container.
 
 ```sh
