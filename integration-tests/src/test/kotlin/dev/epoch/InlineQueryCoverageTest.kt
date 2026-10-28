@@ -2,6 +2,7 @@ package dev.epoch
 
 import dev.epoch.core.AccessPathStatus
 import dev.epoch.core.ColumnReference
+import dev.epoch.core.DatabaseApiRole
 import dev.epoch.core.Verdict
 import dev.epoch.hibernate.ExtractionRequest
 import dev.epoch.hibernate.HibernateExtractor
@@ -47,13 +48,32 @@ class InlineQueryCoverageTest {
             repositoryPackages = listOf("dev.epoch.inlinefixture"),
             applicationVersion = "inline-query-fixture",
         ))
-        val fixedMethods = listOf("inlineHql", "inlineNative", "annotationDeclared", "multiline",
-            "marginLiteral", "defaultMarginLiteral", "shorthand")
-        val verifiedIds = fixedMethods.flatMap { method ->
-            val path = contract.accessPaths.single { it.method.startsWith("$method(") }
-            assertTrue(path.status in setOf(AccessPathStatus.STATIC, AccessPathStatus.DECLARED), path.toString())
+        val fixedMethods = mapOf("inlineHql" to "JPA_HQL", "inlineNative" to "JPA_NATIVE",
+            "annotationDeclared" to "JPA_NAMED", "multiline" to "JPA_HQL", "marginLiteral" to "JPA_HQL",
+            "defaultMarginLiteral" to "JPA_HQL", "shorthand" to "PANACHE")
+        val inventory = requireNotNull(contract.apiInventory)
+        val verifiedIds = fixedMethods.flatMap { (method, mechanism) ->
+            val paths = contract.accessPaths.filter { it.method.startsWith("$method(") }
+            val path = paths.single { it.mechanism == mechanism }
+            assertEquals(if (mechanism == "JPA_NAMED") AccessPathStatus.DECLARED else AccessPathStatus.STATIC,
+                path.status, path.toString())
             assertTrue(path.queryIds.isNotEmpty(), path.toString())
-            assertTrue(requireNotNull(path.line) > 0, path.toString())
+            assertTrue(paths.all { requireNotNull(it.line) > 0 && it.queryIds == path.queryIds }, paths.toString())
+            if (mechanism == "PANACHE") {
+                assertEquals(1, paths.size, paths.toString())
+            } else {
+                // One fixed producer plus its execution; scalar bindings belong to the API inventory.
+                assertEquals(2, paths.size, paths.toString())
+                val terminal = paths.single { it.mechanism == "QUERY_TERMINAL" }
+                assertEquals(AccessPathStatus.STATIC, terminal.status, terminal.toString())
+                val binding = inventory.invocations.single {
+                    it.method.startsWith("$method(") && it.role == DatabaseApiRole.BINDING
+                }
+                assertEquals("setParameter", binding.name, binding.toString())
+                assertFalse(binding.queryCapable, binding.toString())
+                assertTrue(binding.accessPathIds.isEmpty(), binding.toString())
+                assertNull(binding.unresolvedReason, binding.toString())
+            }
             path.queryIds.forEach { id ->
                 val query = contract.queries.single { it.id == id }
                 assertTrue(query.dependenciesComplete, query.toString())
@@ -64,8 +84,12 @@ class InlineQueryCoverageTest {
         val inlineNative = contract.queries.single { it.id.contains("#inlineNative(") }
         assertTrue(ColumnReference("public.inline_accounts", "legacy_note") in inlineNative.columns)
         assertFalse(contract.entities.flatMap { it.columns }.any { it.name == "legacy_note" })
-        val dynamic = contract.accessPaths.single { it.method.startsWith("dynamic(") }
-        assertEquals(AccessPathStatus.UNRESOLVED, dynamic.status)
+        val dynamicPaths = contract.accessPaths.filter { it.method.startsWith("dynamic(") }
+        val dynamic = dynamicPaths.single { it.mechanism == "JPA_HQL" }
+        assertEquals(setOf("JPA_HQL", "QUERY_TERMINAL"), dynamicPaths.map { it.mechanism }.toSet())
+        assertEquals(2, dynamicPaths.size, dynamicPaths.toString())
+        assertTrue(dynamicPaths.all { it.status == AccessPathStatus.UNRESOLVED && it.queryIds.isEmpty() },
+            dynamicPaths.toString())
         assertEquals("dev.epoch.inlinefixture.InlineAccountDao", dynamic.className)
         assertTrue(requireNotNull(dynamic.line) > 0, dynamic.toString())
         assertTrue(contract.unresolvedQueries.any { it.id == dynamic.id }, contract.toString())
