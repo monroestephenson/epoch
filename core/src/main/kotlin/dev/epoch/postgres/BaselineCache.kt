@@ -43,26 +43,40 @@ internal class BaselineCache(private val directory: Path?) {
 
         fun rebuild(reason: String): CachePreparation {
             migrateBaseline()
-            command(database, "pg_dump", "--format=custom", "--username", database.username,
-                "--dbname", database.databaseName, "--file", CONTAINER_DUMP)
-            val temporary = Files.createTempFile(store.root, "$key-", ".dump.tmp")
-            try {
-                database.copyFileFromContainer(CONTAINER_DUMP, temporary.toString())
-                store.publish(temporary, schemaDigest(database))
-            } finally { Files.deleteIfExists(temporary) }
+            withContainerDump(database) { dump ->
+                command(database, "pg_dump", "--format=custom", "--username", database.username,
+                    "--dbname", database.databaseName, "--file", dump)
+                val temporary = Files.createTempFile(store.root, "$key-", ".dump.tmp")
+                var failure: Throwable? = null
+                try {
+                    database.copyFileFromContainer(dump, temporary.toString())
+                    store.publish(temporary, schemaDigest(database))
+                } catch (caught: Throwable) { failure = caught; throw caught }
+                finally {
+                    try { Files.deleteIfExists(temporary) }
+                    catch (cleanup: Throwable) {
+                        if (failure == null) throw cleanup
+                        failure.addSuppressed(cleanup)
+                    }
+                }
+            }
             return CachePreparation(if (hadEntry) "REBUILT" else "MISS", reason)
         }
 
-        fun restore(archive: BaselineArchive): String? {
-            database.copyFileToContainer(MountableFile.forHostPath(archive.path), CONTAINER_DUMP)
+        fun restore(archive: BaselineArchive): String? = withContainerDump(database) { dump ->
+            // Docker preserves host ownership. The enclosing directory is private to the
+            // exec user; a readable input permits pg_restore even when those UIDs differ.
+            database.copyFileToContainer(MountableFile.forHostPath(archive.path, 0b110_100_100), dump)
             // Docker/connection failures deliberately propagate; only a completed restore rejection
             // or catalog mismatch is recoverable cache invalidity.
             val result = database.execInContainer("pg_restore", "--exit-on-error", "--username", database.username,
-                "--dbname", database.databaseName, CONTAINER_DUMP)
-            if (result.exitCode != 0) return "pg_restore rejected the cached archive (exit ${result.exitCode}): ${result.stderr.trim().take(2000)}"
-            val actual = schemaDigest(database)
-            return if (actual == archive.manifest.schemaSha256) null
+                "--dbname", database.databaseName, dump)
+            if (result.exitCode != 0) "pg_restore rejected the cached archive (exit ${result.exitCode}): ${result.stderr.trim().take(2000)}"
+            else {
+                val actual = schemaDigest(database)
+                if (actual == archive.manifest.schemaSha256) null
                 else "Restored catalog fingerprint differs from the saved baseline (expected=${archive.manifest.schemaSha256}; actual=$actual)."
+            }
         }
 
         fun tryRestore(archive: BaselineArchive): Boolean {
@@ -119,7 +133,24 @@ internal class BaselineCache(private val directory: Path?) {
 
     private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }
 
-    companion object {
-        private const val CONTAINER_DUMP = "/tmp/epoch-baseline.dump"
+    /** Never overwrite a Docker-copied archive, particularly in sticky /tmp with
+     * fs.protected_regular enabled. Each restore/dump owns a fresh private directory. */
+    private fun <T> withContainerDump(database: PostgreSQLContainer, operation: (String) -> T): T {
+        val created = database.execInContainer("mktemp", "-d", "/tmp/epoch-baseline.XXXXXXXXXX")
+        check(created.exitCode == 0) { "Baseline cache temporary directory failed (exit ${created.exitCode}): ${created.stderr.trim()}" }
+        val directory = created.stdout.trim()
+        check(Regex("/tmp/epoch-baseline\\.[A-Za-z0-9]{10}").matches(directory)) {
+            "Baseline cache temporary directory returned an unexpected path."
+        }
+        var failure: Throwable? = null
+        try { return operation("$directory/archive.dump") }
+        catch (caught: Throwable) { failure = caught; throw caught }
+        finally {
+            try { command(database, "rm", "-rf", "--", directory) }
+            catch (cleanup: Throwable) {
+                if (failure == null) throw cleanup
+                failure.addSuppressed(cleanup)
+            }
+        }
     }
 }

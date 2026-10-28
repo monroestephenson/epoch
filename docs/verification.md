@@ -248,4 +248,6 @@ Progress snapshots carry `complete=false` until verification finishes. An interr
 
 The optional baseline cache records `MISS`, `HIT`, and `REBUILT`; every miss or rebuild includes `baseline.cacheReason`, emitted immediately under `--verbose`. Immutable archive generations and an atomic manifest let valid warm readers restore without acquiring the writer lock. A hit still verifies archive integrity, the restored catalog, and Flyway history. Its schema digest uses logical live-column order, so PostgreSQL restore's removal of historical dropped-column slots does not repeatedly invalidate equivalent dumps.
 
+Each container dump or restore uses a separate private temporary directory. A Docker-copied archive can retain a different filesystem owner; rebuilding a rejected restore never overwrites that input file. This avoids sticky-directory ownership failures on CI runners without relaxing kernel protections or archive validation. Temporary inputs and outputs are removed after success or failure; cleanup errors preserve an earlier failure as the primary cause.
+
 See [rollout and rollback workflows](feedback-round2.md#rollout-and-rollback-workflows) for `--new-contract` and `verify-release`. Reverse verification uses a retained copy of the old schema; it does not execute down migrations.
