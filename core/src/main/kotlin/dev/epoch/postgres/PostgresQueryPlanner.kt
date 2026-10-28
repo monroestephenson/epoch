@@ -34,6 +34,7 @@ internal data class QueryPlanningBatch(val plans: Map<String, QueryPlan>, val pl
 /** PREPARE plus EXPLAIN, never EXECUTE/ANALYZE: DML is planned but not run. */
 internal class PostgresQueryPlanner {
     private var batchTypeCache: MutableMap<String, String?>? = null
+    private val behaviorSyntax = BehaviorQuerySyntax()
 
     /** Resolve recurring JDBC type aliases once per schema state, not once per parameter. */
     fun inspectAll(connection: Connection, queries: List<QueryContract>,
@@ -66,7 +67,7 @@ internal class PostgresQueryPlanner {
         if (queries.isEmpty()) return QueryPlanningBatch(emptyMap(), 0)
         if (connectionFactory == null || parallelism == 1 || !connection.autoCommit)
             return QueryPlanningBatch(inspectAll(connection, queries, baselineParameterTypes), 1)
-        val safety = PlanningSafety(snapshot)
+        val safety = PlanningSafety(snapshot, behaviorSyntax)
         val eligible = queries.map(safety::eligible)
         val plans = linkedMapOf<String, QueryPlan>()
         var maximumWorkers = 1
@@ -234,8 +235,9 @@ internal class PostgresQueryPlanner {
         previousPlans: Map<String, QueryPlan> = baseline,
         connectionFactory: (() -> Connection)? = null,
         parallelism: Int = 1,
+        readCompatibility: ReadCompatibility? = null,
     ): QueryPlanningStep {
-        val delta = QueryRevalidation.delta(before, after)
+        val delta = QueryRevalidation.delta(before, after, behaviorSyntax)
         val changed = queries.filter { query -> baseline.getValue(query.id).accepted &&
             (previousPlans[query.id] == null || delta.needsPlanning(query)) }
         val types = changed.associate { it.id to baseline.getValue(it.id).parameterTypes }
@@ -250,7 +252,7 @@ internal class PostgresQueryPlanner {
             }
             val current = inspected.plans[query.id] ?: previousPlans.getValue(query.id)
             plans[query.id] = current
-            comparisonFinding(query, original, current, migration)
+            comparisonFinding(query, original, current, migration, readCompatibility)
         }
         return QueryPlanningStep(findings, plans, changed.size, queries.size - changed.size, inspected.planningParallelism)
     }
@@ -261,16 +263,18 @@ internal class PostgresQueryPlanner {
         queries: List<QueryContract>,
         baseline: Map<String, QueryPlan>,
         migration: MigrationInfo,
+        readCompatibility: ReadCompatibility? = null,
     ): List<Finding> = withTypeCache {
         queries.mapNotNull { query ->
             val previous = baseline.getValue(query.id)
             if (!previous.accepted) baselineFinding(query, previous)
-            else comparisonFinding(query, previous, inspect(connection, query, previous.parameterTypes), migration)
+            else comparisonFinding(query, previous, inspect(connection, query, previous.parameterTypes), migration, readCompatibility)
         }
     }
 
     private fun comparisonFinding(
         query: QueryContract, previous: QueryPlan, current: QueryPlan, migration: MigrationInfo,
+        readCompatibility: ReadCompatibility? = null,
     ): Finding? = when {
         !current.accepted -> Finding(
             if (current.sqlState?.startsWith("42") == true || current.sqlState in setOf("3F000", "EPOCH_RESULT_MISMATCH")) Verdict.BREAKING else Verdict.UNKNOWN,
@@ -278,7 +282,8 @@ internal class PostgresQueryPlanner {
             "PostgreSQL accepted this SQL before migration and rejects it afterward.", current.evidence,
             listOf(query.id), migration, "Retain the old table/column/type contract until the old application is retired.",
         )
-        current.results != previous.results -> Finding(
+        current.results != previous.results &&
+            readCompatibility?.resultCompatible(query, previous.results, current.results) != true -> Finding(
             if (query.exactResultShape || query.resultColumns.isNotEmpty()) Verdict.BREAKING else Verdict.UNKNOWN,
             "RESULT_SIGNATURE_CHANGED", query.id,
             "The query's PostgreSQL result labels or types changed.",

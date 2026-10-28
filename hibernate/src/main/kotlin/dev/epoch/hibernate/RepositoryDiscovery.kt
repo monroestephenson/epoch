@@ -25,6 +25,12 @@ object RepositoryDiscovery {
     fun discover(classpath: List<String>, packages: List<String>, loader: ClassLoader, entityClasses: List<String> = emptyList()): DiscoveredQueries {
         val nodes = sortedMapOf<String, ClassNode>()
         val unresolved = mutableListOf<UnresolvedQuery>()
+        val diagnostics = ExtractionDiagnostics()
+        val failedClasses = sortedSetOf<String>()
+        val failedArchives = sortedSetOf<String>()
+        var failedMethods = 0
+        var inspectedInvocations = 0
+        var recognizedInvocations = 0
         val notes = mutableListOf<String>()
         val paths = mutableListOf<AccessPathCoverage>()
         val hql = sortedMapOf<String, String>()
@@ -35,14 +41,16 @@ object RepositoryDiscovery {
         }
         fun selected(name: String) = name.endsWith(".class") && name != "module-info.class" &&
             (prefixes.isEmpty() || prefixes.any(name::startsWith))
-        fun read(bytes: ByteArray, location: String) {
+        fun read(location: String, bytes: () -> ByteArray) {
             try {
                 val node = ClassNode()
-                ClassReader(bytes).accept(node, ClassReader.SKIP_FRAMES)
+                ClassReader(bytes()).accept(node, ClassReader.SKIP_FRAMES)
                 val previous = nodes.putIfAbsent(node.name, node)
                 if (previous != null) notes += "Duplicate repository class uses first classpath definition: ${node.name.replace('/', '.')}"
-            } catch (error: Exception) {
-                unresolved += UnresolvedQuery("repository-discovery:$location", "Cannot inspect compiled class: ${error.javaClass.simpleName}")
+            } catch (error: Throwable) {
+                val id = "repository-discovery:$location"
+                diagnostics.capture(id, "Cannot inspect compiled class", error)
+                failedClasses += id
             }
         }
         var scannedRoots = 0
@@ -54,7 +62,7 @@ object RepositoryDiscovery {
                 scannedRoots++
                 Files.walk(path).use { files ->
                     files.filter { Files.isRegularFile(it) && selected(path.relativize(it).toString().replace('\\', '/')) }
-                        .sorted().forEach { read(Files.readAllBytes(it), path.relativize(it).toString()) }
+                        .sorted().forEach { file -> read(path.relativize(file).toString()) { Files.readAllBytes(file) } }
                 }
                 notes += "Repository bytecode root: $entry; packages=${packages.ifEmpty { listOf("all classes in directory") }}"
             } else if (prefixes.isEmpty()) {
@@ -65,12 +73,14 @@ object RepositoryDiscovery {
                     JarFile(path.toFile(), true, ZipFile.OPEN_READ, JarFile.runtimeVersion()).use { jar ->
                         jar.versionedStream().use { entries ->
                             entries.filter { !it.isDirectory && selected(it.name) }.sorted(compareBy { it.name })
-                                .forEach { item -> jar.getInputStream(item).use { read(it.readBytes(), "$entry!/${item.name}") } }
+                                .forEach { item -> read("$entry!/${item.name}") { jar.getInputStream(item).use { it.readBytes() } } }
                         }
                     }
                     notes += "Repository bytecode root: $entry; packages=$packages"
-                } catch (error: Exception) {
-                    unresolved += UnresolvedQuery("repository-discovery:$entry", "Cannot inspect classpath archive: ${error.javaClass.simpleName}")
+                } catch (error: Throwable) {
+                    val id = "repository-discovery:$entry"
+                    diagnostics.capture(id, "Cannot inspect classpath archive", error)
+                    failedArchives += id
                 }
             }
         }
@@ -83,7 +93,7 @@ object RepositoryDiscovery {
             field.value?.takeIf { field.access and (Opcodes.ACC_STATIC or Opcodes.ACC_FINAL) == (Opcodes.ACC_STATIC or Opcodes.ACC_FINAL) }
                 ?.let { "${owner.name}.${field.name}:${field.desc}" to it }
         } }.toMap()
-        val metadata = MetadataInventory(nodes, loader)
+        val metadata = MetadataInventory(nodes, loader, diagnostics)
         val namedQueries = metadata.namedQueries(entityClasses)
         val propertyQueries = metadata.namedQueryProperties()
         val xmlMappingsPresent = loader.getResources("META-INF/orm.xml").hasMoreElements()
@@ -100,7 +110,7 @@ object RepositoryDiscovery {
                         paths += AccessPathCoverage(id, className, methodName, AccessPathStatus.STATIC, listOf(id), mechanism = mechanism, line = line)
                     } else {
                         val explanation = problem ?: "Query string is not a compile-time constant on every incoming control-flow path"
-                        unresolved += UnresolvedQuery(id, explanation)
+                        if (!diagnostics.attach(id, explanation)) unresolved += UnresolvedQuery(id, explanation)
                         paths += AccessPathCoverage(id, className, methodName, AccessPathStatus.UNRESOLVED, reason = explanation, mechanism = mechanism, line = line)
                     }
                 }
@@ -121,7 +131,9 @@ object RepositoryDiscovery {
                 }
                 val queryAnnotations = annotations.filter { it.desc in SPRING_QUERY_ANNOTATIONS }
                 val queryAnnotation = queryAnnotations.singleOrNull()
-                val customQueryAnnotation = annotations.any { it.desc !in SPRING_QUERY_ANNOTATIONS && metadata.isQueryExtension(it.desc) }
+                val customQueryAnnotation = annotations.any {
+                    it.desc !in SPRING_QUERY_ANNOTATIONS && metadata.isQueryExtension(it.desc, unreadableMayBeQuery = repository)
+                }
                 if (queryAnnotation != null) {
                     val attributes = metadata.annotationDefaults(queryAnnotation.desc).orEmpty() + annotationValues(queryAnnotation)
                     val rewriter = attributes["queryRewriter"] as? Type
@@ -160,7 +172,7 @@ object RepositoryDiscovery {
                     } else {
                     val derived = if (entity == null) Result.failure(IllegalArgumentException("Repository entity type is not a resolved concrete class"))
                         else deriveSpringQuery(method.name, entity, loader)
-                    record(id, derived.getOrNull(), "SPRING_DERIVED", reason = derived.exceptionOrNull()?.let { describe(it) })
+                    record(id, derived.getOrNull(), "SPRING_DERIVED", reason = derived.exceptionOrNull()?.let { diagnostics.capture(id, "Spring query expansion unavailable", it) })
                     if (derived.isSuccess) {
                         val variants = nullableSpringVariants(derived.getOrThrow(), method)
                         if (variants == null)
@@ -197,8 +209,9 @@ object RepositoryDiscovery {
                 if (method.instructions.size() == 0) continue
                 var analysisFailure: String? = null
                 val frames = try { Analyzer(ConstantInterpreter(constants)).analyze(owner.name, method) }
-                catch (failure: Exception) {
-                    analysisFailure = "Bytecode data flow could not be analyzed: ${failure.javaClass.simpleName}: ${failure.message}"
+                catch (failure: Throwable) {
+                    analysisFailure = diagnostics.capture("$className#$methodName:analysis", "Bytecode data flow could not be analyzed", failure)
+                    failedMethods++
                     null
                 }
                 var callIndex = 0
@@ -208,7 +221,9 @@ object RepositoryDiscovery {
                 method.instructions.toArray().forEachIndexed { index, instruction ->
                     if (instruction is LineNumberNode) sourceLine = instruction.line
                     if (instruction !is MethodInsnNode) return@forEachIndexed
+                    inspectedInvocations++
                     val mechanism = mechanism(instruction, nodes) ?: return@forEachIndexed
+                    recognizedInvocations++
                     val id = "$className#$methodName:${callIndex++}"
                     val arguments = Type.getArgumentTypes(instruction.desc)
                     val stringArgument = arguments.indexOfFirst { it.className == "java.lang.String" }
@@ -250,14 +265,17 @@ object RepositoryDiscovery {
                                 else if (entity == null) Result.failure(IllegalArgumentException("Panache entity type cannot be resolved from the compiled repository/entity hierarchy"))
                                 else runCatching { fixed.map { expandPanache(instruction.name, entity, it, loader).getOrThrow() } }
                             recordVariants(id, expanded.getOrNull(), mechanism,
-                                reason = queryFailure ?: expanded.exceptionOrNull()?.let(::describe), line = sourceLine)
+                                reason = queryFailure ?: expanded.exceptionOrNull()?.let { diagnostics.capture(id, "Panache query expansion unavailable", it) }, line = sourceLine)
                         }
                         else -> record(id, null, mechanism, reason = "$mechanism database-access call ${instruction.owner.replace('/', '.')}.${instruction.name} is not exhaustively translated; declare finite SQL/HQL variants or instrument runtime SQL", line = sourceLine)
                     }
                 }
             }
         }
-        return DiscoveredQueries(hql, native, unresolved.distinct().sortedBy { it.id }, paths.sortedBy { it.id }, notes.distinct())
+        notes += "Repository scan inventory: ${nodes.size} readable classes, ${failedClasses.size} unreadable class sources, ${failedArchives.size} unreadable archives, $failedMethods methods with failed data flow; inspected $inspectedInvocations method-call instructions and recognized $recognizedInvocations database API call sites."
+        notes += "Recognized API calls are not a complete database-access denominator: unrecognized inherited owners, helper APIs, reflection, and unreadable bytecode remain outside this count; method percentages describe only discovered access paths."
+        return DiscoveredQueries(hql, native, (unresolved + diagnostics.unresolved()).distinct().sortedBy { it.id },
+            paths.map { it.copy(reason = diagnostics.resolve(it.reason)) }.sortedBy { it.id }, notes.distinct())
     }
 
     private fun mechanism(call: MethodInsnNode, nodes: Map<String, ClassNode>): String? {
@@ -293,24 +311,34 @@ object RepositoryDiscovery {
     private val SPRING_QUERY_ANNOTATIONS = setOf("Lorg/springframework/data/jpa/repository/Query;", SPRING_NATIVE_QUERY)
 
     /** Read annotation and entity metadata from the effective application loader without initializing classes. */
-    private class MetadataInventory(private val scanned: Map<String, ClassNode>, private val loader: ClassLoader) {
+    private class MetadataInventory(private val scanned: Map<String, ClassNode>, private val loader: ClassLoader,
+                                    private val diagnostics: ExtractionDiagnostics) {
         private val external = mutableMapOf<String, ClassNode?>()
         private fun node(name: String): ClassNode? = scanned[name] ?: external.getOrPut(name) {
             try {
                 loader.getResourceAsStream("$name.class")?.use { input ->
                     ClassNode().also { ClassReader(input).accept(it, ClassReader.SKIP_CODE or ClassReader.SKIP_DEBUG or ClassReader.SKIP_FRAMES) }
                 }
-            } catch (_: Exception) { null }
+            } catch (error: Throwable) {
+                diagnostics.capture("repository-header:${name.replace('/', '.')}", "Cannot inspect repository metadata header", error)
+                null
+            }
         }
         fun annotationDefaults(descriptor: String): Map<String, Any?>? =
             node(descriptor.removePrefix("L").removeSuffix(";"))?.methods?.filter { it.annotationDefault != null }
                 ?.associate { it.name to it.annotationDefault }
 
-        fun isQueryExtension(descriptor: String, seen: MutableSet<String> = mutableSetOf()): Boolean {
+        fun isQueryExtension(descriptor: String, unreadableMayBeQuery: Boolean,
+                             seen: MutableSet<String> = mutableSetOf()): Boolean {
             if (descriptor in SPRING_QUERY_ANNOTATIONS || descriptor == "Lorg/springframework/data/jpa/repository/query/Procedure;") return true
             if (!seen.add(descriptor) || descriptor.startsWith("Ljava/lang/annotation/") || descriptor.startsWith("Lkotlin/")) return false
-            val type = node(descriptor.removePrefix("L").removeSuffix(";")) ?: return true
-            return (type.visibleAnnotations.orEmpty() + type.invisibleAnnotations.orEmpty()).any { isQueryExtension(it.desc, seen) }
+            // A missing HTTP/cache annotation is not evidence of database access. On a known Spring
+            // repository it can still change query lookup, so it must block fabricated derivation.
+            // Readable composed query annotations remain recognized on every scanned class.
+            val type = node(descriptor.removePrefix("L").removeSuffix(";")) ?: return unreadableMayBeQuery
+            return (type.visibleAnnotations.orEmpty() + type.invisibleAnnotations.orEmpty()).any {
+                isQueryExtension(it.desc, unreadableMayBeQuery, seen)
+            }
         }
 
         fun namedQueries(classes: List<String>): Set<String> = buildSet {
@@ -330,9 +358,14 @@ object RepositoryDiscovery {
 
         fun namedQueryProperties(): Set<String> = buildSet {
             val resources = loader.getResources("META-INF/jpa-named-queries.properties")
-            while (resources.hasMoreElements()) try {
-                resources.nextElement().openStream().use { input -> addAll(Properties().apply { load(input) }.stringPropertyNames()) }
-            } catch (_: Exception) { add("*") }
+            while (resources.hasMoreElements()) {
+                val resource = resources.nextElement()
+                try { resource.openStream().use { input -> addAll(Properties().apply { load(input) }.stringPropertyNames()) } }
+                catch (error: Throwable) {
+                    diagnostics.capture("repository-named-queries:$resource", "Cannot inspect named query properties", error)
+                    add("*")
+                }
+            }
         }
     }
 
@@ -434,11 +467,6 @@ object RepositoryDiscovery {
         }
         "$select from $entityName e" + (if (disjunctions.isEmpty()) "" else " where ${disjunctions.joinToString(" or ")}") +
             (if (orders.isEmpty()) "" else " order by ${orders.joinToString(", ")}")
-    }
-
-    private fun describe(failure: Throwable): String {
-        val root = generateSequence(failure) { it.cause }.last()
-        return "${root.javaClass.simpleName}: ${root.message ?: "unsupported framework query expansion"}"
     }
 
     /** Spring's simple equality predicates select IS [NOT] NULL based on the bound argument. */

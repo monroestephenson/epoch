@@ -173,6 +173,9 @@ class PostgresVerifier {
                         withOperational(engine.report(contract, steps.toList(), baselineHealth, options.acceptedBaseline)))
                     var priorSchema = baseline
                     var currentPlans = baselinePlans
+                    val acceptedBaselineIds = ReadCompatibility.establishedBaselineIds(contract, baseline,
+                        baselinePlans.filterValues { it.accepted }.keys, baselineHealth.findings)
+                    var preservedIntegerColumns = IntegerReadPreservation.initial(baseline)
                     MigrationDeadline(options.migrationTimeoutSeconds).use { deadline ->
                         val callback = object : Callback {
                             override fun getCallbackName() = "epoch-intermediate-schema-verification"
@@ -190,13 +193,30 @@ class PostgresVerifier {
                                         "Could not read the exact migration resource for effect classification.",
                                         failure.javaClass.simpleName, migration = migration))
                                 }
+                                val measured = operational.snapshot(migration)
+                                val callbackEffects = measured.statements.flatMap { statement ->
+                                    statement.findings.filter { it.ruleId == "OP_DATABASE_CALLBACK_UNPROVEN" }
+                                        .map { it.evidence to statement.ordinal }
+                                }.groupBy({ it.first }, { it.second }).toSortedMap().map { (cause, ordinals) ->
+                                    Finding(Verdict.UNKNOWN, "MIGRATION_DATABASE_CALLBACK_UNPROVEN", migration.filename,
+                                        "Applicable database migration callbacks can change data outside the catalog proof.",
+                                        "$cause Observed statement ordinals: ${ordinals.distinct().sorted().joinToString()}. Their affected application paths are not established.",
+                                        migration = migration,
+                                        mitigation = "Verify the applicable callback's data effects independently; an unchanged catalog does not establish behavioral preservation.")
+                                }
+                                preservedIntegerColumns = IntegerReadPreservation.advance(baseline, priorSchema, after,
+                                    preservedIntegerColumns, measured.statements)
+                                val readCompatibility = ReadCompatibility(contract, baseline, after, acceptedBaselineIds, preservedIntegerColumns)
                                 val planning = planner.planStep(context.connection, contract.queries, baselinePlans,
-                                    migration, priorSchema, after, currentPlans, ::openPlanningConnection, options.planningParallelism)
+                                    migration, priorSchema, after, currentPlans, ::openPlanningConnection, options.planningParallelism,
+                                    readCompatibility = readCompatibility)
                                 val witnesses = boundaryBaseline?.let { boundaryCollector?.findings(context.connection, it, after, migration) }.orEmpty()
                                 steps += engine.verifyStep(contract, baseline, after, migration,
-                                    baselineHealth.findings + effects + planning.findings + witnesses)
+                                    baselineHealth.findings + effects + callbackEffects + planning.findings + witnesses,
+                                    preservedIntegerColumns = preservedIntegerColumns)
                                     .copy(replannedQueries = planning.replannedQueries, reusedQueries = planning.reusedQueries,
-                                        planningParallelism = planning.planningParallelism, operational = operational.snapshot(migration))
+                                        planningParallelism = planning.planningParallelism, operational = measured,
+                                        catalogChanged = priorSchema != after)
                                 priorSchema = after
                                 currentPlans = planning.plans
                                 if (options.progress != null) publishProgress(options, "old-on-new",
@@ -340,6 +360,9 @@ class PostgresVerifier {
         if (contracts.size == 1) return contracts.single()
         val prefixed = contracts.mapIndexed { index, item ->
             val prefix = "contract[${index + 1}]/"
+            val diagnosticReferences = item.unresolvedQueries.associate {
+                "Extraction diagnostic ${it.id}" to "Extraction diagnostic $prefix${it.id}"
+            }
             item.copy(
                 entities = item.entities.map { entity -> entity.copy(id = prefix + entity.id,
                     hierarchy = entity.hierarchy?.let { hierarchy -> hierarchy.copy(
@@ -352,8 +375,11 @@ class PostgresVerifier {
                     polymorphicReads = it.polymorphicReads.map { read -> read.copy(rootEntityId = prefix + read.rootEntityId) },
                     discriminatorWrites = it.discriminatorWrites.map { write -> write.copy(entityId = prefix + write.entityId) },
                 ) },
-                unresolvedQueries = item.unresolvedQueries.map { it.copy(id = prefix + it.id) },
-                accessPaths = item.accessPaths.map { it.copy(id = prefix + it.id, queryIds = it.queryIds.map { query -> prefix + query }) },
+                unresolvedQueries = item.unresolvedQueries.map { it.copy(id = prefix + it.id,
+                    affectedIds = it.affectedIds.map { source -> prefix + source }) },
+                accessPaths = item.accessPaths.map { path -> path.copy(id = prefix + path.id,
+                    queryIds = path.queryIds.map { query -> prefix + query },
+                    reason = path.reason?.let { diagnosticReferences[it] ?: it }) },
             )
         }
         return DatabaseContract(

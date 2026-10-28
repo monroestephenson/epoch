@@ -58,11 +58,13 @@ internal object HibernateReadMetadata {
             val entityId = mappings[table]
             if (entityId == null) { complete = false; return }
             val positions = BitSet().also(fetch::collectValueIndexesToCache)
-            val expression = selections.getValue(positions.nextSetBit(0)).single().expression as SqlColumnReference
+            val selection = selections.getValue(positions.nextSetBit(0)).single()
+            val expression = selection.expression as SqlColumnReference
             if (SqlDependencies.identifier(expression.columnExpression) != SqlDependencies.identifier(part.selectionExpression)) {
                 complete = false; return
             }
-            reads += MappedColumnRead(entityId, ColumnReference(table, SqlDependencies.identifier(part.selectionExpression)))
+            reads += MappedColumnRead(entityId, ColumnReference(table, SqlDependencies.identifier(part.selectionExpression)),
+                selection.jdbcResultSetIndex)
         }
         val identifier = result.identifierFetch
         // A standard by-ID result may use the supplied identifier instead of decoding it from the row.

@@ -41,6 +41,8 @@ class Extract : Callable<Int> {
     var keepGoing = false
     @Option(names = ["--runtime-sql"], description = ["Captured SqlCollector JSONL input; repeat to merge test observations"])
     var runtimeSqlPaths: List<Path> = emptyList()
+    @Option(names = ["--details"], description = ["Print every discovered class, access path and unresolved source; default output summarizes coverage"])
+    var details = false
 
     override fun call(): Int {
         val request: ExtractionRequest = json.readValue(descriptor.toFile())
@@ -52,10 +54,7 @@ class Extract : Callable<Int> {
         val contract = HibernateExtractor().extract(resolved)
         writeJson(output, contract)
         contract.coverage.notes.filter { it.startsWith("Warning:") }.forEach(System.err::println)
-        println("Extracted ${contract.entities.size} entity mappings and ${contract.queries.size} SQL templates to $output")
-        println("Scope: ${contract.scope}; unresolved sources: ${contract.unresolvedQueries.size}")
-        println(renderCoverage(contract))
-        println("Entity discovery does not establish whole-application coverage.")
+        println(renderExtractionSummary(contract, output, allDetails = details))
         return 0
     }
 }
@@ -278,7 +277,7 @@ fun renderReport(report: CompatibilityReport, summaryOnly: Boolean = false, allD
         if (remaining == 0) { omitted++; return }
         remaining--
         appendLine("  ${f.verdict} [${f.ruleId}] ${f.objectName}: ${f.message}")
-        if (f.affectedContractIds.isNotEmpty()) appendLine("    Affected: ${f.affectedContractIds.joinToString()}")
+        if (f.affectedContractIds.isNotEmpty()) appendLine(renderAffectedIds(f.affectedContractIds, allDetails))
         appendLine("    Evidence: ${f.evidence}")
         if (f.verdict == Verdict.UNKNOWN) appendLine("    Next evidence: ${f.mitigation ?: unknownEvidence(f)}")
         else f.mitigation?.let { appendLine("    Mitigation: $it") }
@@ -287,6 +286,7 @@ fun renderReport(report: CompatibilityReport, summaryOnly: Boolean = false, allD
     for (step in report.migrations.sortedBy { severity(it.verdict) }) {
         appendLine()
         appendLine("${step.migration.version} ${step.migration.filename}: ${step.verdict} (${step.findings.size} findings)")
+        if (step.catalogChanged == false) appendLine("  No changes in the inspected catalog; data and procedural effects are assessed separately.")
         step.findings.sortedBy { severity(it.verdict) }.forEach(::finding)
     }
     report.baseline?.takeIf { it.findings.isNotEmpty() }?.let {

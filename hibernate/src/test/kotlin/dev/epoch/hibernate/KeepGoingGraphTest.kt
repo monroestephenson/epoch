@@ -58,7 +58,9 @@ class KeepGoingGraphTest {
         assertTrue(healthy.columns.any { it.name == "related_id" }, contract.toString())
         assertTrue(contract.queries.filter { it.id.startsWith("${GenericHealthyOwner::class.java.name}.") &&
             it.operation == Operation.INSERT }.all { it.writeColumns.any { column -> column.column == "related_id" } }, contract.toString())
-        assertTrue(contract.unresolvedQueries.any { it.id == GenericMissingIdentifier::class.java.name }, contract.toString())
+        assertTrue(contract.unresolvedQueries.any {
+            it.id == GenericMissingIdentifier::class.java.name || GenericMissingIdentifier::class.java.name in it.affectedIds
+        }, contract.toString())
         assertFalse(contract.unresolvedQueries.any { it.id == "${GenericHealthyOwner::class.java.name}.related" }, contract.toString())
         assertFalse(contract.coverage.complete)
     }
@@ -82,7 +84,8 @@ class KeepGoingGraphTest {
             })
         assertTrue(attempts.isEmpty(), attempts.toString())
         assertTrue(contract.entities.any { it.id == GraphHub::class.java.name }, contract.toString())
-        assertTrue(contract.unresolvedQueries.map { it.id }.containsAll(hierarchy.map { it.name }), contract.toString())
+        val diagnostic = contract.unresolvedQueries.single()
+        assertEquals(hierarchy.map { it.name }.sorted(), diagnostic.affectedIds, contract.toString())
     }
 
     @Test fun `a failing class name does not select a healthy class with a shared name prefix`() {

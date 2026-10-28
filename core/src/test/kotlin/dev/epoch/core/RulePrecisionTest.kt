@@ -69,8 +69,11 @@ class RulePrecisionTest {
     }
 
     @Test fun `dropping outside table and its owned sequence does not poison verdict`() {
-        val audit = TableSchema(columns = mapOf("id" to ColumnSchema("bigint", false, "nextval('audit_id_seq')")),
-            constraints = mapOf("owner_fk" to ConstraintSchema("f", "FOREIGN KEY(owner_id) REFERENCES customer(id)", referencedTable = "public.customer")))
+        val audit = TableSchema(columns = mapOf("id" to ColumnSchema("bigint", false, "nextval('audit_id_seq')"),
+            "owner_id" to ColumnSchema("bigint", true)),
+            constraints = mapOf("owner_fk" to ConstraintSchema("f", "FOREIGN KEY(owner_id) REFERENCES customer(id)",
+                columns = listOf("owner_id"), referencedTable = "public.customer", referencedColumns = listOf("id"),
+                onDelete = "a", onUpdate = "a")))
         val old = baseline.copy(tables = baseline.tables + ("public.audit" to audit), sequences = mapOf("public.audit_id_seq" to "bigint:1:1:999:1:false:1"),
             sequenceOwners = mapOf("public.audit_id_seq" to ColumnReference("public.audit", "id")))
         assertRule(engine.verifyStep(contract, old, baseline, migration), Verdict.SAFE, "UNREFERENCED_TABLE_DROPPED")

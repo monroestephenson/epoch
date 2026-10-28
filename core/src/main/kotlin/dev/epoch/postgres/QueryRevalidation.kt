@@ -7,10 +7,14 @@ internal object QueryRevalidation {
     fun needsPlanning(query: QueryContract, before: SchemaSnapshot, after: SchemaSnapshot): Boolean =
         delta(before, after).needsPlanning(query)
 
-    fun delta(before: SchemaSnapshot, after: SchemaSnapshot): Delta {
-        val opaque = before.behaviors != after.behaviors ||
-            (before.behaviors.keys + after.behaviors.keys).any { !it.startsWith("enum:") } ||
-            before.extensions != after.extensions || before.enumTypes != after.enumTypes
+    fun delta(before: SchemaSnapshot, after: SchemaSnapshot,
+              syntax: BehaviorQuerySyntax = BehaviorQuerySyntax()): Delta {
+        val changes = BehaviorChanges(before, after)
+        val legacyDependencies = listOf(before, after).any {
+            it.behaviorGraph?.let { graph -> graph.version != 1 || !graph.attachmentInventoryComplete } != false
+        }
+        val priorSafety = PlanningSafety(before, syntax)
+        val targetSafety = PlanningSafety(after, syntax)
         val relations = mutableSetOf<String>()
         val columns = mutableMapOf<String, Set<String>>()
         val incomingTargets = mutableSetOf<String>()
@@ -32,14 +36,19 @@ internal object QueryRevalidation {
         }
         val changedSequences = (before.sequences.keys + after.sequences.keys).filter { before.sequences[it] != after.sequences[it] }
         val owners = changedSequences.map { after.sequenceOwners[it] ?: before.sequenceOwners[it] }
-        return Delta(opaque, relations, columns, changedSequences.isNotEmpty(), owners.any { it == null },
+        return Delta(changes, priorSafety, targetSafety, relations, columns,
+            legacyDependencies && (before.extensions != after.extensions || before.enumTypes != after.enumTypes),
+            legacyDependencies && changedSequences.isNotEmpty(), owners.any { it == null },
             owners.filterNotNull().map { it.table }.toSet(), incomingTargets, unknownIncomingTarget)
     }
 
     data class Delta internal constructor(
-        private val forceAll: Boolean,
+        private val behaviorChanges: BehaviorChanges,
+        private val priorSafety: PlanningSafety,
+        private val targetSafety: PlanningSafety,
         private val changedRelations: Set<String>,
         private val changedColumns: Map<String, Set<String>>,
+        private val unscopedTypeOrExtensionChanges: Boolean,
         private val sequencesChanged: Boolean,
         private val unknownSequenceOwner: Boolean,
         private val sequenceOwnerTables: Set<String>,
@@ -47,7 +56,14 @@ internal object QueryRevalidation {
         private val unknownIncomingTarget: Boolean,
     ) {
         fun needsPlanning(query: QueryContract): Boolean {
-            if (!query.dependenciesComplete || query.verificationStatus != VerificationStatus.EXTRACTED || forceAll) return true
+            if (!query.dependenciesComplete || query.verificationStatus != VerificationStatus.EXTRACTED) return true
+            if (unscopedTypeOrExtensionChanges) return true
+            // Data/code-dependent plans are rechecked locally even when the catalog is unchanged.
+            if (!priorSafety.eligible(query) || !targetSafety.eligible(query)) return true
+            for (scope in listOf(priorSafety.behavior(query), targetSafety.behavior(query))) {
+                if (scope.planningNodeIds.any { it in behaviorChanges.changedNodeIds } ||
+                    behaviorChanges.intersects(scope.planningReferences)) return true
+            }
             val tables = (query.tables + listOfNotNull(query.targetTable) + (query.columns + query.writeColumns).map { it.table })
                 .map(::physicalTable).toSet()
             if (tables.any { it in changedRelations }) return true

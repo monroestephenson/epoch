@@ -16,7 +16,7 @@ class QueryRevalidationTest {
 
     @Test fun `ten thousand query dependencies across one hundred steps select only the changed table`() {
         val queries = (0 until 100).flatMap { relation -> (0 until 100).map { index ->
-            query.copy(id = "$relation-$index", tables = listOf("public.table_$relation"),
+            query.copy(id = "$relation-$index", sql = "select id from table_$relation", tables = listOf("public.table_$relation"),
                 columns = listOf(ColumnReference("public.table_$relation", "id")))
         } }
         var before = SchemaSnapshot(tables = (0 until 100).associate { "public.table_$it" to table })
@@ -64,14 +64,40 @@ class QueryRevalidationTest {
         assertTrue(QueryRevalidation.needsPlanning(query, baseline, baseline.copy(enumTypes = mapOf("public.state" to listOf("ok")))))
     }
 
+    @Test fun `complete graph keeps unrelated standalone sequence and enum changes out of planning`() {
+        val known = baseline.copy(behaviorGraph = BehaviorGraph(attachmentInventoryComplete = true,
+            nodes = emptyMap(), attachments = emptyList()))
+        val after = known.copy(sequences = mapOf("public.unused_seq" to "increment=2"),
+            enumTypes = mapOf("public.unused_state" to listOf("ready")))
+        assertFalse(QueryRevalidation.needsPlanning(query, known, after))
+    }
+
+    @Test fun `complete graph rechecks an actually reached sequence default only`() {
+        val node = BehaviorNode("default", "nextval('public.customer_ids'::regclass)",
+            references = listOf(BehaviorReference(BehaviorReferenceKind.SEQUENCE, "public.customer_ids")),
+            dependenciesComplete = true, semanticsSupported = true, planningMayEvaluate = false)
+        val known = baseline.copy(sequences = mapOf("public.customer_ids" to "increment=1"),
+            behaviorGraph = BehaviorGraph(attachmentInventoryComplete = true, nodes = mapOf("default:id" to node),
+                attachments = listOf(BehaviorAttachment("public.customers", "default:id", setOf(Operation.INSERT),
+                    BehaviorActivation.DEFAULT, "id"))))
+        val after = known.copy(sequences = mapOf("public.customer_ids" to "increment=2"))
+        val insert = QueryContract("insert", Operation.INSERT, "insert into customers(unused) values (?)",
+            tables = listOf("public.customers"), columns = listOf(ColumnReference("public.customers", "unused")),
+            writeColumns = listOf(ColumnReference("public.customers", "unused")), parameterTypes = listOf("VARCHAR"),
+            targetTable = "public.customers", dependenciesComplete = true)
+        assertTrue(QueryRevalidation.needsPlanning(insert, known, after))
+        assertFalse(QueryRevalidation.needsPlanning(query, known, after))
+    }
+
     @Test fun `incoming foreign key changes recheck target writes but not unrelated selects`() {
         val child = TableSchema(constraints = mapOf("fk" to ConstraintSchema("f", "FOREIGN KEY(customer_id) REFERENCES customers(id)",
             referencedTable = "public.customers")))
         val after = baseline.copy(tables = baseline.tables + ("public.child" to child))
-        assertTrue(QueryRevalidation.needsPlanning(query.copy(operation = Operation.DELETE, targetTable = "public.customers"), baseline, after))
+        val delete = query.copy(operation = Operation.DELETE, sql = "delete from customers", targetTable = "public.customers")
+        assertTrue(QueryRevalidation.needsPlanning(delete, baseline, after))
         assertFalse(QueryRevalidation.needsPlanning(query, baseline, after))
         val unrelated = child.copy(constraints = mapOf("fk" to child.constraints.getValue("fk").copy(referencedTable = "public.accounts")))
-        assertFalse(QueryRevalidation.needsPlanning(query.copy(operation = Operation.DELETE), baseline,
+        assertFalse(QueryRevalidation.needsPlanning(delete, baseline,
             baseline.copy(tables = baseline.tables + ("public.child" to unrelated))))
     }
 

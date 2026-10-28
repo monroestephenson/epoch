@@ -16,16 +16,18 @@ internal data class ExtractedSql(
 internal object QueryExtraction {
     private val logger = LoggerFactory.getLogger(QueryExtraction::class.java)
 
-    fun <T> attempt(id: String, phase: String, unresolved: MutableList<UnresolvedQuery>, action: () -> T): T? =
+    fun <T> attempt(id: String, phase: String, unresolved: MutableList<UnresolvedQuery>,
+                    diagnostics: ExtractionDiagnostics? = null, action: () -> T): T? =
         try { action() }
         catch (error: Throwable) {
-            unresolved += UnresolvedQuery(id, failure(id, phase, error))
+            if (diagnostics == null) unresolved += UnresolvedQuery(id, failure(id, phase, error))
+            else diagnostics.capture(id, phase, error)
             null
         }
 
     fun record(id: String, phase: String, queries: MutableList<QueryContract>, unresolved: MutableList<UnresolvedQuery>,
-               action: () -> ExtractedSql?) {
-        val result = attempt(id, phase, unresolved, action) ?: return
+               diagnostics: ExtractionDiagnostics? = null, action: () -> ExtractedSql?) {
+        val result = attempt(id, phase, unresolved, diagnostics, action) ?: return
         result.query?.let(queries::add)
         unresolved += result.limitations
     }
@@ -40,14 +42,20 @@ internal object QueryExtraction {
     fun rethrowNonRecoverable(error: Throwable) =
         ExtractionFailurePolicy.rethrowNonRecoverable(error, recoverQueryStackOverflow = true)
 
+    /** Untruncated normalized cause key: clipped display summaries must not merge different failures. */
+    fun failureKey(phase: String, error: Throwable): String = phase + "\n" + causes(error).joinToString("\n") {
+        "${it.javaClass.name}:${message(it)}"
+    }
+
     fun describe(error: Throwable): String = causes(error).take(8).joinToString("; caused by ") { cause ->
-        val message = cause.message?.replace(Regex("\\s+"), " ")?.trim().orEmpty()
-            // Class-loader/object identities and local artifact roots are not reproducible facts.
-            .replace(Regex("@[0-9a-fA-F]{4,}"), "@<identity>")
-            .replace(Regex("(?:file:)?(?:/[A-Za-z0-9._+%~-]+)+\\.(?:jar|class)(?![A-Za-z0-9])"), "<artifact>")
-            .take(512)
+        val message = message(cause).take(512)
         "${cause.javaClass.simpleName}: ${message.ifEmpty { "no additional detail" }}"
     }.take(4096)
+
+    private fun message(error: Throwable): String = error.message?.replace(Regex("\\s+"), " ")?.trim().orEmpty()
+        // Class-loader/object identities and local artifact roots are not reproducible facts.
+        .replace(Regex("@[0-9a-fA-F]{4,}"), "@<identity>")
+        .replace(Regex("(?:file:)?(?:/[A-Za-z0-9._+%~-]+)+\\.(?:jar|class)(?![A-Za-z0-9])"), "<artifact>")
 
     private fun causes(error: Throwable): List<Throwable> {
         val seen = Collections.newSetFromMap(IdentityHashMap<Throwable, Boolean>())

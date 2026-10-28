@@ -29,7 +29,12 @@ data class Coverage(
     val notes: List<String> = emptyList(),
 )
 
-data class UnresolvedQuery(val id: String, val reason: String)
+data class UnresolvedQuery(
+    val id: String,
+    val reason: String,
+    /** Complete source inventory for one shared extraction failure; empty retains single-source semantics. */
+    val affectedIds: List<String> = emptyList(),
+)
 
 /** table is schema-qualified; column names are the physical Hibernate column names. */
 data class EntityContract(
@@ -75,11 +80,18 @@ data class ColumnContract(
     val lengthUnbounded: Boolean = false,
     /** Positive direct decoder fact, independent of write transformations and generated values. */
     val readDomainComplete: Boolean = false,
+    /** A known direct String binder has no Hibernate DDL-length cap; database admission still applies. */
+    val stringInputLengthUnrestricted: Boolean = false,
 )
 
 data class ColumnReference(val table: String, val column: String)
 data class ResultColumn(val name: String, val typeName: String? = null)
-data class MappedColumnRead(val entityId: String, val column: ColumnReference)
+data class MappedColumnRead(
+    val entityId: String,
+    val column: ColumnReference,
+    /** One-based actual selected JDBC slot; null means unavailable, never inferred from labels. */
+    val resultPosition: Int? = null,
+)
 data class PolymorphicRead(val rootEntityId: String, val unrestricted: Boolean = false)
 data class DiscriminatorWrite(val entityId: String, val column: ColumnReference, val value: String)
 data class HierarchyContract(
@@ -133,6 +145,7 @@ data class SchemaSnapshot(
     val enumTypes: Map<String, List<String>> = emptyMap(),
     /** Actual current_schemas(true), including implicit schemas, for interpreting deparsed expressions. */
     val expressionSearchPath: List<String> = emptyList(),
+    val behaviorGraph: BehaviorGraph? = null,
 )
 
 data class TableSchema(
@@ -144,6 +157,8 @@ data class TableSchema(
     val plainIndexes: Set<String> = emptySet(),
     val indexColumns: Map<String, List<String>> = emptyMap(),
     val indexMethods: Map<String, String> = emptyMap(),
+    val indexValidity: Map<String, Boolean> = emptyMap(),
+    val indexReadiness: Map<String, Boolean> = emptyMap(),
     val view: ViewSchema? = null,
     val relationSecurity: RelationSecurity? = null,
     /** Live-database identity for rename proofs; never a portable catalog or fingerprint fact. */
@@ -221,6 +236,8 @@ data class MigrationReport(
     val planningParallelism: Int? = null,
     /** Actual pending-statement observations; null means no measured assessment is available. */
     val operational: OperationalAssessment? = null,
+    /** Immediate before/after catalog observation; null means no comparison was recorded. */
+    val catalogChanged: Boolean? = null,
 )
 
 data class CompatibilityReport(

@@ -88,9 +88,15 @@ internal object RuleProofs {
             }
         }
         if (a.family == "string" && (column.logicalJavaType == null || column.logicalJavaType == "java.lang.String")) {
-            val mappedLength = if (column.lengthUnbounded) Long.MAX_VALUE else column.length
+            val unrestricted = column.stringInputLengthUnrestricted && column.logicalJavaType == "java.lang.String"
+            val mappedLength = if (column.lengthUnbounded || unrestricted) Long.MAX_VALUE else column.length
             if (mappedLength != null && minOf(mappedLength, a.length!!) > b.length!!) {
-                return "A string of ${b.length + 1} characters fits the ${if (column.lengthUnbounded) "explicitly unbounded" else "length $mappedLength"} mapped domain and baseline $before, but exceeds $after."
+                val input = when {
+                    unrestricted -> "standard direct String-binding domain (DDL length ${column.length ?: "unknown"} is not a runtime cap)"
+                    column.lengthUnbounded -> "explicitly unbounded mapped domain"
+                    else -> "declared length $mappedLength mapped domain"
+                }
+                return "A string of ${b.length + 1} characters fits the $input and baseline $before, but exceeds $after."
             }
         }
         if (a.family == "numeric" && (column.logicalJavaType == null || column.logicalJavaType == "java.math.BigDecimal") && column.precision != null && column.scale != null) {
@@ -135,20 +141,29 @@ internal object RuleProofs {
         var bytes = 32L // tuple header, alignment and NULL bitmap margin
         for (name in columns) {
             val type = table.columns[name]?.type ?: return false
-            val size = when (type) {
-                "boolean" -> 1L
-                "smallint" -> 2L
-                "integer", "real", "date" -> 4L
-                "bigint", "double precision", "time without time zone", "timestamp without time zone", "timestamp with time zone" -> 8L
-                "uuid", "interval", "time with time zone" -> 16L
-                else -> Regex("(?:character varying|varchar|character|char)\\((\\d+)\\)").matchEntire(type)?.let { it.groupValues[1].toLong() * 4 + 8 }
-                    ?: Regex("numeric\\((\\d+)(?:,\\d+)?\\)").matchEntire(type)?.let { (it.groupValues[1].toLong() + 3) / 4 * 2 + 12 }
-                    ?: return false
-            }
+            val size = btreeColumnBytes(type) ?: return false
             bytes += size + 8 // per-attribute alignment margin, including INCLUDE columns
             if (bytes > 2000) return false
         }
         return true
+    }
+
+    /** A useful bounded datum size, never an overflowed arithmetic result or an application DDL hint. */
+    fun btreeColumnBytes(type: String): Long? = when (type) {
+        "boolean" -> 1L
+        "smallint" -> 2L
+        "integer", "real", "date" -> 4L
+        "bigint", "double precision", "time without time zone", "timestamp without time zone", "timestamp with time zone" -> 8L
+        "uuid", "interval", "time with time zone" -> 16L
+        else -> {
+            val length = Regex("(?:character varying|varchar|character|char)\\((\\d+)\\)").matchEntire(type)
+            val precision = Regex("numeric\\((\\d+)(?:,\\d+)?\\)").matchEntire(type)
+            when {
+                length != null -> length.groupValues[1].toLongOrNull()?.takeIf { it <= 498 }?.let { it * 4 + 8 }
+                precision != null -> precision.groupValues[1].toLongOrNull()?.takeIf { it <= 3976 }?.let { (it + 3) / 4 * 2 + 12 }
+                else -> null
+            }
+        }
     }
 
     /** Supported catalog form: column IN ('a', 'b') or column = ANY (ARRAY['a'::text, 'b'::text]). */

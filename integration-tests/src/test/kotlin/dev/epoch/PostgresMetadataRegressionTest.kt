@@ -32,17 +32,30 @@ class PostgresMetadataRegressionTest {
         dependenciesComplete = true,
     )
 
-    @Test fun `extension owned functions do not blanket mark ordinary schema changes unknown`() {
+    @Test fun `unused extension functions and user wrappers do not poison ordinary schema changes`() {
         val report = verify(
-            "CREATE EXTENSION pgcrypto; CREATE EXTENSION pg_trgm; CREATE TABLE typed (id bigint PRIMARY KEY);",
+            """
+            CREATE EXTENSION pgcrypto;
+            CREATE EXTENSION pg_trgm;
+            CREATE TABLE typed (id bigint PRIMARY KEY);
+            CREATE FUNCTION public.user_hash(value text) RETURNS bytea LANGUAGE sql IMMUTABLE
+              AS 'SELECT public.digest(value, ''sha256'')';
+            """.trimIndent(),
             "ALTER TABLE typed ADD COLUMN metadata text;",
             readContract(select("typed.find", "SELECT id FROM typed WHERE id = ?", listOf("bigint"), listOf("id"))),
         )
+        assertEquals(Verdict.SAFE, requireNotNull(report.baseline).verdict, report.toString())
         assertEquals(Verdict.SAFE, report.verdict, report.toString())
-        assertTrue(report.migrations.flatMap { it.findings }.none { it.ruleId == "EXISTING_DATABASE_BEHAVIOR" }, report.toString())
+        assertEquals(0, report.migrations.single().replannedQueries, report.toString())
+        assertEquals(1, report.migrations.single().reusedQueries, report.toString())
+        assertTrue((requireNotNull(report.baseline).findings + report.migrations.flatMap { it.findings }).none {
+            it.ruleId == "EXISTING_DATABASE_BEHAVIOR" || it.ruleId == "DATABASE_BEHAVIOR_DEPENDENCY_UNPROVEN"
+        }, report.toString())
     }
 
-    @Test fun `user function calling extension remains a custom behavior`() {
+    @Test fun `invoked user function calling extension remains custom behavior only for its caller`() {
+        val caller = QueryContract("user_hash.call", Operation.SELECT, "SELECT public.user_hash(?)",
+            parameterTypes = listOf("text"), dependenciesComplete = true)
         val report = verify(
             """
             CREATE EXTENSION pgcrypto;
@@ -51,17 +64,20 @@ class PostgresMetadataRegressionTest {
               AS 'SELECT public.digest(value, ''sha256'')';
             """.trimIndent(),
             "ALTER TABLE typed ADD COLUMN metadata text;",
-            readContract(select("typed.find", "SELECT id FROM typed WHERE id = ?", listOf("bigint"), listOf("id"))),
+            readContract(caller, select("typed.find", "SELECT id FROM typed WHERE id = ?", listOf("bigint"), listOf("id"))),
         )
         assertEquals(Verdict.UNKNOWN, report.verdict, report.toString())
-        assertTrue(report.baseline?.findings.orEmpty().any {
-            it.ruleId == "EXISTING_DATABASE_BEHAVIOR" && "user_hash" in it.evidence && it.migration == null
-        }, report.toString())
+        val baselineFindings = requireNotNull(report.baseline).findings.filter { it.ruleId == "EXISTING_DATABASE_BEHAVIOR" }
+        assertTrue(baselineFindings.any { "user_hash" in it.objectName }, baselineFindings.toString())
+        assertTrue(baselineFindings.all { it.migration == null && it.affectedContractIds == listOf(caller.id) }, baselineFindings.toString())
         assertTrue(report.migrations.flatMap { it.findings }.none { it.ruleId == "EXISTING_DATABASE_BEHAVIOR" }, report.toString())
-        assertEquals(Verdict.UNKNOWN, report.migrations.single().verdict, report.toString())
-        assertTrue(report.migrations.single().findings.any {
-            it.ruleId == "DATABASE_BEHAVIOR_DEPENDENCY_UNPROVEN"
-        }, "New schema/behavior interactions cannot be accepted merely by suppressing baseline debt: $report")
+        val step = report.migrations.single()
+        assertEquals(Verdict.UNKNOWN, step.verdict, report.toString())
+        assertEquals(1, step.replannedQueries, report.toString())
+        assertEquals(1, step.reusedQueries, report.toString())
+        val interactions = step.findings.filter { it.ruleId == "DATABASE_BEHAVIOR_DEPENDENCY_UNPROVEN" }
+        assertTrue(interactions.isNotEmpty(), "New interactions remain unproven for the actual opaque caller: $report")
+        assertTrue(interactions.all { it.affectedContractIds == listOf(caller.id) && it.migration == step.migration }, interactions.toString())
     }
 
     @Test fun `JDBC double tinyint and OTHER UUID JSON types resolve against PostgreSQL`() {

@@ -74,5 +74,5 @@ internal class BaselinePlanCache(private val directory: Path?, private val sessi
     private fun digest(value: Any) = MessageDigest.getInstance("SHA-256").digest(mapper.writeValueAsBytes(value))
         .joinToString("") { "%02x".format(it) }
 
-    companion object { private const val FORMAT = 1 }
+    companion object { private const val FORMAT = 2 }
 }

@@ -132,12 +132,16 @@ class PostgresCatalog {
         connection.rows("""
             SELECT n.nspname || '.' || c.relname AS table_name, i.relname AS index_name,
                    pg_get_indexdef(ix.indexrelid) || '; valid=' || ix.indisvalid AS definition, ix.indisunique,
-                   am.amname AS method,
+                   am.amname AS method, ix.indisvalid, ix.indisready,
                    ARRAY(SELECT a.attname FROM unnest(ix.indkey) WITH ORDINALITY k(num, position)
                          JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum=k.num ORDER BY k.position) AS columns,
-                   ix.indexprs IS NULL AND ix.indpred IS NULL AND NOT EXISTS (
+                   ix.indexprs IS NULL AND ix.indpred IS NULL AND am.oid < 16384 AND NOT EXISTS (
                        SELECT 1 FROM unnest(ix.indclass) op(oid) JOIN pg_opclass oc ON oc.oid=op.oid
-                       JOIN pg_namespace ons ON ons.oid=oc.opcnamespace WHERE ons.nspname <> 'pg_catalog'
+                       JOIN pg_namespace ons ON ons.oid=oc.opcnamespace
+                       JOIN pg_opfamily family ON family.oid=oc.opcfamily
+                       JOIN pg_namespace fns ON fns.oid=family.opfnamespace
+                       WHERE ons.nspname <> 'pg_catalog' OR fns.nspname <> 'pg_catalog'
+                         OR oc.oid >= 16384 OR family.oid >= 16384
                    ) AS plain_index
             FROM pg_index ix JOIN pg_class c ON c.oid=ix.indrelid
             JOIN pg_class i ON i.oid=ix.indexrelid JOIN pg_namespace n ON n.oid=c.relnamespace
@@ -152,7 +156,9 @@ class PostgresCatalog {
                 uniqueIndexes = table.uniqueIndexes + (index to row.getBoolean("indisunique")),
                 plainIndexes = table.plainIndexes + (if (row.getBoolean("plain_index")) setOf(index) else emptySet()),
                 indexColumns = table.indexColumns + (index to row.strings("columns")),
-                indexMethods = table.indexMethods + (index to row.getString("method")))
+                indexMethods = table.indexMethods + (index to row.getString("method")),
+                indexValidity = table.indexValidity + (index to row.getBoolean("indisvalid")),
+                indexReadiness = table.indexReadiness + (index to row.getBoolean("indisready")))
         }
         val behaviors = sortedMapOf<String, String>()
         fun behavior(sql: String) = connection.rows(sql) { behaviors[it.getString(1)] = it.getString(2) }
@@ -192,7 +198,9 @@ class PostgresCatalog {
         """)
         behavior("""
             SELECT 'policy:' || n.nspname || '.' || c.relname || '.' || p.polname,
-                   p.polcmd::text || ':' || p.polpermissive || ':' || p.polroles::text || ':' ||
+                   p.polcmd::text || ':' || p.polpermissive || ':' ||
+                   array_to_string(ARRAY(SELECT CASE WHEN role_oid=0 THEN 'PUBLIC' ELSE role.rolname END
+                       FROM unnest(p.polroles) role_oid LEFT JOIN pg_roles role ON role.oid=role_oid ORDER BY 1),',') || ':' ||
                    coalesce(pg_get_expr(p.polqual,p.polrelid),'') || ':' || coalesce(pg_get_expr(p.polwithcheck,p.polrelid),'')
             FROM pg_policy p JOIN pg_class c ON c.oid=p.polrelid JOIN pg_namespace n ON n.oid=c.relnamespace
             WHERE n.nspname NOT LIKE 'pg_%'
@@ -205,9 +213,10 @@ class PostgresCatalog {
               AND ${notExtensionOwned("pg_class", "c.oid")}
         """)
         behavior("""
-            SELECT 'inheritance:' || child.oid::regclass::text, parent.oid::regclass::text || ':' ||
+            SELECT 'inheritance:' || cn.nspname || '.' || child.relname, pn.nspname || '.' || parent.relname || ':' ||
                    coalesce(pg_get_expr(child.relpartbound,child.oid),'')
             FROM pg_inherits i JOIN pg_class child ON child.oid=i.inhrelid JOIN pg_class parent ON parent.oid=i.inhparent
+            JOIN pg_namespace cn ON cn.oid=child.relnamespace JOIN pg_namespace pn ON pn.oid=parent.relnamespace
             WHERE ${notExtensionOwned("pg_class", "child.oid")}
         """)
         val enumTypes = sortedMapOf<String, List<String>>()
@@ -258,8 +267,9 @@ class PostgresCatalog {
         connection.rows("SELECT extname, extversion FROM pg_extension ORDER BY extname") {
             extensions[it.getString(1)] = it.getString(2)
         }
-        return SchemaSnapshot(tables = tables, behaviors = behaviors, sequences = sequences, extensions = extensions,
+        val snapshot = SchemaSnapshot(tables = tables, behaviors = behaviors, sequences = sequences, extensions = extensions,
             sequenceOwners = sequenceOwners, enumTypes = enumTypes, expressionSearchPath = expressionSearchPath)
+        return snapshot.copy(behaviorGraph = PostgresBehaviorGraph().inspect(connection, snapshot))
     }
 }
 

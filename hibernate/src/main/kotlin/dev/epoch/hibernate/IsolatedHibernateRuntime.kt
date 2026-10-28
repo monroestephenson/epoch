@@ -6,6 +6,7 @@ import java.net.URL
 import java.net.URLClassLoader
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.Enumeration
 
 /** Runs the API-compatible, tested adapter against the application's own Hibernate and JPA runtime. */
 internal object IsolatedHibernateRuntime {
@@ -44,6 +45,20 @@ internal object IsolatedHibernateRuntime {
     }
 
     private class ApplicationLoader(urls: Array<URL>, parent: ClassLoader) : URLClassLoader(urls, parent) {
+        /** A provider must implement the same service API identity selected by loadClass. */
+        override fun getResources(name: String): Enumeration<URL> =
+            if (applicationService(name)) findResources(name) else super.getResources(name)
+
+        override fun getResource(name: String): URL? =
+            if (applicationService(name)) findResource(name) else super.getResource(name)
+
+        private fun applicationService(resource: String): Boolean {
+            if (!resource.startsWith("META-INF/services/")) return false
+            val service = resource.removePrefix("META-INF/services/")
+            return try { loadClass(service, false).classLoader === this }
+            catch (_: ClassNotFoundException) { false }
+        }
+
         override fun loadClass(name: String, resolve: Boolean): Class<*> = synchronized(getClassLoadingLock(name)) {
             findLoadedClass(name)?.let { return@synchronized it }
             val shared = name.startsWith("java.") || name.startsWith("javax.") || name.startsWith("jdk.") || name.startsWith("sun.") ||

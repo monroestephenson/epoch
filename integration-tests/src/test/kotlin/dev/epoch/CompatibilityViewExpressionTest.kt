@@ -33,7 +33,15 @@ class CompatibilityViewExpressionTest {
 
         val report = PostgresVerifier().verify(contract, baseline, pending)
         val health = requireNotNull(report.baseline)
-        assertEquals(Verdict.SAFE, health.verdict, report.toString())
+        // PREPARE succeeds at baseline, but these reached name-observing expressions are
+        // explicitly opaque even before any rename. Baseline debt and the new interaction differ.
+        assertEquals(Verdict.UNKNOWN, health.verdict, report.toString())
+        val baselineObservers = health.findings.filter { it.ruleId == "EXISTING_DATABASE_BEHAVIOR" }
+        assertEquals(mapOf(
+            "default:public.accounts.label" to listOf("accounts.insert"),
+            "default:public.logs.label" to listOf("logs.insert"),
+            "check:public.checked_log.checked_log_sequence_visible" to listOf("checked_log.insert"),
+        ), baselineObservers.associate { it.objectName to it.affectedContractIds }, report.toString())
         assertTrue(health.findings.none { it.ruleId == "BASELINE_SQL_UNVERIFIED" ||
             it.ruleId.startsWith("INVALID_BASELINE_") }, report.toString())
         assertEquals(Verdict.UNKNOWN, report.verdict, report.toString())

@@ -116,7 +116,7 @@ object CompatibilityViews {
     private val integerTypes = setOf("smallint", "integer", "bigint")
     private val expressionTokens = Regex("\"(?:[^\"]|\"\")*\"|'(?:[^']|'')*'|[A-Za-z_][A-Za-z_0-9$]*|\\d+|[+*/%<>=!|&^~?:-]+|\\S")
 
-    private fun safeDefault(expression: String, type: String, snapshot: SchemaSnapshot): Boolean {
+    internal fun safeDefault(expression: String, type: String, snapshot: SchemaSnapshot): Boolean {
         if (RuleProofs.constantDefault(expression, type)) return true
         if (builtinType.matches(type) && Regex("NULL(?:::${Regex.escape(type)})?", RegexOption.IGNORE_CASE).matches(expression.trim())) return true
         if (type !in integerTypes) return false
@@ -128,7 +128,7 @@ object CompatibilityViews {
     }
 
     /** Positive fragments only: builtin scalar null checks, text literal comparisons, and integer arithmetic/comparisons. */
-    private fun simpleExpression(expression: String, table: TableSchema): Boolean {
+    internal fun simpleExpression(expression: String, table: TableSchema): Boolean {
         val tokens = expressionTokens.findAll(expression.trim()).map { it.value }.toList()
         if (tokens.isEmpty()) return false
         var start = 0

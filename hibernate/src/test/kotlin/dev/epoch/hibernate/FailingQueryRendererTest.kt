@@ -54,10 +54,14 @@ class FailingQueryRendererTest {
                 assertTrue(contract.queries.any { it.id.startsWith("finite.variant.") }, contract.toString())
                 assertTrue(contract.queries.any { it.operation == Operation.INSERT }, contract.toString())
                 assertFalse(contract.queries.any { it.id in setOf("a.badRenderer", "a.badNative") }, contract.toString())
-                val renderer = contract.unresolvedQueries.single { it.id == "a.badRenderer" }
+                val renderer = contract.unresolvedQueries.single { it.id == "a.badRenderer" || "a.badRenderer" in it.affectedIds }
                 assertContains(renderer.reason, "StackOverflowError: fixture function renderer failed")
                 assertTrue(contract.unresolvedQueries.any { it.id == "a.badNative" && it.reason.contains("Exception") }, contract.toString())
-                assertEquals(1, contract.unresolvedQueries.count { it.id.startsWith("finite.variant.") })
+                val failedVariants = contract.unresolvedQueries.flatMap { it.affectedIds.ifEmpty { listOf(it.id) } }
+                    .filter { it.startsWith("finite.variant.") }
+                assertEquals(1, failedVariants.size)
+                assertEquals(setOf("a.badRenderer", failedVariants.single()), renderer.affectedIds.toSet(),
+                    "The repeated renderer failure retains both query identities without duplicating its cause")
                 assertFalse(contract.coverage.complete)
             }
         } finally { StandardServiceRegistryBuilder.destroy(registry) }

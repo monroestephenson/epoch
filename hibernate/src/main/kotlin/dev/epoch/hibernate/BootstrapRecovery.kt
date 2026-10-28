@@ -13,21 +13,22 @@ internal object BootstrapRecovery {
         val components = components(classes)
         val completed = mutableListOf<Pair<List<Class<*>>, DatabaseContract>>()
         val unresolved = mutableListOf<UnresolvedQuery>()
+        val diagnostics = ExtractionDiagnostics()
+        val budgetSources = sortedSetOf<String>()
         var remainingAttempts = 64
-        fun reject(group: List<List<Class<*>>>, reason: String) {
-            group.flatten().forEach { unresolved += UnresolvedQuery(it.name, reason) }
-        }
         fun visit(group: List<List<Class<*>>>, knownFailure: Throwable? = null) {
             if (group.isEmpty()) return
             val members = group.flatten().sortedBy { it.name }
             val failure = knownFailure ?: if (remainingAttempts-- <= 0) {
-                reject(group, "Partial extraction stopped after the 64-attempt bootstrap isolation budget; this component remains unresolved")
+                budgetSources += members.map { it.name }
                 return
             } else try {
                 completed += members to bootstrap(members)
                 return
             } catch (error: Throwable) { rethrowFatal(error); error }
-            if (group.size == 1) reject(group, "Entity dependency component could not bootstrap: ${describe(failure)}")
+            if (group.size == 1) members.forEach {
+                diagnostics.capture(it.name, "Entity dependency component could not bootstrap", failure)
+            }
             else {
                 val middle = group.size / 2
                 visit(group.take(middle))
@@ -41,11 +42,14 @@ internal object BootstrapRecovery {
             try { combined = bootstrap(successfulClasses) }
             catch (error: Throwable) {
                 rethrowFatal(error)
-                unresolved += UnresolvedQuery("bootstrap.combined", "Successful subsets could not bootstrap together: ${describe(error)}")
+                diagnostics.capture("bootstrap.combined", "Successful subsets could not bootstrap together", error)
             }
         }
-        if (successfulClasses.size == classes.size) unresolved += UnresolvedQuery("bootstrap.combined",
-            "The complete entity set failed bootstrap even though isolated subsets succeeded: ${describe(initialFailure)}")
+        if (successfulClasses.size == classes.size) diagnostics.capture("bootstrap.combined",
+            "The complete entity set failed bootstrap even though isolated subsets succeeded", initialFailure)
+        if (budgetSources.isNotEmpty()) unresolved += UnresolvedQuery("bootstrap.isolation-budget",
+            "Partial extraction stopped after the 64-attempt bootstrap isolation budget; these components remain unresolved",
+            budgetSources.toList())
         val contracts = combined?.let(::listOf) ?: completed.map { it.second }
         val entities = contracts.flatMap { it.entities }.distinct().sortedBy { it.id }
         val groupedQueries = contracts.flatMap { it.queries }.groupBy { it.id }
@@ -55,7 +59,7 @@ internal object BootstrapRecovery {
                 emptyList()
             }
         }.sortedBy { it.id }
-        val allUnresolved = (unresolved + contracts.flatMap { it.unresolvedQueries } +
+        val allUnresolved = (unresolved + diagnostics.unresolved() + contracts.flatMap { it.unresolvedQueries } +
             request.unresolvedDynamicQueries.map { UnresolvedQuery(it.key, it.value) }).distinct().sortedWith(compareBy({ it.id }, { it.reason }))
         return DatabaseContract(applicationVersion = request.applicationVersion, entities = entities, queries = queries,
             coverage = Coverage(false, contracts.flatMap { it.coverage.mechanisms }.distinct().sorted(),
@@ -91,8 +95,11 @@ internal object BootstrapRecovery {
                 try {
                     val associations = prune(retained, omitted) ?: continue
                     val contract = bootstrap(retained, associations.overrides)
-                    val issues = omitted.sortedBy { it.name }.map { UnresolvedQuery(it.name,
-                        "Entity excluded after failed bootstrap: ${describe(previous)}") } +
+                    val diagnostics = ExtractionDiagnostics()
+                    omitted.sortedBy { it.name }.forEach {
+                        diagnostics.capture(it.name, "Entity excluded after failed bootstrap", previous)
+                    }
+                    val issues = diagnostics.unresolved() +
                         associations.paths.map { path -> UnresolvedQuery("${path.owner.name}.${path.property}",
                             "Association declared by ${path.declaring.name}.${path.property} targets excluded entities ${path.targets.filter { it in omitted }.map { it.name }.sorted()}; omitted only in partial extraction, so its SQL and behavior remain unresolved") }
                     return contract.copy(coverage = contract.coverage.copy(complete = false,
@@ -230,5 +237,5 @@ internal object BootstrapRecovery {
     }
 
     fun rethrowFatal(error: Throwable) = ExtractionFailurePolicy.rethrowNonRecoverable(error)
-    fun describe(error: Throwable): String = "${error.javaClass.simpleName}: ${error.message ?: "no additional detail"}"
+    fun describe(error: Throwable): String = QueryExtraction.describe(error)
 }

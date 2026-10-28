@@ -16,7 +16,12 @@ class IdentityResultTypeTest {
         val baseline = directory.resolve("baseline").createDirectories()
         baseline.resolve("V1__baseline.sql").writeText("CREATE TABLE accounts (id serial PRIMARY KEY);")
         val pending = directory.resolve("pending").createDirectories()
-        pending.resolve("V2__serial_enum.sql").writeText("CREATE TYPE serial AS ENUM ('x');")
+        // The unrelated enum no longer invalidates every plan. A real index change on the
+        // selected relation still forces Describe, exercising the frozen JDBC alias boundary.
+        pending.resolve("V2__serial_enum.sql").writeText("""
+            CREATE TYPE serial AS ENUM ('x');
+            CREATE INDEX accounts_id_lookup ON accounts(id);
+        """.trimIndent())
         val query = QueryContract("accounts.read", Operation.SELECT, "SELECT id FROM accounts",
             tables = listOf("public.accounts"), columns = listOf(ColumnReference("public.accounts", "id")),
             resultColumns = listOf(ResultColumn("id", "serial")), dependenciesComplete = true)
