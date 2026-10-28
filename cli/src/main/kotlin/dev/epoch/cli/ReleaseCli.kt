@@ -44,6 +44,11 @@ class VerifyRelease : Callable<Int> {
     var tableSizesPath: Path? = null
     @Option(names = ["--fail-on-operational"], description = ["Also require operational SAFE; exit 4 after a passing compatibility gate"])
     var failOnOperational = false
+    @Option(names = ["--fail-on"], defaultValue = "unknown", paramLabel = "breaking|unknown",
+        converter = [CompatibilityFailurePolicyConverter::class],
+        description = ["Compatibility gate: unknown (default) fails on UNKNOWN and BREAKING; breaking fails only on BREAKING.",
+            "Reported compatibility verdicts remain unchanged."])
+    var failOn = CompatibilityFailurePolicy.UNKNOWN
 
     override fun call(): Int {
         val contracts = contractPaths.map { json.readValue<DatabaseContract>(it.toFile()) }
@@ -72,7 +77,7 @@ class VerifyRelease : Callable<Int> {
                     sarifPath?.let { writeJson(it, sarifReport(directions, migrationPath)) }
                     println("Git migrations: ${files.provenance.baseCommit} -> ${files.provenance.targetCommit}")
                     directions.forEach { (name, report) -> println("Direction: $name\n${renderReport(report, allDetails = details)}") }
-                    verificationExitCode(directions, failOnOperational)
+                    verificationExitCode(directions, failOnOperational, failOn)
                 } catch (failure: Throwable) {
                     try { checkpoint.fail(failure) } catch (checkpointFailure: Throwable) { failure.addSuppressed(checkpointFailure) }
                     throw failure

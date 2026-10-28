@@ -97,6 +97,11 @@ class Verify : Callable<Int> {
     var tableSizesPath: Path? = null
     @Option(names = ["--fail-on-operational"], description = ["Also require operational SAFE; exit 4 after a passing compatibility gate"])
     var failOnOperational = false
+    @Option(names = ["--fail-on"], defaultValue = "unknown", paramLabel = "breaking|unknown",
+        converter = [CompatibilityFailurePolicyConverter::class],
+        description = ["Compatibility gate: unknown (default) fails on UNKNOWN and BREAKING; breaking fails only on BREAKING.",
+            "Reported compatibility verdicts remain unchanged."])
+    var failOn = CompatibilityFailurePolicy.UNKNOWN
 
     override fun call(): Int {
         val contracts = contractPaths.map { json.readValue<DatabaseContract>(it.toFile()) }
@@ -117,13 +122,13 @@ class Verify : Callable<Int> {
                     val directions = report.directionReports()
                     sarifPath?.let { writeJson(it, sarifReport(directions, migrationSourcePrefix)) }
                     directions.forEach { (name, result) -> println("Direction: $name\n${renderReport(result, allDetails = details)}") }
-                    verificationExitCode(directions, failOnOperational)
+                    verificationExitCode(directions, failOnOperational, failOn)
                 } else {
                     val report = verifier.verify(contracts, baseline, migrations, options)
                     checkpoint.complete(report)
                     sarifPath?.let { writeJson(it, sarifReport(listOf("old-on-new" to report), migrationSourcePrefix)) }
                     println(renderReport(report, allDetails = details))
-                    verificationExitCode(listOf("old-on-new" to report), failOnOperational)
+                    verificationExitCode(listOf("old-on-new" to report), failOnOperational, failOn)
                 }
             } catch (failure: Throwable) {
                 try { checkpoint.fail(failure) } catch (checkpointFailure: Throwable) { failure.addSuppressed(checkpointFailure) }
@@ -152,6 +157,11 @@ class Report : Callable<Int> {
     var migrationSourcePrefix = ""
     @Option(names = ["--fail-on-operational"], description = ["Also require measured operational SAFE; exit 4 after a passing compatibility gate"])
     var failOnOperational = false
+    @Option(names = ["--fail-on"], defaultValue = "unknown", paramLabel = "breaking|unknown",
+        converter = [CompatibilityFailurePolicyConverter::class],
+        description = ["Compatibility gate: unknown (default) fails on UNKNOWN and BREAKING; breaking fails only on BREAKING.",
+            "Reported compatibility verdicts remain unchanged."])
+    var failOn = CompatibilityFailurePolicy.UNKNOWN
 
     override fun call(): Int {
         require(!(summaryOnly && details)) { "Choose either --summary or --details" }
@@ -188,7 +198,7 @@ class Report : Callable<Int> {
             sarifPath?.let { writeJson(it, sarifReport(directions, sourcePrefix)) }
             if (directions.any { !it.second.complete } || payload.path("complete").let { it.isBoolean && !it.asBoolean() } ||
                 tree.path("complete").let { it.isBoolean && !it.asBoolean() }) return 3
-            return verificationExitCode(directions, failOnOperational)
+            return verificationExitCode(directions, failOnOperational, failOn)
         }
         val report = json.treeToValue(payload, CompatibilityReport::class.java)
         require(report.schemaVersion == 1) { "Unsupported report schemaVersion: ${report.schemaVersion}" }
@@ -206,7 +216,7 @@ class Report : Callable<Int> {
             return operationalExitCode(0, report.operationalVerdict, failOnOperational)
         }
         require(justification == null) { "--justification requires --write-accepted-baseline" }
-        return verificationExitCode(listOf("old-on-new" to report), failOnOperational)
+        return verificationExitCode(listOf("old-on-new" to report), failOnOperational, failOn)
     }
 }
 
@@ -228,9 +238,11 @@ private fun directionReports(oldOnNew: CompatibilityReport, newOnOld: Compatibil
     dataCompatibility?.let { add("new-writes-old-reads" to it) }
 }
 
-internal fun verificationExitCode(directions: List<Pair<String, CompatibilityReport>>, failOnOperational: Boolean = false): Int {
+internal fun verificationExitCode(directions: List<Pair<String, CompatibilityReport>>, failOnOperational: Boolean = false,
+                                  failOn: CompatibilityFailurePolicy = CompatibilityFailurePolicy.UNKNOWN): Int {
     if (directions.any { !it.second.complete }) return 3
-    val compatibility = exitCode(CompatibilityEngine.aggregate(directions.map { it.second.gateVerdict ?: it.second.verdict }))
+    val verdict = CompatibilityEngine.aggregate(directions.map { it.second.gateVerdict ?: it.second.verdict })
+    val compatibility = compatibilityPolicyExitCode(verdict, failOn)
     val operational = directions.firstOrNull { it.first == "old-on-new" }?.second?.operationalVerdict
     return operationalExitCode(compatibility, operational, failOnOperational)
 }

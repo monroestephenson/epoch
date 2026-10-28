@@ -41,7 +41,23 @@ cli/build/install/db-compat/bin/db-compat verify \
 
 Repeated `--contract` inputs share one migrated baseline and pending migration sequence. They must refer to the same database baseline; use separate verification runs for different databases. Findings namespace contract IDs by input position.
 
-Default exit codes are `0` for compatibility `SAFE`, `1` for `BREAKING`, `2` for `UNKNOWN`, and `3` for invalid input or runtime failure, including unexpected linkage errors. Without acceptance, the exit code follows the overall compatibility verdict. With `--accepted-baseline`, it follows the distinct `gateVerdict`; the report still preserves the overall verdict and justified baseline debt. The optional operational gate below adds exit `4` after a passing compatibility gate.
+## Compatibility CI policy
+
+`verify`, `verify-release`, and saved `report` replay share `--fail-on unknown|breaking`. The default `unknown` blocks UNKNOWN and BREAKING; `breaking` permits completed UNKNOWN results while teams address that debt. This changes exit policy only: JSON, terminal verdicts, findings and coverage remain unchanged. Without baseline acceptance the policy uses the overall verdict; with reviewed `--accepted-baseline` it uses the distinct `gateVerdict`. All requested directions contribute, including new-writes-old-reads.
+
+| Completed compatibility gate | `--fail-on unknown` (default) | `--fail-on breaking` |
+| --- | ---: | ---: |
+| SAFE | 0 | 0 |
+| BREAKING | 1 | 1 |
+| UNKNOWN | 2 | 0 |
+
+For example, replay an existing report under the less restrictive policy without rerunning or changing its evidence:
+
+```sh
+db-compat report --input artifacts/compatibility-report.json --summary --fail-on breaking
+```
+
+Invalid policy values, other invalid input, runtime failures and incomplete reports always return `3`. The optional operational gate below adds exit `4` after compatibility passes the selected policy. See the [rule reference](compatibility-model.md) for each verdict's proof and limits; allowing UNKNOWN does not establish SAFE.
 
 Preserve the executable's exit status in CI. Upload the JSON report after verification, including nonzero compatibility results. Verification checkpoints are explicitly incomplete until the entire requested run succeeds; incomplete reports return exit 3 when rendered and cannot be used to accept baseline debt. Invalid arguments can still fail before a checkpoint is created, so never reuse an earlier run's report as the current result.
 
@@ -66,11 +82,11 @@ db-compat report --input artifacts/compatibility-report.json \
 | --- | ---: |
 | Invalid input, runtime failure, failed measurement, or incomplete run | 3 |
 | Compatibility gate BREAKING | 1 |
-| Compatibility gate UNKNOWN | 2 |
-| Compatibility gate passes; `--fail-on-operational` is set; operational result is RISKY, UNKNOWN, or unavailable | 4 |
-| Compatibility gate passes and the optional operational requirement is satisfied or disabled | 0 |
+| Compatibility gate UNKNOWN with the default `--fail-on unknown` | 2 |
+| Compatibility policy passes (including UNKNOWN with `--fail-on breaking`); requested operational result is RISKY, UNKNOWN, or unavailable | 4 |
+| Compatibility policy passes and the optional operational requirement is satisfied or disabled | 0 |
 
-An older saved report without operational fields returns 4 under that flag only after its compatibility gate passes. With `--new-contract`, all requested compatibility directions must pass first, while operational assessment comes solely from the actual forward migration sequence. Store JSON checkpoints and reports even on exit 4. `report --summary` shows operational rule counts; `--details` adds every retained statement and finding, timeout changes, held-after locks, and rewrites. JSON also retains before-statement and newly observed lock sets. Current SARIF exports compatibility findings only, so keep JSON for operational review. `lint` remains a separate static advisory command and does not satisfy the measured gate.
+An older saved report without operational fields returns 4 under that flag only after its compatibility policy passes. With `--new-contract`, all requested compatibility directions contribute first, while operational assessment comes solely from the actual forward migration sequence. Store JSON checkpoints and reports even on exit 4. `report --summary` shows operational rule counts; `--details` adds every retained statement and finding, timeout changes, held-after locks, and rewrites. JSON also retains before-statement and newly observed lock sets. Current SARIF exports compatibility findings only, so keep JSON for operational review. `lint` remains a separate static advisory command and does not satisfy the measured gate.
 
 ## Table-size estimates
 
@@ -138,7 +154,7 @@ cli/build/install/db-compat/bin/db-compat report \
   --justification "Reviewed baseline debt tracked in ENG-123; retain the existing application contract while addressing these gaps."
 ```
 
-This operation writes every non-safe baseline finding with that justification and exits `0` on success. Review the file, remove entries that should remain blocking, and replace the shared justification with individual explanations where needed. Keep the reviewed file in version control, then add `--accepted-baseline accepted-baseline.json` to verification.
+This operation writes every non-safe baseline finding with that justification and exits `0` on success under either `--fail-on` policy. If `--fail-on-operational` is also requested, its independent gate still applies after the file is written. Review the file, remove entries that should remain blocking, and replace the shared justification with individual explanations where needed. Keep the reviewed file in version control, then add `--accepted-baseline accepted-baseline.json` to verification.
 
 Acceptance never suppresses new migration findings. A stale contract, baseline input, catalog, or evidence fingerprint is rejected. Regenerate and review the file when those inputs deliberately change. An accepted-baseline gate can pass while the overall compatibility verdict remains `UNKNOWN`; display both in CI.
 
@@ -162,7 +178,11 @@ The CLI writes an initial incomplete checkpoint and replaces it atomically after
 
 ## Logging and offline use
 
-The CLI logs concise CLI failures by default. Add `--verbose` (or `-v`) for library INFO logs and full exception traces. Failures always include their underlying cause chain. Default reports group findings by rule and print at most 20 details, prioritizing migrations. `report --summary` omits detail; `--details` prints everything retained in JSON.
+Library output, including migration PostgreSQL NOTICEs, is quiet by default; the CLI still prints its own findings, classpath warnings and concise failure cause chains. Add `--verbose` (or `-v`) for library INFO logs and original exception traces. Extraction keeps shared diagnostic causes and their full source inventory even when normal output is compact.
+
+Default reports group findings by rule and print at most 20 details, prioritizing BREAKING migrations/findings and limiting each affected-ID sample to 20. Default extraction summarizes up to 20 classes without dumping individual access paths. `report --summary` omits finding detail; `extract --details`, `verify --details` and `report --details` expose the retained inventories. Full evidence stays in JSON.
+
+Extraction resolves Hibernate's PostgreSQL 16.8 dialect from pinned offline product facts without a database connection. It does not inject the deprecated explicit-dialect or legacy JDBC-metadata settings that would cause its own verbose warnings. Custom application dialect resolvers are unsupported for this pinned model; see [bootstrap settings](contracts.md#extraction-descriptor).
 
 Initial setup downloads Gradle, dependencies, and Docker images. Once all dependencies for the selected tasks and the required images are cached:
 

@@ -5,6 +5,8 @@ import org.hibernate.boot.registry.StandardServiceRegistry
 import org.hibernate.boot.registry.StandardServiceRegistryBuilder
 import org.hibernate.boot.registry.classloading.spi.ClassLoaderService
 import org.hibernate.boot.registry.classloading.spi.ClassLoadingException
+import org.hibernate.engine.jdbc.dialect.internal.StandardDialectResolver
+import org.hibernate.engine.jdbc.dialect.spi.DialectResolver
 import java.io.IOException
 import java.io.InputStream
 import java.lang.reflect.InvocationHandler
@@ -55,7 +57,12 @@ internal class ExtractionClassLoaderService(private val loader: ClassLoader) : C
         fun registry(settings: Map<String, Any>): StandardServiceRegistry {
             val loader = Thread.currentThread().contextClassLoader ?: ExtractionClassLoaderService::class.java.classLoader
             val bootstrap = BootstrapServiceRegistryBuilder().applyClassLoaderService(ExtractionClassLoaderService(loader)).build()
-            return try { StandardServiceRegistryBuilder(bootstrap).applySettings(settings).build() }
+            return try {
+                StandardServiceRegistryBuilder(bootstrap).applySettings(settings)
+                    // Offline product facts must not enable application resolver callbacks via ServiceLoader.
+                    .addService(DialectResolver::class.java, StandardDialectResolver())
+                    .build()
+            }
             catch (failure: Throwable) {
                 BootstrapServiceRegistryBuilder.destroy(bootstrap)
                 throw failure

@@ -50,19 +50,21 @@ The baseline directory contains the Flyway SQL migrations that establish the sch
 
 Verification starts its own PostgreSQL container. There is no target JDBC URL option and no production database credential is needed. Docker and the pinned container image must be available.
 
-| Command outcome | Exit code |
+| Default command outcome | Exit code |
 | --- | ---: |
 | `SAFE`, successful extraction, or help | 0 |
 | `BREAKING` | 1 |
 | `UNKNOWN` | 2 |
-| Invalid arguments or runtime failure | 3 |
+| Invalid arguments, runtime failure, or incomplete report | 3 |
 | Passing compatibility gate, but operational `RISKY`, `UNKNOWN`, or unavailable with `--fail-on-operational` | 4 |
 
-`report` returns the verdict's exit code too. By default, `UNKNOWN` is a failing CI gate. With an explicitly reviewed accepted-baseline file, `verify` and `report` use the separate `gateVerdict` for their exit code; the overall compatibility verdict remains unchanged. Migration execution/validation failures, lost database connections, and verification timeouts return runtime exit `3` with their stage and migration; they are not completed compatibility verdicts. Extraction success means a contract was written; inspect `coverage` and `unresolvedQueries` before treating it as complete.
+`verify`, `verify-release`, and saved `report` replay accept `--fail-on unknown|breaking`. The default `unknown` blocks both UNKNOWN and BREAKING. `--fail-on breaking` permits a completed UNKNOWN result with exit `0`; its JSON and terminal verdict remain UNKNOWN. With an explicitly reviewed accepted-baseline file, `verify` and `report` apply this policy to the separate `gateVerdict`; the overall compatibility verdict remains unchanged. All requested directions, including new-writes-old-reads, contribute to the gate. See [CI policy and precedence](docs/ci.md#compatibility-ci-policy).
+
+Migration execution/validation failures, lost database connections, and verification timeouts return runtime exit `3` with their stage and migration; they are not completed compatibility verdicts. Incomplete reports remain exit `3` under either policy. Extraction success means a contract was written; inspect `coverage` and `unresolvedQueries` before treating it as complete.
 
 Unexpected errors, including `NoClassDefFoundError`, return `3` and print the underlying cause. Library logging is quiet by default; the CLI prints concise failure causes. Use `--verbose` for INFO logs and full traces.
 
-Read [the descriptor and contract format](docs/contracts.md), [verification boundaries](docs/verification.md), and [CI usage](docs/ci.md) before integrating the result into a deployment workflow. [Current verification refinements](docs/feedback-round2.md) and [repository coverage](docs/repository-coverage.md) document the latest changes; [the earlier feedback record](docs/feedback.md) describes the previous revision.
+Read [the descriptor and contract format](docs/contracts.md), [verification boundaries](docs/verification.md), the [complete rule reference](docs/compatibility-model.md), and [CI usage](docs/ci.md) before integrating the result into a deployment workflow. [Current verification refinements](docs/feedback-round2.md) and [repository coverage](docs/repository-coverage.md) document the latest changes; [the earlier feedback record](docs/feedback.md) describes the previous revision.
 
 ## Baseline health, scale, and multiple persistence units
 
@@ -110,7 +112,7 @@ db-compat verify --contract contract.json \
   --report compatibility-report.json
 ```
 
-Both flags are optional. Caller-supplied [table-size estimates](docs/ci.md#table-size-estimates) grade known risks; small estimates never turn `RISKY` into `SAFE`. Without `--fail-on-operational`, exit codes follow compatibility. With it, a passing compatibility gate additionally requires measured operational `SAFE`; other operational outcomes return `4`. Runtime/incomplete `3` and compatibility `1`/`2` retain precedence. `verify-release` and saved `report` replay support the same gate; legacy reports without operational evidence fail that optional gate.
+Both flags are optional. Caller-supplied [table-size estimates](docs/ci.md#table-size-estimates) grade known risks; small estimates never turn `RISKY` into `SAFE`. Without `--fail-on-operational`, exit codes follow the selected compatibility policy. With it, a passing compatibility gate additionally requires measured operational `SAFE`; other operational outcomes return `4`. This also applies when `--fail-on breaking` permits UNKNOWN compatibility. Runtime/incomplete `3` and compatibility failures under the selected policy take precedence. `verify-release` and saved `report` replay support the same gate; legacy reports without operational evidence fail that optional gate.
 
 See [operational proof boundaries and rules](docs/verification.md#operational-migration-assessment) for supported concurrent-index and split-transaction validation patterns. Only forward deployment migrations contribute to this result. Operational details are in JSON and terminal reports; SARIF currently exports compatibility findings only. The separate `lint` command remains unchanged and provides static review hints.
 

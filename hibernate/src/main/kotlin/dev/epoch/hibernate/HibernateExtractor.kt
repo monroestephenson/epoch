@@ -152,15 +152,25 @@ class HibernateExtractor {
         require(request.hibernateProperties["hibernate.dialect"].let { it == null || it == "org.hibernate.dialect.PostgreSQLDialect" }) {
             "Extraction uses PostgreSQL 16.8; a different hibernate.dialect requires a separate adapter"
         }
+        require(request.hibernateProperties["hibernate.dialect_resolvers"].isNullOrBlank()) {
+            "Offline extraction pins PostgreSQL 16.8 and does not support hibernate.dialect_resolvers; application resolvers are not invoked"
+        }
         val settings = mutableMapOf<String, Any>("hibernate.default_schema" to "public")
         settings.putAll(request.hibernateProperties)
         request.physicalNamingStrategy?.let { settings["hibernate.physical_naming_strategy"] = it }
         request.implicitNamingStrategy?.let { settings["hibernate.implicit_naming_strategy"] = it }
+        // Legacy product hints take precedence in some supported Hibernate runtimes. Remove them
+        // before resolving the dialect from authoritative offline facts through Hibernate's standard resolver.
+        listOf("hibernate.dialect", "hibernate.dialect_resolvers", "hibernate.temp.use_jdbc_metadata_defaults",
+            "javax.persistence.database-product-name", "javax.persistence.database-product-version",
+            "javax.persistence.database-major-version", "javax.persistence.database-minor-version").forEach(settings::remove)
         // Apply these after application properties: extraction must not connect, mutate a schema, or invoke Bean Validation.
         settings.putAll(mapOf(
-            "hibernate.dialect" to org.hibernate.dialect.PostgreSQLDialect(org.hibernate.dialect.DatabaseVersion.make(16, 8)),
             "hibernate.boot.allow_jdbc_metadata_access" to false,
-            "hibernate.temp.use_jdbc_metadata_defaults" to false,
+            "jakarta.persistence.database-product-name" to "PostgreSQL",
+            "jakarta.persistence.database-product-version" to "16.8",
+            "jakarta.persistence.database-major-version" to 16,
+            "jakarta.persistence.database-minor-version" to 8,
             "hibernate.hbm2ddl.auto" to "none",
             "hibernate.connection.provider_class" to "org.hibernate.engine.jdbc.connections.internal.UserSuppliedConnectionProviderImpl",
             "jakarta.persistence.validation.mode" to "none",

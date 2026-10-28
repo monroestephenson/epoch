@@ -24,4 +24,4 @@ This table maps the reported issues to the implementation and documents the limi
 | 16 | `nativeQueryParameterTypes` supplies types for explicit and named native queries. | Preparation does not establish full native-query dependencies or behavioral safety. |
 | 17 | Verification help describes contract/report paths and the new options. | Use each command's `--help` for exact syntax. |
 | 18 | Baseline health, justified acceptance files, rule summaries, and bounded terminal detail reduce duplicate noise. | Acceptance changes a separate CI gate, never the original compatibility verdict or new migration findings. |
-| 19 | Optional checksummed baseline dumps avoid replaying historical migrations; logging defaults to warnings/errors. | Cache hits still start a fresh container and restore a baseline; `--verbose` enables INFO logs and traces. |
+| 19 | Optional checksummed baseline dumps avoid replaying historical migrations; library output is quiet by default while CLI warnings and failure causes remain visible. | Cache hits still start a fresh container and restore a baseline; `--verbose` enables INFO logs and traces. |

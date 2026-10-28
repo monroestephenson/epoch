@@ -2,6 +2,8 @@
 
 Epoch asks a bounded question: do the old SQL and mappings in this explicit contract retain their supported structural dependencies after each migration? It does not prove equivalence of arbitrary programs or SQL behavior.
 
+The [complete rule reference](compatibility-model.md) lists every built-in compatibility rule, measured operational rule, static lint hint and runtime failure stage. [CI policy](ci.md#compatibility-ci-policy) controls which completed verdicts fail the process; it does not change the evidence or proof model.
+
 ## Database workflow
 
 1. Start a disposable PostgreSQL 16.8 container.
