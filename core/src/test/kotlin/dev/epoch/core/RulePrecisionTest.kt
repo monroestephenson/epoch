@@ -7,11 +7,13 @@ import kotlin.test.assertTrue
 class RulePrecisionTest {
     private val engine = CompatibilityEngine()
     private val migration = MigrationInfo("2", "V2__change.sql")
-    private val table = TableSchema(columns = mapOf("id" to ColumnSchema("bigint", false), "status" to ColumnSchema("character varying(20)", true)))
-    private val baseline = SchemaSnapshot(tables = mapOf("public.customer" to table))
+    private val table = TableSchema(columns = mapOf("id" to ColumnSchema("bigint", false, typeAcceptsImplicitNull = true),
+        "status" to ColumnSchema("character varying(20)", true, collation = "pg_catalog.default", typeAcceptsImplicitNull = true)),
+        relationSecurity = RelationSecurity("epoch", false, false, false, false))
+    private val baseline = SchemaSnapshot(tables = mapOf("public.customer" to table), expressionSearchPath = listOf("pg_catalog", "public"))
     private val entity = EntityContract("Customer", "public.customer", listOf(
         ColumnContract("id", "bigint", false, updatable = false),
-        ColumnContract("status", "varchar", true, length = 20),
+        ColumnContract("status", "varchar", true, length = 20, declaredNonNull = false, hibernateNullable = true),
     ))
     private val contract = DatabaseContract(entities = listOf(entity), coverage = Coverage(complete = true))
     private fun verify(target: TableSchema, input: DatabaseContract = contract, old: SchemaSnapshot = baseline) =
@@ -85,7 +87,7 @@ class RulePrecisionTest {
         assertRule(verify(table.copy(columns = table.columns + ("status" to table.columns.getValue("status").copy(nullable = false)))), Verdict.BREAKING, "MAPPED_NULL_REJECTED")
         val checked = table.copy(constraints = mapOf("valid" to ConstraintSchema("c", "CHECK(status IS NOT NULL)")))
         assertRule(verify(checked.copy(columns = checked.columns + ("status" to checked.columns.getValue("status").copy(nullable = false))),
-            old = baseline.copy(tables = mapOf("public.customer" to checked))), Verdict.UNKNOWN, "NULLABILITY_CHANGED")
+            old = baseline.copy(tables = mapOf("public.customer" to checked))), Verdict.SAFE, "REDUNDANT_NOT_NULL")
     }
 
     @Test fun `mapped length narrowing proves exclusion while widening preserves string reads`() {
@@ -182,9 +184,9 @@ class RulePrecisionTest {
     }
 
     @Test fun `integer narrowing rejects values in the old mapped range`() {
-        val oldTable = table.copy(columns = table.columns + ("id" to ColumnSchema("integer", false)))
+        val oldTable = table.copy(columns = table.columns + ("id" to ColumnSchema("integer", false, typeAcceptsImplicitNull = true)))
         val input = contract.copy(entities = listOf(entity.copy(columns = entity.columns.map { if (it.name == "id") it.copy(typeName = "INTEGER") else it })))
-        assertRule(verify(oldTable.copy(columns = oldTable.columns + ("id" to ColumnSchema("smallint", false))), input,
+        assertRule(verify(oldTable.copy(columns = oldTable.columns + ("id" to ColumnSchema("smallint", false, typeAcceptsImplicitNull = true))), input,
             baseline.copy(tables = mapOf("public.customer" to oldTable))), Verdict.BREAKING, "MAPPED_TYPE_NARROWED")
     }
 

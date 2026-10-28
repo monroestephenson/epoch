@@ -10,12 +10,12 @@ class CompatibilityEngineTest {
     private val engine = CompatibilityEngine()
     private val migration = MigrationInfo("2", "V2__change.sql")
     private val table = TableSchema(columns = linkedMapOf(
-        "id" to ColumnSchema("bigint", false, ordinal = 1),
-        "email" to ColumnSchema("text", true, ordinal = 2),
+        "id" to ColumnSchema("bigint", false, ordinal = 1, typeAcceptsImplicitNull = true),
+        "email" to ColumnSchema("text", true, ordinal = 2, typeAcceptsImplicitNull = true),
     ), relationSecurity = RelationSecurity("epoch", false, false, false, false))
     private val baseline = SchemaSnapshot(mapOf("public.customers" to table))
     private val entity = EntityContract("Customer", "public.customers", listOf(
-        ColumnContract("id", "bigint", false), ColumnContract("email", "text", true),
+        ColumnContract("id", "bigint", false), ColumnContract("email", "text", true, declaredNonNull = false, hibernateNullable = true),
     ))
     private val contract = DatabaseContract(applicationVersion = "1.0", entities = listOf(entity), coverage = Coverage(complete = true))
     private fun verify(target: TableSchema, c: DatabaseContract = contract) =

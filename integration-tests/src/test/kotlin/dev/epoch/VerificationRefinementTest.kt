@@ -181,7 +181,8 @@ class VerificationRefinementTest {
 
     @Test fun `SET NOT NULL excludes mapped nullable write input`() {
         val report = verify("CREATE TABLE accounts (id bigint PRIMARY KEY, label text);",
-            contract(insert(), entities = listOf(mapped(ColumnContract("label", "text", nullable = true)))),
+            contract(insert(), entities = listOf(mapped(ColumnContract("label", "text", nullable = true,
+                declaredNonNull = false, hibernateNullable = true)))),
             "ALTER TABLE accounts ALTER COLUMN label SET NOT NULL;")
         assertEquals(Verdict.BREAKING, report.verdict, report.toString())
         assertTrue(report.migrations.flatMap { it.findings }.any { it.ruleId == "MAPPED_NULL_REJECTED" }, report.toString())

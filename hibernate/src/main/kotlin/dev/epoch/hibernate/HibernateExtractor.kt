@@ -168,8 +168,12 @@ class HibernateExtractor {
                     } + "</entity-mappings>"
                 sources.addInputStream(mappings.byteInputStream())
             }
-            val factory = sources.buildMetadata().buildSessionFactory() as SessionFactoryImplementor
-            try { return extractFactory(factory, request) } finally { factory.close() }
+            val metadata = sources.buildMetadata()
+            val factory = metadata.buildSessionFactory() as SessionFactoryImplementor
+            try {
+                val unbounded = BootColumnBounds.unboundedStrings(metadata, request.hibernateProperties["hibernate.default_schema"] ?: "public")
+                return extractFactory(factory, request, unbounded)
+            } finally { factory.close() }
         } finally { StandardServiceRegistryBuilder.destroy(registry) }
     }
 
@@ -202,12 +206,17 @@ class HibernateExtractor {
     }
 
     /** For tests/adapters already bootstrapping Hibernate with all application-specific settings. */
-    fun extractFactory(factory: SessionFactoryImplementor, request: ExtractionRequest): DatabaseContract {
+    fun extractFactory(factory: SessionFactoryImplementor, request: ExtractionRequest): DatabaseContract =
+        extractFactory(factory, request, emptySet())
+
+    private fun extractFactory(factory: SessionFactoryImplementor, request: ExtractionRequest,
+                               unbounded: Set<BootColumnBounds.Key>): DatabaseContract {
         // Hibernate 7 changed this public compile-time constant; resolve it from the actual runtime.
         val sqlTemplate = org.hibernate.sql.Template::class.java.getField("TEMPLATE").get(null) as String
         val unresolved = request.unresolvedDynamicQueries.toSortedMap().map { UnresolvedQuery(it.key, it.value) }.toMutableList()
         val entities = mutableListOf<EntityContract>()
         val queries = mutableListOf<QueryContract>()
+        val mappingIds = linkedMapOf<String, Map<String, String>>()
         val scopeNotes = mutableListOf("Hibernate runtime ${org.hibernate.Version.getVersionString()}; PostgreSQL dialect version ${factory.jdbcServices.dialect.version}.")
         val persisters = factory.mappingMetamodel.streamEntityDescriptors().toList().sortedBy { it.entityName }
         for (raw in persisters) {
@@ -222,6 +231,8 @@ class HibernateExtractor {
                 continue
             }
             val operations = operations(request, p)
+            val dynamicInput = Operation.INSERT in operations && p.entityMetamodel.isDynamicInsert ||
+                Operation.UPDATE in operations && p.entityMetamodel.isDynamicUpdate
             if (operations != Operation.entries.toSet()) scopeNotes += "Entity ${p.entityName} operations are scoped to ${operations.sortedBy { it.name }}."
             val selectables = linkedMapOf<Pair<String, String>, SelectableMapping>()
             val consume: (Int, SelectableMapping) -> Unit = consume@{ _, s ->
@@ -237,7 +248,11 @@ class HibernateExtractor {
             p.identifierMapping.forEachSelectable(consume)
             p.forEachSelectable(consume)
             // Secondary/JOINED tables have their own key columns, which do not always appear among attribute selectables.
+            val customMutations = linkedMapOf<String, Pair<Boolean, Boolean>>()
+            val optionalTables = mutableSetOf<String>()
             p.forEachMutableTable { table ->
+                customMutations[qualified(table.tableName)] = (table.insertCustomSql != null) to (table.updateCustomSql != null)
+                if (table.isOptional) optionalTables += qualified(table.tableName)
                 // KeyMapping changes from a class to an interface in Hibernate 7.4.
                 // Dispatch through its stable superinterface in both runtime generations.
                 val keySelectables: SelectableMappings = table.keyMapping
@@ -246,15 +261,23 @@ class HibernateExtractor {
                 }
             }
             val primitiveColumns = mutableSetOf<Pair<String, String>>()
+            val generatedColumns = mutableSetOf<Pair<String, String>>()
             val declaredNullability = mutableMapOf<Pair<String, String>, MutableSet<Boolean?>>()
             fun recordDeclaration(attribute: AttributeMapping) {
                 // A component/container/association declaration does not describe every JDBC leaf.
                 val value = if (attribute is BasicValuedModelPart)
                     DeclaredNullability.of(attribute.propertyAccess?.getter?.member) else null
+                // Hibernate's state-array position links this property (including component leaves)
+                // to its actual generator. An audit timestamp must not hide unrelated input domains.
+                val generated = p.entityMetamodel.generators?.getOrNull(attribute.stateArrayPosition)?.let { generator ->
+                    Operation.INSERT in operations && generator.generatesOnInsert() ||
+                        Operation.UPDATE in operations && generator.generatesOnUpdate()
+                } == true
                 attribute.forEachSelectable { _, selectable ->
                     if (!selectable.isFormula) {
                         val key = qualified(p.physicalTableNameForMutation(selectable)) to identifier(selectable.selectionExpression)
                         declaredNullability.getOrPut(key) { linkedSetOf() } += value
+                        if (generated) generatedColumns += key
                     }
                 }
             }
@@ -282,23 +305,37 @@ class HibernateExtractor {
                 unresolved += UnresolvedQuery(p.entityName, "ALL/DIRTY optimistic locking creates runtime-dependent predicates")
             if (p.mappedClass.annotations.any { it.annotationClass.java.name in CUSTOM_SQL_ANNOTATIONS || it.annotationClass.java.name.startsWith("org.hibernate.annotations.SQL") })
                 unresolved += UnresolvedQuery(p.entityName, "Custom Hibernate SQL requires a separate declared query contract")
+            val tableMappings = selectables.keys.map { it.first }.distinct().sorted().associateWith { table ->
+                if (selectables.keys.map { it.first }.distinct().size == 1) p.entityName else "${p.entityName}@$table"
+            }
+            mappingIds[p.entityName] = tableMappings
             selectables.entries.groupBy { it.key.first }.toSortedMap().forEach { (table, entries) ->
                 entities += EntityContract(
-                    id = if (selectables.keys.map { it.first }.distinct().size == 1) p.entityName else "${p.entityName}@$table",
+                    id = tableMappings.getValue(table),
                     table = table,
                     columns = entries.map { (key, s) ->
                         val valueMetadata = MappingValueMetadata.inspect(s.jdbcMapping)
+                        val insertable = s.isInsertable
+                        val updatable = s.isUpdateable && key.second !in p.identifierColumnNames.map(::identifier)
+                        val custom = customMutations[table]
+                        val directInput = inputDomainComplete(s.jdbcMapping, valueMetadata) &&
+                            s.customWriteExpression.let { it == null || it.trim() == "?" } && !dynamicInput && key !in generatedColumns &&
+                            (Operation.INSERT !in operations || !insertable || custom?.first == false) &&
+                            (Operation.UPDATE !in operations || !updatable || custom?.second == false) &&
+                            // Optional secondary rows can be skipped/deleted when their values are NULL.
+                            !(table in optionalTables && (Operation.INSERT in operations && insertable ||
+                                Operation.UPDATE in operations && updatable))
                         ColumnContract(
                         name = key.second,
                         typeName = jdbcName(s.jdbcMapping),
                         nullable = s.isNullable && key !in primitiveColumns,
-                        insertable = s.isInsertable,
-                        updatable = s.isUpdateable && key.second !in p.identifierColumnNames.map(::identifier),
+                        insertable = insertable,
+                        updatable = updatable,
                         generated = p.generator is org.hibernate.id.IdentityGenerator && table == qualified(p.identifierTableMapping.tableName) && key.second in p.identifierColumnNames.map(::identifier),
                         length = s.length, precision = s.precision, scale = s.scale,
                         enumValues = valueMetadata.enumValues,
                         logicalJavaType = logicalType(s.jdbcMapping).name,
-                        inputDomainComplete = inputDomainComplete(s.jdbcMapping),
+                        inputDomainComplete = directInput,
                         declaredNonNull = declaredNullability[key]?.singleOrNull(),
                         hibernateNullable = s.isNullable,
                         enumMode = valueMetadata.enumMode,
@@ -307,6 +344,8 @@ class HibernateExtractor {
                         enumEncoding = valueMetadata.enumEncoding,
                         converterClass = valueMetadata.converterClass,
                         converterBytecodeSha256 = valueMetadata.converterBytecodeSha256,
+                        lengthUnbounded = directInput && logicalType(s.jdbcMapping) == String::class.java &&
+                            BootColumnBounds.Key(p.entityName, table, key.second) in unbounded,
                     ) }.sortedBy { it.name },
                     operations = operations,
                     generatedIdentifier = generatedId,
@@ -324,10 +363,18 @@ class HibernateExtractor {
             val operations = operations(request, p)
             fun capture(id: String, operation: Operation, sql: String, tables: List<String>, binders: List<JdbcParameterBinder>) {
                 val deps = SqlDependencies.inspect(sql, request.hibernateProperties["hibernate.default_schema"] ?: "public")
+                val references = deps.tables.ifEmpty { tables }.distinct().sorted()
+                // Hibernate knows the mutation target even when its SQL uses an unsupported MERGE
+                // form. Retaining provenance does not establish complete dependencies or behavior.
+                val target = deps.target ?: tables.singleOrNull().takeIf { operation != Operation.SELECT }
+                val origins = mappingIds[p.entityName].orEmpty().filterKeys { table ->
+                    if (operation == Operation.SELECT) table in references
+                    else table == target && table in tables
+                }.values.sorted()
                 queries += QueryContract(id, operation, sql, deps.tables.ifEmpty { tables }.distinct().sorted(), deps.columns, deps.writes,
                     parameterTypes = parameterTypes(binders), source = QuerySource.HIBERNATE_MAPPING,
                     dependenciesComplete = deps.complete, explicitColumnList = true,
-                    targetTable = deps.target)
+                    targetTable = target, mappedEntityIds = origins)
                 if (!deps.complete) unresolved += UnresolvedQuery(id, "Generated SQL has an unsupported dependency expression or unresolved table alias")
             }
             if (Operation.SELECT in operations) try {
@@ -361,7 +408,7 @@ class HibernateExtractor {
                 }
             }
         }
-        extractCollections(factory, request, entities, queries, unresolved)
+        extractCollections(factory, request, entities, queries, unresolved, unbounded)
         val session = factory.openSession()
         try {
             fun hql(id: String, text: String, source: QuerySource, variant: String? = null) {
@@ -445,7 +492,7 @@ class HibernateExtractor {
 
     private fun extractCollections(factory: SessionFactoryImplementor, request: ExtractionRequest,
                                    entities: MutableList<EntityContract>, queries: MutableList<QueryContract>,
-                                   unresolved: MutableList<UnresolvedQuery>) {
+                                   unresolved: MutableList<UnresolvedQuery>, unbounded: Set<BootColumnBounds.Key>) {
         for (raw in factory.mappingMetamodel.streamCollectionDescriptors().toList().sortedBy { it.role }) {
             val p = raw as? org.hibernate.persister.collection.BasicCollectionPersister
             val owner = raw.ownerEntityPersister as? AbstractEntityPersister
@@ -472,7 +519,9 @@ class HibernateExtractor {
                 val deps = SqlDependencies.inspect(sql, request.hibernateProperties["hibernate.default_schema"] ?: "public")
                 collectionQueries += QueryContract("$role.$suffix", operation, sql, deps.tables, deps.columns, deps.writes,
                     parameterTypes = parameterTypes(binders), source = QuerySource.HIBERNATE_MAPPING,
-                    dependenciesComplete = deps.complete, targetTable = deps.target)
+                    dependenciesComplete = deps.complete, targetTable = deps.target,
+                    mappedEntityIds = if (if (operation == Operation.SELECT) table in deps.tables else deps.target == table)
+                        listOf("$role@collection") else emptyList())
                 if (!deps.complete) unresolved += UnresolvedQuery("$role.$suffix", "Collection SQL dependency resolution is incomplete")
             }
             try {
@@ -514,13 +563,19 @@ class HibernateExtractor {
                 "Collection SQL includes columns without complete selectable metadata: ${(observedColumns - selectables.keys).sorted()}")
             entities += EntityContract("$role@collection", table, selectables.map { (name, s) ->
                 val valueMetadata = MappingValueMetadata.inspect(s.jdbcMapping)
+                val directInput = inputDomainComplete(s.jdbcMapping, valueMetadata) &&
+                    s.customWriteExpression.let { it == null || it.trim() == "?" } &&
+                    !(collectionQueries.any { it.operation == Operation.INSERT } && p.collectionTableMapping.insertDetails.customSql != null) &&
+                    !(collectionQueries.any { it.operation == Operation.UPDATE } && p.collectionTableMapping.updateDetails.customSql != null)
                 ColumnContract(name, jdbcName(s.jdbcMapping), s.isNullable, s.isInsertable, s.isUpdateable,
                     length = s.length, precision = s.precision, scale = s.scale, enumValues = valueMetadata.enumValues,
-                    logicalJavaType = logicalType(s.jdbcMapping).name, inputDomainComplete = inputDomainComplete(s.jdbcMapping),
+                    logicalJavaType = logicalType(s.jdbcMapping).name, inputDomainComplete = directInput,
                     hibernateNullable = s.isNullable, enumMode = valueMetadata.enumMode,
                     enumConstants = valueMetadata.enumConstants, enumRelationalValues = valueMetadata.enumRelationalValues,
                     enumEncoding = valueMetadata.enumEncoding, converterClass = valueMetadata.converterClass,
-                    converterBytecodeSha256 = valueMetadata.converterBytecodeSha256)
+                    converterBytecodeSha256 = valueMetadata.converterBytecodeSha256,
+                    lengthUnbounded = directInput && logicalType(s.jdbcMapping) == String::class.java &&
+                        BootColumnBounds.Key("$role@collection", table, name) in unbounded)
             }.sortedBy { it.name }, collectionQueries.map { it.operation }.toSet().ifEmpty { setOf(Operation.SELECT) })
         }
     }
@@ -571,8 +626,11 @@ class HibernateExtractor {
         }
         private fun logicalType(mapping: org.hibernate.metamodel.mapping.JdbcMapping): Class<*> =
             mapping.valueConverter?.domainJavaType?.javaTypeClass ?: mapping.javaTypeDescriptor.javaTypeClass
-        private fun inputDomainComplete(mapping: org.hibernate.metamodel.mapping.JdbcMapping): Boolean {
+        private fun inputDomainComplete(mapping: org.hibernate.metamodel.mapping.JdbcMapping, facts: MappingValueMetadata.Facts): Boolean {
             if (mapping.valueConverter != null) return false
+            // Recognized standard native PostgreSQL enums live outside descriptor.jdbc. Their finite
+            // relational values are established by exact EnumJavaType/JdbcType metadata above.
+            if (logicalType(mapping).isEnum) return facts.enumEncoding != null && facts.enumRelationalValues.isNotEmpty()
             if (!mapping.jdbcType.javaClass.name.startsWith("org.hibernate.type.descriptor.jdbc.")) return false
             val type = logicalType(mapping)
             return type.isEnum || type.isPrimitive || type.name in setOf("java.lang.String", "java.lang.Character",

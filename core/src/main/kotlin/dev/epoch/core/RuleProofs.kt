@@ -1,5 +1,7 @@
 package dev.epoch.core
 
+import java.math.BigInteger
+
 /** Deliberately small proof fragments over PostgreSQL catalog definitions, never migration regexes. */
 internal object RuleProofs {
     private val builtin = "(?:smallint|integer|bigint|real|double precision|numeric(?:\\(\\d+(?:,\\d+)?\\))?|text|character varying(?:\\(\\d+\\))?|boolean)"
@@ -8,6 +10,16 @@ internal object RuleProofs {
         val value = expression.trim()
         val literal = "(?:[-+]?\\d+(?:\\.\\d+)?(?:[eE][-+]?\\d+)?|true|false|'(?:[^']|'')*')"
         return Regex("^$literal(?:::$builtin)?$", RegexOption.IGNORE_CASE).matches(value)
+    }
+
+    /** Exact builtin nextval over a catalog-resolved sequence; no arbitrary default evaluation. */
+    fun sequenceDefault(expression: String?, type: String, snapshot: SchemaSnapshot): Boolean {
+        if (expression == null || type !in setOf("smallint", "integer", "bigint") ||
+            snapshot.expressionSearchPath.firstOrNull() != "pg_catalog") return false
+        val name = Regex("(?:pg_catalog\\.)?nextval\\('([A-Za-z_][A-Za-z_0-9$]*(?:\\.[A-Za-z_][A-Za-z_0-9$]*)?)'::(?:pg_catalog\\.)?regclass\\)")
+            .matchEntire(expression.trim())?.groupValues?.get(1) ?: return false
+        return if ('.' in name) name in snapshot.sequences else
+            snapshot.expressionSearchPath.any { "$it.$name" in snapshot.sequences }
     }
 
     private data class Shape(val family: String, val integerDigits: Int? = null, val fractionDigits: Int = 0, val length: Long? = null)
@@ -57,14 +69,29 @@ internal object RuleProofs {
             }
             return null
         }
-        if (a.family == "integer" && (column.logicalJavaType == null || column.logicalJavaType in setOf("byte", "short", "int", "long", "java.lang.Byte", "java.lang.Short", "java.lang.Integer", "java.lang.Long"))) {
-            val mapped = column.typeName?.let(::shape)
-            if (mapped?.family == "integer" && mapped.integerDigits!! <= a.integerDigits!! && mapped.integerDigits > b.integerDigits!!) {
-                return "Declared mapped integer type ${column.typeName} includes values in $before outside the target $after range."
+        if (a.family == "integer") {
+            val logicalBits = when (column.logicalJavaType) {
+                null -> 64
+                "byte", "java.lang.Byte" -> 8
+                "short", "java.lang.Short" -> 16
+                "int", "java.lang.Integer" -> 32
+                "long", "java.lang.Long" -> 64
+                else -> return null
+            }
+            val physicalBits = integerBits(before) ?: return null
+            val mappedBits = column.typeName?.let(::integerBits) ?: return null
+            val targetBits = integerBits(after) ?: return null
+            val acceptedBits = minOf(physicalBits, mappedBits, logicalBits)
+            if (acceptedBits > targetBits) {
+                val witness = BigInteger.ONE.shiftLeft(targetBits - 1)
+                return "Integer $witness fits the baseline $before and mapped ${column.typeName}/${column.logicalJavaType ?: "declared JDBC domain"}, but exceeds $after."
             }
         }
-        if (a.family == "string" && (column.logicalJavaType == null || column.logicalJavaType == "java.lang.String") && column.length != null && column.length > b.length!! && column.length <= a.length!!) {
-            return "Declared mapped length ${column.length} is accepted by $before and exceeds target length ${b.length}."
+        if (a.family == "string" && (column.logicalJavaType == null || column.logicalJavaType == "java.lang.String")) {
+            val mappedLength = if (column.lengthUnbounded) Long.MAX_VALUE else column.length
+            if (mappedLength != null && minOf(mappedLength, a.length!!) > b.length!!) {
+                return "A string of ${b.length + 1} characters fits the ${if (column.lengthUnbounded) "explicitly unbounded" else "length $mappedLength"} mapped domain and baseline $before, but exceeds $after."
+            }
         }
         if (a.family == "numeric" && (column.logicalJavaType == null || column.logicalJavaType == "java.math.BigDecimal") && column.precision != null && column.scale != null) {
             val integer = column.precision - column.scale
@@ -75,6 +102,30 @@ internal object RuleProofs {
         }
         return null
     }
+
+    private fun integerBits(type: String) = when (type.lowercase().trim()) {
+        "tinyint" -> 8
+        "smallint", "int2" -> 16
+        "integer", "int", "int4" -> 32
+        "bigint", "int8" -> 64
+        else -> null
+    }
+
+    /** A complete simple catalog expression, not an occurrence inside arbitrary SQL. */
+    fun notNullCheck(constraint: ConstraintSchema): String? {
+        if (constraint.type != "c") return null
+        val expression = constraint.checkExpression ?: constraint.definition.substringBefore("; validated=")
+            .removePrefix("CHECK ").removePrefix("CHECK").trim()
+        val identifier = "(?:\"(?:[^\"]|\"\")+\"|[A-Za-z_][A-Za-z_0-9]*)"
+        val match = Regex("^($identifier)\\s+IS\\s+NOT\\s+NULL$", RegexOption.IGNORE_CASE)
+            .matchEntire(unwrap(expression.trim())) ?: return null
+        return postgresIdentifier(match.groupValues[1].removeSurrounding("\"").replace("\"\"", "\""))
+    }
+
+    /** Row/composite IS NOT NULL has different semantics from a scalar datum's NOT NULL. */
+    fun scalarNullTest(type: String, snapshot: SchemaSnapshot): Boolean =
+        Regex("(?:smallint|integer|bigint|boolean|real|double precision|numeric(?:\\(\\d+(?:,\\s*-?\\d+)?\\))?|text|character varying(?:\\(\\d+\\))?|character(?:\\(\\d+\\))?|bytea|uuid|date|timestamp(?:\\(\\d+\\))? (?:with|without) time zone|time(?:\\(\\d+\\))? (?:with|without) time zone|interval(?:\\(\\d+\\))?|json|jsonb)").matches(type) ||
+            type in snapshot.enumTypes || "public.$type" in snapshot.enumTypes
 
     /** Conservative bound for ordinary btree tuples on PostgreSQL's supported 8 KiB pages. */
     fun boundedBtreeKey(table: TableSchema, index: String): Boolean {

@@ -70,6 +70,8 @@ data class ColumnContract(
     val converterClass: String? = null,
     /** SHA-256 of the converter's defining class artifact; not a semantic equivalence proof. */
     val converterBytecodeSha256: String? = null,
+    /** A supported explicit unbounded string declaration; missing length alone is not evidence. */
+    val lengthUnbounded: Boolean = false,
 )
 
 data class ColumnReference(val table: String, val column: String)
@@ -94,6 +96,8 @@ data class QueryContract(
     val targetTable: String? = null,
     val accessPathIds: List<String> = emptyList(),
     val observationFrames: List<String> = emptyList(),
+    /** Exact entity/table mapping entries from which this ORM statement was generated. */
+    val mappedEntityIds: List<String> = emptyList(),
 )
 
 data class SchemaSnapshot(

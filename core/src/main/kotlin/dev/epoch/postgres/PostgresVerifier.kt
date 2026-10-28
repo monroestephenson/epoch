@@ -308,7 +308,11 @@ class PostgresVerifier {
             val prefix = "contract[${index + 1}]/"
             item.copy(
                 entities = item.entities.map { it.copy(id = prefix + it.id) },
-                queries = item.queries.map { it.copy(id = prefix + it.id, accessPathIds = it.accessPathIds.map { path -> prefix + path }) },
+                queries = item.queries.map { it.copy(
+                    id = prefix + it.id,
+                    accessPathIds = it.accessPathIds.map { path -> prefix + path },
+                    mappedEntityIds = it.mappedEntityIds.map { entity -> prefix + entity },
+                ) },
                 unresolvedQueries = item.unresolvedQueries.map { it.copy(id = prefix + it.id) },
                 accessPaths = item.accessPaths.map { it.copy(id = prefix + it.id, queryIds = it.queryIds.map { query -> prefix + query }) },
             )

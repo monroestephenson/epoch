@@ -30,7 +30,7 @@ The baseline must reproduce the schema against which the old contract was valid.
 | A replacement view cannot support a baseline-valid old write, even with trigger support included | `BREAKING`, with the affected operation and PostgreSQL capability evidence. |
 | Add a `NOT NULL` column that old inserts necessarily omit as NULL | `BREAKING` when catalog type and write-behavior facts establish rejection; otherwise `UNKNOWN`. |
 | SQL valid at baseline becomes invalid after a migration | A breaking SQL finding when the PostgreSQL failure establishes incompatibility. |
-| Tighten mapped nullable inputs or narrow a mapped length/precision domain | `BREAKING` when the supported baseline input proof establishes an excluded value; otherwise `UNKNOWN`. |
+| Tighten declared nullable inputs or narrow a mapped length/precision domain | `BREAKING` when direct mapping and catalog evidence establish an old accepted value that the target rejects; otherwise `UNKNOWN`. |
 | Widen supported write types | Can be `SAFE`; old read mappings are checked separately. |
 | Change a referenced column's collation | `UNKNOWN` (`COLUMN_COLLATION_CHANGED`); comparison and ordering semantics require a separate proof. |
 | Add a nullable or required column with a supported constant default | Can be `SAFE` for old explicit-column inserts; newly imposed constraints still receive their own checks. |
@@ -50,6 +50,20 @@ Constant defaults do not waive newly added constraints. For example, an old `INS
 The omitted-NULL exemption requires positive catalog evidence: no column default, identity, generated expression, type-level default or domain restriction, and no opaque table write behavior. Every component of a composite foreign key must meet this proof; one NULL does not establish safety for `MATCH FULL`. Missing type or relation facts remain unknown. `OMITTED_COLUMN_VALUE_UNPROVEN` explains this boundary for newly added nullable columns, including domains whose own NOT NULL constraint is absent from the column's `attnotnull` flag. Extension ownership suppresses generic behavior noise; it does not erase a table's actual trigger/rule facts or a type's domain semantics.
 
 `ExpansionCompatibilityTest` exercises constant defaults, varchar-to-text widening, serial identifier dependencies, and new nullable foreign keys against PostgreSQL. Its rejection witnesses demonstrate FK and domain failures that successful planning alone misses. `VerificationRefinementTest` covers unrelated drops and their dependent objects, supported index changes, new-table sequences, and bounded widening. Integer widening with old readers and unbounded B-tree keys retain their separate hydration and input-size limits; these are not unconditional SAFE rules.
+
+## Write-domain proofs
+
+NOT NULL and a supported `CHECK (column IS NOT NULL)` share the same input reasoning. A direct writable mapping with `declaredNonNull=false` can establish `MAPPED_NULL_REJECTED` only when Hibernate does not already reject NULL and the baseline database accepts it. `OMITTED_NULL_REJECTED` uses a separate proven omitted-NULL INSERT witness. `NON_NULL_INPUT_PRESERVED` establishes SAFE only when every relevant writer is covered; a native query or an unrelated generated statement cannot borrow a member's non-null declaration. Generated SQL uses explicit `mappedEntityIds` to establish its source mapping. Missing declarations, converters, column transformers, custom mutation SQL, dynamic mutations, and generated property values retain their own proof limits.
+
+A validated baseline non-null CHECK can prove that later SET NOT NULL is redundant (`REDUNDANT_NOT_NULL`). An unvalidated CHECK does not establish that existing rows satisfy it. In particular, a newly added NOT VALID CHECK can reject an UPDATE of an unrelated column on a preexisting NULL row. The empty verification database is not evidence that those rows cannot exist. Preserve the old accepted NULL domain during rollout, or first establish the non-null invariant for all affected writes and rows.
+
+CHECK equivalence is limited to supported scalar types. A PostgreSQL composite such as `ROW(NULL, 1)` can pass physical NOT NULL yet fail `IS NOT NULL`, which also examines its fields. An exact existing validated CHECK is separate evidence; a physical NOT NULL flag alone does not establish the composite CHECK.
+
+An entity's INSERT and UPDATE can have different input behavior. A proven non-null UPDATE does not cover an INSERT that omits the same column; each omission needs its own default or NULL proof. Removing a column default also does not establish breakage when a domain still supplies a value, or when the old default already made the omitted INSERT fail.
+
+`MAPPED_TYPE_NARROWED` intersects supported logical input bounds with the baseline database's accepted range. An explicit unbounded string declaration is distinct from missing length metadata; a finite witness longer than the new limit can prove rejection. A Java Byte stored as BIGINT does not acquire BIGINT's full logical input range. `ENUM_VALUE_REJECTED` and `ENUM_CHECK_ACCEPTS_MAPPED_VALUES` use actual relational values, not guessed Java names, and account for baseline restrictions and supported comparison semantics. A custom collation can make two different labels compare equal, so a literal set difference alone cannot prove CHECK rejection there. Keep the old accepted values or bounds until old writers are retired.
+
+Dormant mapping drift remains baseline health: a missing physical column produces `INVALID_BASELINE_COLUMN`, with no pending-migration attribution. It cannot support a fabricated new failure or terminate the rest of verification.
 
 ## Compatibility views
 

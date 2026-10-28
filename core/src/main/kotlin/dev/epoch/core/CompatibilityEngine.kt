@@ -84,7 +84,7 @@ class CompatibilityEngine {
                 entity.columns.forEach { column ->
                     if (column.name !in oldTable.columns) unknown("INVALID_BASELINE_COLUMN", "${entity.table}.${column.name}", "A mapped column is absent from the baseline.", "The old operation is not established as valid against the baseline.", listOf(entity.id))
                     val physicalType = oldTable.columns[column.name]?.type
-                    val enumLabels = baseline.enumTypes[physicalType] ?: baseline.enumTypes["public.$physicalType"]
+                    val enumLabels = physicalType?.let { baseline.enumTypes[it] ?: baseline.enumTypes["public.$it"] }
                     if (enumLabels != null && column.enumValues.any { it !in enumLabels }) unknown(
                         "INVALID_BASELINE_ENUM", "${entity.table}.${column.name}", "The old mapped enum domain includes values absent from the baseline PostgreSQL enum.",
                         "Mapped=${column.enumValues}; baseline=$enumLabels.", listOf(entity.id))
@@ -108,10 +108,13 @@ class CompatibilityEngine {
 
         // A catalog mismatch is not a demonstrated regression if the old operation was
         // already invalid against the supplied baseline.
-        val rejectedBaselineIds = (additionalFindings + findings).filter {
+        val directlyRejectedBaselineIds = (additionalFindings + findings).filter {
             it.ruleId == "BASELINE_SQL_UNVERIFIED" || it.ruleId.startsWith("INVALID_BASELINE_")
         }.flatMap { it.affectedContractIds }.toSet() +
             allIds.groupingBy { it }.eachCount().filterValues { it > 1 }.keys
+        val rejectedBaselineIds = directlyRejectedBaselineIds + contract.queries.filter {
+            it.id in directlyRejectedBaselineIds && it.source == QuerySource.HIBERNATE_MAPPING
+        }.flatMap { it.mappedEntityIds }
         val validBaselineIds = (contract.entities.filter { entity ->
             entity.columns.isNotEmpty() && entity.operations.isNotEmpty() &&
                 entity.columns.all { it.name in (baseline.tables[entity.table]?.columns ?: emptyMap()) }
@@ -230,13 +233,128 @@ class CompatibilityEngine {
         fun hasInputForeignKey(table: TableSchema, column: String) = table.constraints.values.any {
             it.type == "f" && (it.columns.isEmpty() || column in it.columns)
         }
-        fun unconstrainedInput(table: TableSchema, column: String) = !opaqueWriteBehavior && table.kind == "table" &&
+        fun unconstrainedInput(table: TableSchema, column: String) = !opaqueWriteBehavior && ordinaryWriteSemantics(table) &&
+            table.columns[column]?.typeAcceptsImplicitNull == true &&
             table.constraints.values.none { it.type == "c" } && !hasInputForeignKey(table, column)
+        fun enumComparisonKnown(table: TableSchema, column: String) =
+            table.columns[column]?.collation == "pg_catalog.default" &&
+                table.columns[column]?.type?.let { Regex("(?:text|character varying(?:\\(\\d+\\))?|varchar(?:\\(\\d+\\))?)").matches(it) } == true &&
+                baseline.expressionSearchPath.firstOrNull() == "pg_catalog" &&
+                after.expressionSearchPath.firstOrNull() == "pg_catalog"
         fun permitsEnumValue(table: TableSchema, column: String, value: String) = !opaqueWriteBehavior &&
-            table.kind == "table" && !hasInputForeignKey(table, column) &&
+            ordinaryWriteSemantics(table) && table.columns[column]?.typeAcceptsImplicitNull == true && !hasInputForeignKey(table, column) &&
             table.constraints.values.filter { it.type == "c" }.all { previous ->
-                RuleProofs.enumCheck(previous)?.let { it.first == column && value in it.second } == true
+                RuleProofs.enumCheck(previous)?.let { it.first == column && enumComparisonKnown(table, column) && value in it.second } == true
             }
+
+        fun mappedWriteColumns(table: String, column: String) = contract.entities.filter {
+            it.table == table && it.id in validBaselineIds
+        }.flatMap { entity -> entity.columns.filter { it.name == column && writesColumn(entity, it) }.map { entity to it } }
+        fun generatedWriterSupported(query: QueryContract, table: String, column: String,
+                                     accepts: (ColumnContract) -> Boolean): Boolean {
+            if (query.source != QuerySource.HIBERNATE_MAPPING || query.id !in validBaselineIds ||
+                queryTarget(query) != table || query.mappedEntityIds.isEmpty() ||
+                query.writeColumns.none { it.table == table && it.column == column }) return false
+            val mappings = query.mappedEntityIds.map { id -> contract.entities.singleOrNull { it.id == id } ?: return false }
+            val relevant = mappings.filter { it.table == table }
+            return relevant.isNotEmpty() && relevant.all { entity ->
+                entity.id in validBaselineIds && query.operation in entity.operations &&
+                    entity.columns.singleOrNull { it.name == column }?.let { mapped ->
+                        val writes = if (query.operation == Operation.INSERT) mapped.insertable && !mapped.generated else
+                            query.operation == Operation.UPDATE && mapped.updatable
+                        writes && accepts(mapped)
+                    } == true
+            }
+        }
+        fun allSupportedWriters(table: String, column: String, accepts: (ColumnContract) -> Boolean): Set<String> =
+            mappedWriteColumns(table, column).filter { accepts(it.second) }.map { it.first.id }.toSet() +
+                contract.queries.filter { generatedWriterSupported(it, table, column, accepts) }.map { it.id }
+        fun insertAndUpdateIds(table: String) = contract.entities.filter {
+            it.table == table && it.operations.any { operation -> operation == Operation.INSERT || operation == Operation.UPDATE }
+        }.map { it.id } + contract.queries.filter {
+            queryTarget(it) == table && it.operation in setOf(Operation.INSERT, Operation.UPDATE)
+        }.map { it.id }
+        fun updateIds(table: String) = contract.entities.filter { it.table == table && Operation.UPDATE in it.operations }.map { it.id } +
+            contract.queries.filter { queryTarget(it) == table && it.operation == Operation.UPDATE }.map { it.id }
+        fun everyUpdateReplacesValue(table: String, column: String, accepts: (ColumnContract) -> Boolean) =
+            contract.entities.filter { it.table == table && Operation.UPDATE in it.operations }.all { entity ->
+                entity.id in validBaselineIds && entity.columns.singleOrNull { it.name == column }?.let {
+                    it.updatable && accepts(it)
+                } == true
+            } && contract.queries.filter { queryTarget(it) == table && it.operation == Operation.UPDATE }.all {
+                generatedWriterSupported(it, table, column, accepts)
+            }
+        fun baselineNonNull(table: TableSchema, column: String) = table.columns[column]?.nullable == false ||
+            table.constraints.values.any { it.validated && RuleProofs.notNullCheck(it) == column }
+        fun baselineAcceptsNull(table: TableSchema, column: String) = !opaqueWriteBehavior && ordinaryWriteSemantics(table) &&
+            table.columns[column]?.let { it.nullable && it.typeAcceptsImplicitNull == true } == true &&
+            !hasInputForeignKey(table, column) && table.constraints.values.filter { it.type == "c" }.all {
+                RuleProofs.enumCheck(it)?.first == column && enumComparisonKnown(table, column)
+            }
+        fun implicitNonNull(table: TableSchema, column: String): Boolean {
+            val value = table.columns[column] ?: return false
+            return !opaqueWriteBehavior && ordinaryWriteSemantics(table) && value.typeAcceptsImplicitNull == true &&
+                value.generated.isNullOrEmpty() && RuleProofs.constantDefault(value.defaultExpression, value.type)
+        }
+        fun nullTightening(tableName: String, column: String, old: TableSchema, target: TableSchema,
+                           validated: Boolean, rule: String, evidence: String, checkConstraint: Boolean = false) {
+            val allWrites = insertAndUpdateIds(tableName)
+            if (allWrites.isEmpty()) return
+            val objectName = "$tableName.$column"
+            val repeatedValidatedCheck = old.columns[column]?.type == target.columns[column]?.type &&
+                old.constraints.values.any { it.validated && RuleProofs.notNullCheck(it) == column }
+            if (checkConstraint && !repeatedValidatedCheck && target.columns[column]?.let {
+                    it.typeAcceptsImplicitNull == true && RuleProofs.scalarNullTest(it.type, after)
+                } != true) {
+                unknown(rule, objectName, "IS NOT NULL is not established as a scalar non-null constraint for this column type.",
+                    "$evidence; type=${target.columns[column]?.type}. Composite row predicates and custom/domain semantics require separate proof.", allWrites)
+                return
+            }
+            if (baselineNonNull(old, column) && ordinaryWriteSemantics(old) && ordinaryWriteSemantics(target) && !opaqueWriteBehavior) {
+                finding(Verdict.SAFE, "REDUNDANT_NOT_NULL", objectName,
+                    "The baseline already excludes NULL through a validated constraint.",
+                    "$evidence; baseline NOT NULL or validated IS NOT NULL CHECK establishes the same accepted NULL domain.", allWrites)
+                return
+            }
+            val directWriters = columnWriters(tableName, column)
+            val omissions = omittingInserts(tableName, column)
+            val unknownWriters = contract.queries.filter { queryTarget(it) == tableName &&
+                (it.operation == Operation.INSERT && !it.explicitColumnList || it.operation == Operation.UPDATE && it.writeColumns.isEmpty()) }.map { it.id }
+            val relevant = (directWriters + omissions + unknownWriters + if (!validated) updateIds(tableName) else emptyList()).distinct()
+            if (relevant.isEmpty()) return
+            val mappedNulls = mappedWriteColumns(tableName, column).filter { (_, mapped) ->
+                mapped.declaredNonNull == false && mapped.inputDomainComplete &&
+                    mapped.hibernateNullable != false && mapped.nullable != false &&
+                    mapped.logicalJavaType !in setOf("byte", "short", "int", "long", "float", "double", "boolean", "char")
+            }.map { it.first.id }
+            val ordinary = ordinaryWriteSemantics(old) && ordinaryWriteSemantics(target) && !opaqueWriteBehavior &&
+                target.columns[column]?.typeAcceptsImplicitNull == true
+            if (ordinary && baselineAcceptsNull(old, column)) {
+                if (mappedNulls.isNotEmpty()) finding(Verdict.BREAKING, "MAPPED_NULL_REJECTED", objectName,
+                    "The new constraint rejects NULL in a declared nullable direct writable mapping.",
+                    "$evidence; declaredNonNull=false, direct input domain complete, and no known Hibernate null restriction. The baseline accepts SQL NULL.",
+                    mappedNulls, "Keep the column nullable until old writers no longer supply NULL.")
+                val omittedNulls = omissions.filter { it in validBaselineIds && omittedValueIsNull(old, column) &&
+                    target.columns[column]?.let { value -> value.defaultExpression == null && value.identity.isNullOrEmpty() && value.generated.isNullOrEmpty() } == true }
+                if (omittedNulls.isNotEmpty()) finding(Verdict.BREAKING, "OMITTED_NULL_REJECTED", objectName,
+                    "The new constraint rejects NULL supplied by an old INSERT that omits this column.",
+                    "$evidence; the baseline and target provide no column/type default, identity, generated value, or opaque write transformation.",
+                    omittedNulls, "Preserve nullable input or provide a compatible non-null default while old INSERTs omit this column.")
+                if (mappedNulls.isNotEmpty() || omittedNulls.isNotEmpty()) return
+            }
+            val nonNullWriters = allSupportedWriters(tableName, column) { it.inputDomainComplete && it.declaredNonNull == true }
+            val nonNullOmissions = if (implicitNonNull(target, column)) omissions.toSet() else emptySet()
+            val unrelatedUpdates = if (validated) updateIds(tableName).filter { it !in directWriters && it !in unknownWriters }.toSet() else emptySet()
+            val oldRowsCovered = validated || everyUpdateReplacesValue(tableName, column) { it.inputDomainComplete && it.declaredNonNull == true }
+            if (ordinary && oldRowsCovered && unknownWriters.isEmpty() && nonNullOmissions.containsAll(omissions) &&
+                (nonNullWriters + nonNullOmissions + unrelatedUpdates).containsAll(relevant)) {
+                finding(Verdict.SAFE, "NON_NULL_INPUT_PRESERVED", objectName,
+                    "Every relevant old write supplies a proven non-null value.",
+                    "$evidence; direct writers have declaredNonNull=true with complete mapped SQL provenance; omitted values have supported non-null constant defaults.", relevant)
+            } else unknown(rule, objectName,
+                "The new non-null constraint restricts inputs whose complete accepted domain is not established.",
+                "$evidence; relevant operations=${relevant.sorted()}; proven non-null operations=${(nonNullWriters + nonNullOmissions + unrelatedUpdates).sorted()}. Missing declaration/provenance, custom writes, implicit values, or unvalidated existing rows require additional proof.", relevant)
+        }
 
         for (tableName in (baseline.tables.keys + after.tables.keys).sorted()) {
             val old = baseline.tables[tableName]
@@ -322,7 +440,7 @@ class CompatibilityEngine {
                         "Baseline collation=${a.collation}; target collation=${b.collation}; unchanged SQL types do not establish equivalent collation semantics.",
                         columnReferences + writers)
                     if (a.type != b.type && (columnReferences.isNotEmpty() || writeIds(tableName).isNotEmpty())) {
-                        val narrowed = if (new.kind == "table" && unconstrainedInput(old, columnName)) mapped.mapNotNull { (id, column) ->
+                        val narrowed = if (ordinaryWriteSemantics(new) && b.typeAcceptsImplicitNull == true && unconstrainedInput(old, columnName)) mapped.mapNotNull { (id, column) ->
                             RuleProofs.mappedNarrowing(column, a.type, b.type)?.let { id to it }
                         } else emptyList()
                         val readers = contract.entities.filter { it.table == tableName && Operation.SELECT in it.operations && it.columns.any { c -> c.name == columnName } }.map { it.id } +
@@ -338,24 +456,19 @@ class CompatibilityEngine {
                             else -> unknown("COLUMN_TYPE_CHANGED", objectName, "Parameter binding and result hydration compatibility are not established for a changed type.", "Baseline type=${a.type}; target type=${b.type}.", columnReferences + writers)
                         }
                     }
-                    if (a.nullable && !b.nullable && writers.isNotEmpty()) {
-                        val nullWriters = mapped.filter { it.second.nullable == true && it.second.inputDomainComplete &&
-                            it.second.logicalJavaType !in setOf("byte", "short", "int", "long", "float", "double", "boolean", "char") }.map { it.first }
-                        if (nullWriters.isNotEmpty() && unconstrainedInput(old, columnName) && new.kind == "table") finding(Verdict.BREAKING, "MAPPED_NULL_REJECTED", objectName,
-                            "The new NOT NULL constraint rejects NULL in a declared nullable writable mapping.",
-                            "Baseline accepts NULL; mapped nullable=true and writable=true; target nullable=false. No baseline CHECK, relevant foreign key, or opaque write behavior restricts the declared input domain.",
-                            nullWriters, "Keep the column nullable until old writers no longer supply NULL.")
-                        else unknown("NULLABILITY_CHANGED", objectName, "The new NOT NULL constraint may reject old inputs; their accepted domain is not established.",
-                            "Baseline nullable=${a.nullable}; target nullable=${b.nullable}.", columnReferences + writers)
-                    }
+                    if (a.nullable && !b.nullable) nullTightening(tableName, columnName, old, new,
+                        validated = true, rule = "NULLABILITY_CHANGED", evidence = "Baseline nullable=true; target nullable=false")
                     if (!a.nullable && b.nullable && columnReferences.isNotEmpty()) unknown("NULLABILITY_CHANGED", objectName,
                         "New NULL results may violate old hydration assumptions.", "Baseline nullable=false; target nullable=true.", columnReferences)
                     val omitted = omittingInserts(tableName, columnName).filter { it in validBaselineIds }
-                    val generationRemoved = !opaqueWriteBehavior && old.kind == "table" && new.kind == "table" && (a.defaultExpression != null || !a.identity.isNullOrEmpty()) &&
+                    val oldGenerationNonNull = !a.identity.isNullOrEmpty() || RuleProofs.constantDefault(a.defaultExpression, a.type) ||
+                        RuleProofs.sequenceDefault(a.defaultExpression, a.type, baseline)
+                    val generationRemoved = !opaqueWriteBehavior && ordinaryWriteSemantics(old) && ordinaryWriteSemantics(new) &&
+                        b.typeAcceptsImplicitNull == true && oldGenerationNonNull &&
                         b.defaultExpression == null && b.identity.isNullOrEmpty() && b.generated.isNullOrEmpty() && !b.nullable && omitted.isNotEmpty()
                     if (generationRemoved) finding(Verdict.BREAKING, "REQUIRED_GENERATION_REMOVED", objectName,
                         "Old INSERT operations omit a required column whose default or identity was removed.",
-                        "Baseline default=${a.defaultExpression}, identity=${a.identity}; target has no default/identity and is NOT NULL.", omitted,
+                        "Baseline default=${a.defaultExpression}, identity=${a.identity}; target is NOT NULL with no column/type default, identity, generated expression, or opaque write transformation.", omitted,
                         "Preserve the default or identity while old INSERT operations omit this column.")
                     else {
                         if (a.defaultExpression != b.defaultExpression && tableReferences.isNotEmpty()) unknown("DEFAULT_CHANGED", objectName, "Default changes may alter accepted writes or generated values.", "Baseline default=${a.defaultExpression}; target default=${b.defaultExpression}.", tableReferences)
@@ -391,14 +504,24 @@ class CompatibilityEngine {
                     continue
                 }
                 if (!columnRelevant && b == null) continue
+                val nonNullColumn = b?.let(RuleProofs::notNullCheck)
+                if (nonNullColumn != null) {
+                    val targetCheck = requireNotNull(b)
+                    nullTightening(tableName, nonNullColumn, old, new, targetCheck.validated,
+                        "CONSTRAINT_CHANGED", "Target CHECK=${targetCheck.definition}; validated=${targetCheck.validated}", checkConstraint = true)
+                    continue
+                }
                 val enumCheck = b?.let(RuleProofs::enumCheck)
                 if (enumCheck != null) {
+                    val targetCheck = requireNotNull(b)
                     val (column, accepted) = enumCheck
                     val mapped = contract.entities.filter { it.table == tableName && it.id in validBaselineIds }.flatMap { entity ->
                         entity.columns.filter { it.name == column && writesColumn(entity, it) && it.enumValues.isNotEmpty() && it.inputDomainComplete }.map { entity.id to it }
                     }
+                    val comparisonKnown = enumComparisonKnown(old, column) && enumComparisonKnown(new, column) &&
+                        ordinaryWriteSemantics(new) && new.columns[column]?.typeAcceptsImplicitNull == true
                     val excluded = mapped.flatMap { (id, mapping) -> mapping.enumValues.filter { value ->
-                        value !in accepted && permitsEnumValue(old, column, value)
+                        comparisonKnown && value !in accepted && permitsEnumValue(old, column, value)
                     }.map { id to it } }
                     if (excluded.isNotEmpty()) {
                         finding(Verdict.BREAKING, "ENUM_VALUE_REJECTED", "$tableName.$column", "The new CHECK rejects an enum value the old mapping can write.",
@@ -406,10 +529,21 @@ class CompatibilityEngine {
                             "Retain every enum value written by old applications.")
                         continue
                     }
-                    val writers = columnWriters(tableName, column)
-                    val supportedWriters = mapped.map { it.first }.toSet() + contract.queries.filter { it.source == QuerySource.HIBERNATE_MAPPING &&
-                        queryTarget(it) == tableName && it.writeColumns.any { c -> c.column == column } }.map { it.id }
-                    if (mapped.isNotEmpty() && supportedWriters.containsAll(writers) && mapped.all { accepted.containsAll(it.second.enumValues) }) {
+                    val omissions = omittingInserts(tableName, column)
+                    val unknownWriters = contract.queries.filter { queryTarget(it) == tableName &&
+                        (it.operation == Operation.INSERT && !it.explicitColumnList || it.operation == Operation.UPDATE && it.writeColumns.isEmpty()) }.map { it.id }
+                    val writers = columnWriters(tableName, column) + omissions + unknownWriters +
+                        if (targetCheck.validated) emptyList() else updateIds(tableName)
+                    val supportedOmissions = if (omittedValueIsNull(new, column)) omissions.toSet() else emptySet()
+                    val supportedWriters = allSupportedWriters(tableName, column) {
+                        it.inputDomainComplete && it.enumValues.isNotEmpty() && accepted.containsAll(it.enumValues)
+                    } + supportedOmissions
+                    val oldRowsCovered = targetCheck.validated || everyUpdateReplacesValue(tableName, column) {
+                        it.inputDomainComplete && it.enumValues.isNotEmpty() && accepted.containsAll(it.enumValues)
+                    }
+                    if (comparisonKnown && oldRowsCovered && unknownWriters.isEmpty() && supportedOmissions.containsAll(omissions) &&
+                        !opaqueWriteBehavior && ordinaryWriteSemantics(old) &&
+                        mapped.isNotEmpty() && supportedWriters.containsAll(writers) && mapped.all { accepted.containsAll(it.second.enumValues) }) {
                         finding(Verdict.SAFE, "ENUM_CHECK_ACCEPTS_MAPPED_VALUES", "$tableName.$name", "The supported CHECK accepts every enum value in the declared writable domain.",
                             "Mapped values=${mapped.flatMap { it.second.enumValues }.distinct().sorted()}; accepted values=${accepted.sorted()}.", writers)
                         continue
@@ -487,7 +621,8 @@ class CompatibilityEngine {
                     unknown("ENUM_TYPE_CHANGED", name, "The PostgreSQL enum changed without a complete mapped input domain.", "Baseline=$a; target=$b.")
                 continue
             }
-            val excluded = mappings.filter { (entity, column) -> writesColumn(entity, column) && column.inputDomainComplete }.flatMap { (entity, column) ->
+            val excluded = mappings.filter { (entity, column) -> entity.id in validBaselineIds && writesColumn(entity, column) && column.inputDomainComplete &&
+                after.tables[entity.table]?.let { ordinaryWriteSemantics(it) && it.columns[column.name]?.typeAcceptsImplicitNull == true } == true }.flatMap { (entity, column) ->
                 column.enumValues.filter { it in a.orEmpty() && it !in b.orEmpty() &&
                     baseline.tables[entity.table]?.let { table -> permitsEnumValue(table, column.name, it) } == true
                 }.map { entity.id to it }
