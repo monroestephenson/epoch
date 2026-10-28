@@ -2,6 +2,8 @@
 
 This log follows the requested 17-item order. Each completed item is checked with `./gradlew --no-daemon --offline test`, including the Docker-backed PostgreSQL suite. Gradle may reuse passing results for unchanged inputs. Proof-only additions do not replace an already working implementation.
 
+The eight [urgent follow-up findings](field-trial-followup.md#urgent-follow-up-against-cf152e0) were addressed before items 16–17. The resulting full suite passed: 709 tests, no failures, errors or skips, including Docker-backed PostgreSQL.
+
 | Item | Status | Evidence and remaining limits |
 | --- | --- | --- |
 | 1. Hibernate 7 | IMPLEMENTED (7.4.9 follow-up) | Initially verified the existing 7.0/7.1 adapter without production rework. The subsequent explicit 7.4.9 requirement needed bridges for its select-operation types and key-mapping interface. `Hibernate7CompiledFixtureTest.Kotlin List associations compiled against Hibernate 7 extract with the application runtime` now compiles generic `@ManyToMany` and join-table `@OneToMany` fixtures against 7.4.9 and verifies entity CRUD, collection SQL, and named association HQL under real 7.0.10, 7.1.4, and 7.4.9 runtimes. `Hibernate7RuntimeTest` covers HQL mutations and native queries. The bundled 6.6 runtime stays isolated. Full suite passed: 288 tests, no failures or skips. |
