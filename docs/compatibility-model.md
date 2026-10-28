@@ -140,6 +140,8 @@ Sources: `postgres/PostgresQueryPlanner.kt`, `PostgresBoundaryProbes.kt`, `Migra
 | `FLYWAY_CALLBACK_UNSUPPORTED` | UNKNOWN | Baseline/pending SQL lifecycle callback file discovered; callbacks are outside the supported contract and were not executed. | Use versioned migrations for required changes or verify callback behavior separately. |
 | `MIGRATION_DATABASE_CALLBACK_UNPROVEN` | UNKNOWN | Measured statements encounter applicable event callbacks/opaque database effects that can mutate data beyond catalog observations. | Aggregates matching causes and statement ordinals from operational callback evidence. This is compatibility uncertainty as well as an independent operational assessment; unchanged catalogs do not prove unchanged data. Exact affected application paths are not invented. |
 
+A fresh committed verification session that differs from the known baseline policy produces UNKNOWN `POSTGRES_SQL_REJECTED` evidence with the synthetic marker `EPOCH_SESSION_UNPROVEN`; PostgreSQL did not reject the query, and no SQL/boundary execution is credited under that unsupported policy. Session changes invalidate reuse independently of catalog changes, including recovery to the baseline policy. This adds no new compatibility rule ID.
+
 Planner detail worth spelling out: PREPARE derives OTHER/native parameter types from the actual baseline PostgreSQL expression/catalog context; inferred types are frozen for later states. EXPLAIN is without ANALYZE, and Describe does not execute the DML. This still does not assert arbitrary planning-time functions have no side effects; existing planning/execution safety guards and behavior limitations remain part of scope.
 
 ## New writes read by the old release
@@ -211,7 +213,7 @@ Source: `postgres/OperationalLint.kt`. These inspect SQL text and never enter co
 
 ## Runtime failures and checkpoint states: no compatibility rule
 
-Sources: `postgres/VerificationRuntime.kt`, `PostgresVerifier.kt`, `PostgresOperationalMonitor.kt`, `PostgresQueryPlanner.kt`, and CLI `VerificationCheckpoint.kt`/`Main.kt`. `VerificationException.stage` identifies failure to complete verification. An execution failure is exit 3, not UNKNOWN or BREAKING. Checkpoints preserve only completed evidence; replay of an incomplete checkpoint exits 3. Process-level termination can have a signal exit status; its preserved checkpoint still remains incomplete rather than a compatibility verdict.
+Sources: `postgres/VerificationRuntime.kt`, `CommittedMigrationCoordinator.kt`, `DeferredQueryPlanning.kt`, `CanonicalCatalog.kt`, `PostgresVerifier.kt`, `PostgresOperationalMonitor.kt`, `PostgresQueryPlanner.kt`, and CLI `VerificationCheckpoint.kt`/`Main.kt`. `VerificationException.stage` identifies failure to complete verification. An execution failure is exit 3, not UNKNOWN or BREAKING. Checkpoints preserve only completed evidence; replay of an incomplete checkpoint exits 3. Process-level termination can have a signal exit status; its preserved checkpoint still remains incomplete rather than a compatibility verdict.
 
 | Exact stage | Evidence / recovery |
 | --- | --- |
@@ -219,11 +221,15 @@ Sources: `postgres/VerificationRuntime.kt`, `PostgresVerifier.kt`, `PostgresOper
 | `BASELINE_EXECUTION_FAILED` | Flyway could not build the supplied baseline (unless a timeout supplies the more specific stage). Repair the actual baseline SQL/runtime inputs. This differs from SQL mappings already invalid on a successfully built baseline. |
 | `BASELINE_VALIDATION_FAILED` | Flyway validation rejects the constructed/restored baseline, e.g. checksums/history. Repair baseline/cache inputs instead of accepting it as compatibility debt. |
 | `MIGRATION_EXECUTION_FAILED` | Pending Flyway execution/callback failed, including unavailable container/connection or malformed migration SQL. Retain the current migration filename/version and cause; no completed target schema is certified. |
-| `MIGRATION_TIMEOUT` | Per-migration deadline aborts its connection, or an execution SQLSTATE 57014 explicitly reports timeout. Increase a deliberately sized bound or fix the blocked/slow operation. This is not a structural UNKNOWN. |
+| `MIGRATION_TIMEOUT` | The original pending-migration budget covers SQL, history/COMMIT, catalog checks, committed query workers and publication; expiry aborts registered connections. An execution SQLSTATE 57014 may also explicitly report timeout. Increase a deliberately sized bound or fix the blocked/slow operation. This is not a structural UNKNOWN. |
+| `COMMITTED_SCHEMA_CHANGED` | The durable catalog differs from the precommit capture under canonical inspection, so previously captured evidence cannot certify that committed state. Earlier checkpoints survive. Review commit-time effects; no stale plans or failed step are published as completed. |
+| `PENDING_PLANNING_SESSION_CHANGED` | A committed verification connection or worker changes its expected session while checks are running. Its evidence is incomplete; the stage retains the original migration and exits 3. A fresh session already differing from the baseline policy is instead unverified query evidence (`EPOCH_SESSION_UNPROVEN`), not this infrastructure stage. |
 | `GLOBAL_TIMEOUT` | Whole verification exceeds its deadline, including startup; work is cancelled and owned-container cleanup is started without delaying timeout delivery. Preserve/replay only completed checkpoints. |
 | `INTERRUPTED` | Verification thread is interrupted, or CLI shutdown records interruption. Cancellation is not per-query extraction debt; partial reports stay incomplete. |
 | `PROGRESS_REPORT_FAILED` | A progress callback cannot durably publish its checkpoint. Repair output/filesystem/callback handling; execution evidence cannot be represented as a completed verdict. |
 | `OPERATIONAL_MEASUREMENT_FAILED` | Flyway statement observation fails or its identity/session facts cannot be measured. The migration may have run, but measured verification did not complete; preserve migration and cause. |
+
+A pending migration becomes a completed report step only after a successful commit and all selected checks. Typed verification failures wrapped by Flyway retain their specific stage and migration; a later callback does not reattribute an earlier deferred failure. Generic signal checkpoints do not yet carry a separate pending-worker-stage identity.
 
 Checkpoint-only labels: `IN_PROGRESS` is written before/during the run; `INCOMPLETE` marks closure without a successful finalized report; `RUNTIME_FAILURE` is the fallback when an unexpected failure has no more specific VerificationException stage. Invalid CLI/JSON/descriptor input, linkage errors and other unexpected top-level Throwables also return 3; not every failure occurs late enough to have a checkpoint file. Fatal VM failures and cancellation are not converted to recoverable extraction UNKNOWNs.
 

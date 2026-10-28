@@ -2,8 +2,6 @@ package dev.epoch.postgres
 
 import dev.epoch.core.*
 import org.flywaydb.core.Flyway
-import org.flywaydb.core.api.callback.Callback
-import org.flywaydb.core.api.callback.Context
 import org.flywaydb.core.api.callback.Event
 import org.testcontainers.postgresql.PostgreSQLContainer
 import org.testcontainers.utility.DockerImageName
@@ -66,6 +64,15 @@ class PostgresVerifier {
 
     private data class VerificationRun(val forward: CompatibilityReport, val reverse: CompatibilityReport? = null,
                                        val dataCompatibility: CompatibilityReport? = null)
+
+    private data class PendingVerificationStep(
+        val migration: MigrationInfo,
+        val canonicalCatalog: SchemaSnapshot,
+        val migrationSql: String?,
+        val readFailure: String?,
+        val measured: OperationalAssessment,
+        val callbackEffects: List<Finding>,
+    )
 
     private fun runVerification(
         contracts: List<DatabaseContract>, newContracts: List<DatabaseContract>?,
@@ -142,11 +149,13 @@ class PostgresVerifier {
                     val engine = CompatibilityEngine()
                     val baseline: SchemaSnapshot
                     val baselinePlans: Map<String, QueryPlan>
+                    val baselineSession: Map<String, String?>
                     val baselinePlanResult: BaselinePlans
                     val boundaryBaseline: BoundaryProbeBaseline?
                     DriverManager.getConnection(database.jdbcUrl, database.username, database.password).use { connection ->
                         baseline = catalog.inspect(connection)
-                        baselinePlanResult = BaselinePlanCache(options.baselineCache, PlanningSession.capture(connection)).prepare(contract, cacheKey, baseline) { queries ->
+                        baselineSession = PlanningSession.capture(connection)
+                        baselinePlanResult = BaselinePlanCache(options.baselineCache, baselineSession).prepare(contract, cacheKey, baseline) { queries ->
                             planBatch(connection, queries, baseline)
                         }
                         baselinePlans = baselinePlanResult.plans
@@ -173,62 +182,95 @@ class PostgresVerifier {
                         withOperational(engine.report(contract, steps.toList(), baselineHealth, options.acceptedBaseline)))
                     var priorSchema = baseline
                     var currentPlans = baselinePlans
+                    var previousPlanningSession = baselineSession
                     val acceptedBaselineIds = ReadCompatibility.establishedBaselineIds(contract, baseline,
                         baselinePlans.filterValues { it.accepted }.keys, baselineHealth.findings)
                     var preservedIntegerColumns = IntegerReadPreservation.initial(baseline)
-                    MigrationDeadline(options.migrationTimeoutSeconds).use { deadline ->
-                        val callback = object : Callback {
-                            override fun getCallbackName() = "epoch-intermediate-schema-verification"
-                            override fun supports(event: Event, context: Context?) = event == Event.AFTER_EACH_MIGRATE
-                            override fun canHandleInTransaction(event: Event, context: Context?) = true
-                            override fun handle(event: Event, context: Context) {
-                                val info = context.migrationInfo
-                                val migration = MigrationInfo(info.version?.toString() ?: "repeatable", info.script)
-                                val after = catalog.inspect(context.connection)
-                                val effects = try {
-                                    MigrationClassifier().findings(Files.readString(Path.of(info.physicalLocation)), migration, priorSchema, after,
+                    val committedPlanner = DeferredQueryPlanning(planner, ::openPlanningConnection, options.planningParallelism, baselineSession)
+                    val coordinator = CommittedMigrationCoordinator<PendingVerificationStep>(
+                        options.migrationTimeoutSeconds,
+                        observe = { event, context ->
+                            if (operational.supports(event, context)) operational.handle(event, context)
+                        },
+                        capture = { context, lease ->
+                            val info = context.migrationInfo
+                            val migration = lease.migration
+                            var readFailure: String? = null
+                            val sql = try { Files.readString(Path.of(info.physicalLocation)) }
+                            catch (failure: java.io.IOException) { readFailure = failure.javaClass.simpleName; null }
+                            val measured = operational.snapshot(migration)
+                            val callbackEffects = measured.statements.flatMap { statement ->
+                                statement.findings.filter { it.ruleId == "OP_DATABASE_CALLBACK_UNPROVEN" }
+                                    .map { it.evidence to statement.ordinal }
+                            }.groupBy({ it.first }, { it.second }).toSortedMap().map { (cause, ordinals) ->
+                                Finding(Verdict.UNKNOWN, "MIGRATION_DATABASE_CALLBACK_UNPROVEN", migration.filename,
+                                    "Applicable database migration callbacks can change data outside the catalog proof.",
+                                    "$cause Observed statement ordinals: ${ordinals.distinct().sorted().joinToString()}. Their affected application paths are not established.",
+                                    migration = migration,
+                                    mitigation = "Verify the applicable callback's data effects independently; an unchanged catalog does not establish behavioral preservation.")
+                            }
+                            // Owner observations are operational/commit evidence only. SET LOCAL,
+                            // SET ROLE and temporary shadows are not the old application's session.
+                            val canonical = CanonicalCatalog.inspect(catalog, context.connection)
+                            PendingVerificationStep(migration, canonical, sql, readFailure, measured, callbackEffects)
+                        },
+                        complete = { pending, lease ->
+                            lease.withConnection(::openPlanningConnection) { connection ->
+                                val session = PlanningSession.capture(connection)
+                                val canonical = CanonicalCatalog.inspect(catalog, connection)
+                                if (canonical.copy(expressionSearchPath = emptyList()) !=
+                                    pending.canonicalCatalog.copy(expressionSearchPath = emptyList())) throw VerificationException(
+                                    "COMMITTED_SCHEMA_CHANGED", pending.migration,
+                                    "The committed catalog for ${pending.migration.filename} differs from its observed precommit catalog; verification did not complete.")
+                                // Rules and name/dependency bindings use the committed verification
+                                // session, never the migration owner's transient deparser context.
+                                val after = catalog.inspect(connection)
+                                val effects = pending.migrationSql?.let { sql ->
+                                    MigrationClassifier().findings(sql, pending.migration, priorSchema, after,
                                         CompatibilityViews.provenViewNames(baseline, after))
-                                } catch (failure: java.io.IOException) {
-                                    listOf(Finding(Verdict.UNKNOWN, "MIGRATION_EFFECTS_UNAVAILABLE", migration.filename,
-                                        "Could not read the exact migration resource for effect classification.",
-                                        failure.javaClass.simpleName, migration = migration))
-                                }
-                                val measured = operational.snapshot(migration)
-                                val callbackEffects = measured.statements.flatMap { statement ->
-                                    statement.findings.filter { it.ruleId == "OP_DATABASE_CALLBACK_UNPROVEN" }
-                                        .map { it.evidence to statement.ordinal }
-                                }.groupBy({ it.first }, { it.second }).toSortedMap().map { (cause, ordinals) ->
-                                    Finding(Verdict.UNKNOWN, "MIGRATION_DATABASE_CALLBACK_UNPROVEN", migration.filename,
-                                        "Applicable database migration callbacks can change data outside the catalog proof.",
-                                        "$cause Observed statement ordinals: ${ordinals.distinct().sorted().joinToString()}. Their affected application paths are not established.",
-                                        migration = migration,
-                                        mitigation = "Verify the applicable callback's data effects independently; an unchanged catalog does not establish behavioral preservation.")
-                                }
-                                preservedIntegerColumns = IntegerReadPreservation.advance(baseline, priorSchema, after,
-                                    preservedIntegerColumns, measured.statements)
-                                val readCompatibility = ReadCompatibility(contract, baseline, after, acceptedBaselineIds, preservedIntegerColumns)
-                                val planning = planner.planStep(context.connection, contract.queries, baselinePlans,
-                                    migration, priorSchema, after, currentPlans, ::openPlanningConnection, options.planningParallelism,
-                                    readCompatibility = readCompatibility)
-                                val witnesses = boundaryBaseline?.let { boundaryCollector?.findings(context.connection, it, after, migration) }.orEmpty()
-                                steps += engine.verifyStep(contract, baseline, after, migration,
-                                    baselineHealth.findings + effects + callbackEffects + planning.findings + witnesses,
-                                    preservedIntegerColumns = preservedIntegerColumns)
+                                } ?: listOf(Finding(Verdict.UNKNOWN, "MIGRATION_EFFECTS_UNAVAILABLE", pending.migration.filename,
+                                    "Could not read the exact migration resource for effect classification.",
+                                    pending.readFailure ?: "The migration resource was unavailable.", migration = pending.migration))
+                                // A known policy mismatch is unverified, not a failed old query. It
+                                // cannot reuse accepted plans; restoring the policy must also replan.
+                                val selection = planner.selectStep(contract.queries, baselinePlans, priorSchema, after, currentPlans,
+                                    forceReplan = session != baselineSession || session != previousPlanningSession)
+                                val inspected = committedPlanner.inspectCommitted(connection, after, selection, session, lease)
+                                val witnesses = if (session == baselineSession) boundaryBaseline?.let {
+                                    boundaryCollector?.findings(connection, it, after, pending.migration)
+                                }.orEmpty() else emptyList()
+                                committedPlanner.checkSession(connection, session, lease)
+                                val preserved = IntegerReadPreservation.advance(baseline, priorSchema, after,
+                                    preservedIntegerColumns, pending.measured.statements)
+                                val readCompatibility = ReadCompatibility(contract, baseline, after, acceptedBaselineIds, preserved)
+                                val planning = planner.completeStep(contract.queries, baselinePlans, selection,
+                                    inspected, pending.migration, readCompatibility)
+                                val step = engine.verifyStep(contract, baseline, after, pending.migration,
+                                    baselineHealth.findings + effects + pending.callbackEffects + planning.findings + witnesses,
+                                    preservedIntegerColumns = preserved)
                                     .copy(replannedQueries = planning.replannedQueries, reusedQueries = planning.reusedQueries,
-                                        planningParallelism = planning.planningParallelism, operational = measured,
+                                        planningParallelism = planning.planningParallelism, operational = pending.measured,
                                         catalogChanged = priorSchema != after)
+                                // Publish/update only a committed, completely checked state.
+                                lease.checkExpired()
+                                steps += step
                                 priorSchema = after
                                 currentPlans = planning.plans
+                                previousPlanningSession = session
+                                preservedIntegerColumns = preserved
                                 if (options.progress != null) publishProgress(options, "old-on-new",
                                     withOperational(engine.report(contract, steps.toList(), baselineHealth, options.acceptedBaseline)))
                             }
-                        }
+                        },
+                    )
+                    coordinator.use {
                         try {
-                            configuration().locations(baselineLocation, pendingLocation).callbacks(deadline, callback, operational).load().migrate()
-                            deadline.checkExpired()
+                            configuration().locations(baselineLocation, pendingLocation).callbacks(coordinator).load().migrate()
+                            coordinator.flushCommitted()
+                            coordinator.checkExpired()
                         } catch (failure: Throwable) {
-                            deadline.checkExpired()
-                            throw executionFailure("MIGRATION_EXECUTION_FAILED", deadline.activeMigration, failure)
+                            coordinator.checkExpired()
+                            throw executionFailure("MIGRATION_EXECUTION_FAILED", coordinator.activeMigration, failure)
                         }
                     }
                     val forward = withOperational(engine.report(contract, steps, baselineHealth, options.acceptedBaseline)).let { report ->
@@ -315,7 +357,10 @@ class PostgresVerifier {
     }
 
     private fun executionFailure(stage: String, migration: MigrationInfo?, failure: Throwable): VerificationException {
-        if (failure is VerificationException) return failure
+        // Flyway wraps callback failures. Retain the original queued migration and its
+        // specific infrastructure stage instead of attributing it to the next callback.
+        generateSequence(failure) { it.cause }.take(32).filterIsInstance<VerificationException>()
+            .firstOrNull()?.let { return it }
         val location = migration?.let { " ${it.version} ${it.filename}" }.orEmpty()
         val timedOut = generateSequence(failure) { it.cause }.take(20).filterIsInstance<SQLException>()
             .any { it.sqlState == "57014" && it.message.orEmpty().contains("timeout", ignoreCase = true) }

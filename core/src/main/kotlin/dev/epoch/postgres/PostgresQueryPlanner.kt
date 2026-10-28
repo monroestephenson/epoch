@@ -31,6 +31,12 @@ internal data class QueryPlanningStep(
 
 internal data class QueryPlanningBatch(val plans: Map<String, QueryPlan>, val planningParallelism: Int)
 
+internal data class QueryStepSelection(
+    val changed: List<QueryContract>,
+    val baselineParameterTypes: Map<String, List<String>>,
+    val previousPlans: Map<String, QueryPlan>,
+)
+
 /** PREPARE plus EXPLAIN, never EXECUTE/ANALYZE: DML is planned but not run. */
 internal class PostgresQueryPlanner {
     private var batchTypeCache: MutableMap<String, String?>? = null
@@ -38,8 +44,13 @@ internal class PostgresQueryPlanner {
 
     /** Resolve recurring JDBC type aliases once per schema state, not once per parameter. */
     fun inspectAll(connection: Connection, queries: List<QueryContract>,
-                   baselineParameterTypes: Map<String, List<String>> = emptyMap()): Map<String, QueryPlan> = withTypeCache {
-        queries.associate { it.id to inspect(connection, it, baselineParameterTypes[it.id]) }
+                   baselineParameterTypes: Map<String, List<String>> = emptyMap(),
+                   afterEach: (() -> Unit)? = null): Map<String, QueryPlan> = withTypeCache {
+        queries.associate { query ->
+            val plan = inspect(connection, query, baselineParameterTypes[query.id])
+            afterEach?.invoke()
+            query.id to plan
+        }
     }
 
     /** Each worker owns its connection and type cache; aggregation follows contract order, not completion order. */
@@ -237,24 +248,60 @@ internal class PostgresQueryPlanner {
         parallelism: Int = 1,
         readCompatibility: ReadCompatibility? = null,
     ): QueryPlanningStep {
+        val selection = selectStep(queries, baseline, before, after, previousPlans)
+        val inspected = inspectSupportedBatch(connection, selection.changed, after, connectionFactory,
+            parallelism, selection.baselineParameterTypes)
+        return completeStep(queries, baseline, selection, inspected, migration, readCompatibility)
+    }
+
+    /** Select against the checked schema and invalidate when the known verification policy changes. */
+    fun selectStep(
+        queries: List<QueryContract>, baseline: Map<String, QueryPlan>, before: SchemaSnapshot,
+        after: SchemaSnapshot, previousPlans: Map<String, QueryPlan> = baseline, forceReplan: Boolean = false,
+    ): QueryStepSelection {
         val delta = QueryRevalidation.delta(before, after, behaviorSyntax)
         val changed = queries.filter { query -> baseline.getValue(query.id).accepted &&
-            (previousPlans[query.id] == null || delta.needsPlanning(query)) }
+            (forceReplan || previousPlans[query.id] == null || delta.needsPlanning(query)) }
         val types = changed.associate { it.id to baseline.getValue(it.id).parameterTypes }
-        // A second session cannot observe DDL inside Flyway's current transaction.
-        val inspected = inspectSupportedBatch(connection, changed, after, connectionFactory, parallelism, types)
+        return QueryStepSelection(changed, types, previousPlans)
+    }
+
+    fun eligibleForFreshSession(queries: List<QueryContract>, snapshot: SchemaSnapshot): List<QueryContract> {
+        val safety = PlanningSafety(snapshot, behaviorSyntax)
+        return queries.filter(safety::eligible)
+    }
+
+    /** Pure assembly: a missing selected result is a verification failure, never silent reuse. */
+    fun completeStep(
+        queries: List<QueryContract>, baseline: Map<String, QueryPlan>, selection: QueryStepSelection,
+        inspected: QueryPlanningBatch, migration: MigrationInfo, readCompatibility: ReadCompatibility? = null,
+    ): QueryPlanningStep {
+        val changedIds = selection.changed.map { it.id }.toSet()
+        check(inspected.plans.keys == changedIds) { "Selected query results are missing or unexpected" }
         val plans = linkedMapOf<String, QueryPlan>()
+        val unverifiedSession = inspected.plans.filterValues { it.sqlState == DeferredQueryPlanning.SESSION_UNVERIFIED }.keys
         val findings = queries.mapNotNull { query ->
             val original = baseline.getValue(query.id)
             if (!original.accepted) {
                 plans[query.id] = original
                 return@mapNotNull baselineFinding(query, original)
             }
-            val current = inspected.plans[query.id] ?: previousPlans.getValue(query.id)
+            val current = if (query.id in changedIds) inspected.plans.getValue(query.id)
+                else selection.previousPlans.getValue(query.id)
             plans[query.id] = current
-            comparisonFinding(query, original, current, migration, readCompatibility)
-        }
-        return QueryPlanningStep(findings, plans, changed.size, queries.size - changed.size, inspected.planningParallelism)
+            if (query.id in unverifiedSession) null else comparisonFinding(query, original, current, migration, readCompatibility)
+        } + if (unverifiedSession.isEmpty()) emptyList() else listOf(Finding(Verdict.UNKNOWN,
+            "QUERY_SESSION_UNPROVEN", "postgresql:verification-session",
+            "The baseline verification session is not established for the committed schema.",
+            inspected.plans.filterKeys { it in unverifiedSession }.values.map { it.evidence }.distinct().sorted().joinToString(" "),
+            unverifiedSession.sorted(), migration,
+            "Review the migration's persistent database or role settings and establish the intended application session before treating these templates as verified."))
+        // Session-unverified entries were neither planned nor safely reused. Do not turn
+        // missing evidence into performance reuse statistics.
+        return QueryPlanningStep(findings, plans,
+            if (unverifiedSession.isEmpty()) selection.changed.size else 0,
+            if (unverifiedSession.isEmpty()) queries.size - selection.changed.size else 0,
+            inspected.planningParallelism)
     }
 
     /** Full revalidation entry point retained for callers without factual dependency snapshots. */

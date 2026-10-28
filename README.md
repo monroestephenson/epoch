@@ -99,7 +99,7 @@ db-compat verify-release --repository . --base-ref v1.4.0 --target-ref v1.5.0 \
 
 Existing migration files and their Flyway sidecars must remain unchanged. Contracts are retained release artifacts; Epoch does not rebuild applications from Git refs automatically. See [the release workflow](docs/feedback-round2.md#rollout-and-rollback-workflows).
 
-Verification has per-migration and global deadlines (`--migration-timeout-seconds`, default 120; `--global-timeout-seconds`, default 1800). `CREATE INDEX CONCURRENTLY` uses Flyway’s session-level advisory lock and requires `executeInTransaction=false` in the migration’s `.sql.conf` sidecar. Reports expose reused/replanned query counts and baseline cache rebuild reasons.
+Verification has per-migration and global deadlines (`--migration-timeout-seconds`, default 120; `--global-timeout-seconds`, default 1800). `CREATE INDEX CONCURRENTLY` uses Flyway’s session-level advisory lock and requires `executeInTransaction=false` in the migration’s `.sql.conf` sidecar. Reports expose reused/replanned query counts and baseline cache rebuild reasons. Eligible pending-step checks can use `--planning-parallelism` after their migration commits and before the next script runs. Checks that cannot be parallelized run serially against the committed state; migration-local settings never become application failure evidence. See [planning and commit boundaries](docs/planning.md).
 
 `--execute-boundaries` optionally tries supported rolled-back INSERT counterexamples. A value accepted before a migration and rejected afterward proves a break; successful samples never establish safety.
 

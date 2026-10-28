@@ -60,8 +60,8 @@ class VerificationScaleTest {
         report.migrations.forEach { step ->
             assertEquals(100, step.replannedQueries, step.migration.filename)
             assertEquals(9_900, step.reusedQueries, step.migration.filename)
-            assertEquals(1, step.planningParallelism,
-                "Transactional DDL must be checked on its own connection before commit")
+            assertEquals(4, step.planningParallelism,
+                "Eligible transactional DDL is checked after commit and before the next migration")
             assertEquals(Verdict.SAFE, step.verdict, step.findings.toString())
         }
         assertEquals(10_000, report.migrations.sumOf { requireNotNull(it.replannedQueries) },
@@ -75,7 +75,7 @@ class VerificationScaleTest {
     }
 
     @Test @Timeout(120)
-    fun `pooled committed checks and serialized transactional checks observe the correct schema`() {
+    fun `pooled nontransactional and transactional checks observe the correct committed schema`() {
         val baseline = directory.resolve("baseline").createDirectories()
         baseline.resolve("V1__baseline.sql").writeText("CREATE TABLE accounts (id bigint PRIMARY KEY, label varchar(255));")
         val pending = directory.resolve("pending").createDirectories()
@@ -98,7 +98,7 @@ class VerificationScaleTest {
         val transactional = report.migrations[1]
         assertEquals(Verdict.BREAKING, transactional.verdict, transactional.toString())
         assertEquals(4, transactional.replannedQueries)
-        assertEquals(1, transactional.planningParallelism)
+        assertEquals(4, transactional.planningParallelism)
         val rejected = transactional.findings.filter { it.ruleId == "POSTGRES_SQL_REJECTED" }
         assertEquals(queries.map { it.id }.toSet(), rejected.flatMap { it.affectedContractIds }.toSet())
         assertTrue(rejected.all { it.verdict == Verdict.BREAKING && "42703" in it.evidence }, rejected.toString())
