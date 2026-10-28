@@ -157,6 +157,8 @@ data class ColumnSchema(
     val ordinal: Int = 0,
     /** Stable schema-qualified collation name; null for non-collatable types. */
     val collation: String? = null,
+    /** Catalog-proven absence of domain constraints, type-level NOT NULL, and type defaults. */
+    val typeAcceptsImplicitNull: Boolean? = null,
 )
 
 data class ConstraintSchema(

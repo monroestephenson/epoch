@@ -42,9 +42,12 @@ class PostgresCatalog {
             SELECT n.nspname || '.' || c.relname AS table_name, a.attname,
                    format_type(a.atttypid,a.atttypmod) AS type, a.attnotnull, row_number() OVER (PARTITION BY c.oid ORDER BY a.attnum) AS attnum,
                    pg_get_expr(d.adbin,d.adrelid) AS default_expr, a.attidentity, a.attgenerated,
-                   cn.nspname || '.' || coll.collname AS collation
+                   cn.nspname || '.' || coll.collname AS collation,
+                   t.typtype <> 'd' AND NOT t.typnotnull AND t.typdefault IS NULL
+                       AND t.typdefaultbin IS NULL AS type_accepts_implicit_null
             FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
             JOIN pg_attribute a ON a.attrelid=c.oid
+            JOIN pg_type t ON t.oid=a.atttypid
             LEFT JOIN pg_attrdef d ON d.adrelid=c.oid AND d.adnum=a.attnum
             LEFT JOIN pg_collation coll ON coll.oid=a.attcollation
             LEFT JOIN pg_namespace cn ON cn.oid=coll.collnamespace
@@ -60,6 +63,7 @@ class PostgresCatalog {
                 identity = row.getString("attidentity").takeIf { it.isNotEmpty() },
                 generated = row.getString("attgenerated").takeIf { it.isNotEmpty() },
                 collation = row.getString("collation"),
+                typeAcceptsImplicitNull = row.getBoolean("type_accepts_implicit_null"),
             )))
         }
         connection.rows("""

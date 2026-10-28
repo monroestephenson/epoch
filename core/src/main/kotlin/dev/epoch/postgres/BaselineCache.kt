@@ -23,7 +23,7 @@ internal class BaselineCache(private val directory: Path?) {
             digest.update(ByteBuffer.allocate(8).putLong(bytes.size.toLong()).array())
             digest.update(bytes)
         }
-        field("epoch-baseline-cache-v4;catalog=2;transactionalLock=false;flyway=11.8.2;postgres=${PostgresVerifier.POSTGRES_IMAGE};image=$imageIdentity;placeholders=false;callbacks=false;encoding=UTF-8".toByteArray())
+        field("epoch-baseline-cache-v4;catalog=3;transactionalLock=false;flyway=11.8.2;postgres=${PostgresVerifier.POSTGRES_IMAGE};image=$imageIdentity;placeholders=false;callbacks=false;encoding=UTF-8".toByteArray())
         Files.walk(baselineDirectory).use { paths ->
             paths.filter { Files.isRegularFile(it) }.sorted().forEach { path ->
                 field(baselineDirectory.relativize(path).toString().replace('\\', '/').toByteArray())

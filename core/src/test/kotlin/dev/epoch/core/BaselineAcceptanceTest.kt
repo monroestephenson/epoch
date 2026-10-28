@@ -8,7 +8,8 @@ import kotlin.test.*
 class BaselineAcceptanceTest {
     private val engine = CompatibilityEngine()
     private val migration = MigrationInfo("2", "V2__add_nullable.sql")
-    private val table = TableSchema(mapOf("id" to ColumnSchema("bigint", false, ordinal = 1)))
+    private val table = TableSchema(mapOf("id" to ColumnSchema("bigint", false, ordinal = 1)),
+        relationSecurity = RelationSecurity("epoch", false, false, false, false))
     private val snapshot = SchemaSnapshot(mapOf("public.customers" to table))
     private val contract = DatabaseContract(
         entities = listOf(EntityContract("Customer", "public.customers", listOf(ColumnContract("id")))),
@@ -16,7 +17,7 @@ class BaselineAcceptanceTest {
     )
     private val debtContract = contract.copy(unresolvedQueries = listOf(UnresolvedQuery("search", "Unbounded runtime HQL")))
     private val after = snapshot.copy(tables = mapOf("public.customers" to table.copy(
-        columns = table.columns + ("metadata" to ColumnSchema("text", true, ordinal = 2)),
+        columns = table.columns + ("metadata" to ColumnSchema("text", true, ordinal = 2, typeAcceptsImplicitNull = true)),
     )))
 
     private fun report(c: DatabaseContract = debtContract): CompatibilityReport {

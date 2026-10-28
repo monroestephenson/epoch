@@ -28,12 +28,13 @@ The baseline must reproduce the schema against which the old contract was valid.
 | Remove a referenced table/column name without a supported compatible replacement | `BREAKING`; the old SQL name is gone. |
 | Replace a renamed table with a proven transparent, updatable compatibility view | Can be `SAFE`; backing defaults, constraints, generation and types still undergo the normal rules. |
 | A replacement view cannot support a baseline-valid old write, even with trigger support included | `BREAKING`, with the affected operation and PostgreSQL capability evidence. |
-| Add a `NOT NULL` column without default/identity/generated expression that old inserts omit | `BREAKING`. |
+| Add a `NOT NULL` column that old inserts necessarily omit as NULL | `BREAKING` when catalog type and write-behavior facts establish rejection; otherwise `UNKNOWN`. |
 | SQL valid at baseline becomes invalid after a migration | A breaking SQL finding when the PostgreSQL failure establishes incompatibility. |
 | Tighten mapped nullable inputs or narrow a mapped length/precision domain | `BREAKING` when the supported baseline input proof establishes an excluded value; otherwise `UNKNOWN`. |
 | Widen supported write types | Can be `SAFE`; old read mappings are checked separately. |
 | Change a referenced column's collation | `UNKNOWN` (`COLUMN_COLLATION_CHANGED`); comparison and ordering semantics require a separate proof. |
-| Add a required column with a supported constant default | Can be `SAFE` for old explicit-column inserts. |
+| Add a nullable or required column with a supported constant default | Can be `SAFE` for old explicit-column inserts; newly imposed constraints still receive their own checks. |
+| Add a foreign key on a new table or columns that old inserts omit as proven NULL | Can be `SAFE` when no declared DELETE or referenced-key UPDATE is affected. Defaults, generation, domains, or partial-NULL composite keys require separate proof. |
 | Drop non-unique indexes, or add supported indexes with proven bounded keys | Can be structurally `SAFE`; unbounded B-tree keys can reject oversized writes and remain `UNKNOWN` without stronger evidence. |
 | Change constraints, defaults, or generation behavior | Input proofs, omitted-value dependencies, and SQL planning determine concrete failures; unsupported implications remain `UNKNOWN`. |
 | Change result shape for positional SQL or `SELECT *` | Cannot be assumed safe. |
@@ -41,6 +42,14 @@ The baseline must reproduce the schema against which the old contract was valid.
 | Incomplete query dependencies, unresolved query sources, or observations alone | `UNKNOWN`. |
 
 These are rules for the declared scope, not assurances about every side effect of a DDL statement. Independent safe findings do not cancel unknown or breaking findings. The report retains intermediate failures even if a subsequent migration restores the original schema.
+
+## Expand-phase proofs
+
+Constant defaults do not waive newly added constraints. For example, an old `INSERT INTO accounts(id) VALUES (?)` starts supplying `region_id=0` implicitly after adding that column with `DEFAULT 0`; a new foreign key can reject it even though the old SQL does not name `region_id`. `CONSTRAINT_CHANGED` includes the affected INSERT IDs when those implicit inputs are not proven compatible. Supply a compatible default, retain the old accepted inputs, or establish the additional constraint separately.
+
+The omitted-NULL exemption requires positive catalog evidence: no column default, identity, generated expression, type-level default or domain restriction, and no opaque table write behavior. Every component of a composite foreign key must meet this proof; one NULL does not establish safety for `MATCH FULL`. Missing type or relation facts remain unknown. `OMITTED_COLUMN_VALUE_UNPROVEN` explains this boundary for newly added nullable columns, including domains whose own NOT NULL constraint is absent from the column's `attnotnull` flag. Extension ownership suppresses generic behavior noise; it does not erase a table's actual trigger/rule facts or a type's domain semantics.
+
+`ExpansionCompatibilityTest` exercises constant defaults, varchar-to-text widening, serial identifier dependencies, and new nullable foreign keys against PostgreSQL. Its rejection witnesses demonstrate FK and domain failures that successful planning alone misses. `VerificationRefinementTest` covers unrelated drops and their dependent objects, supported index changes, new-table sequences, and bounded widening. Integer widening with old readers and unbounded B-tree keys retain their separate hydration and input-size limits; these are not unconditional SAFE rules.
 
 ## Compatibility views
 

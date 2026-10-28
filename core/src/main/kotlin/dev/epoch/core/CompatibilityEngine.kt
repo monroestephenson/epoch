@@ -196,6 +196,16 @@ class CompatibilityEngine {
                 it.columns.none { c -> c.name == column && c.insertable && (!c.generated || it.identifierSequence != null) } }.map { it.id } +
                 contract.queries.filter { queryTarget(it) == table && it.operation == Operation.INSERT && it.explicitColumnList &&
                     it.writeColumns.none { c -> c.column == column } }.map { it.id }
+        fun ordinaryWriteSemantics(table: TableSchema) = table.kind == "table" &&
+            table.relationSecurity?.let { security ->
+                !security.userTriggers && !security.userRules && !security.rowSecurity && !security.inheritance
+            } == true
+        fun omittedValueIsNull(table: TableSchema, columnName: String): Boolean {
+            val column = table.columns[columnName] ?: return false
+            return !opaqueWriteBehavior && ordinaryWriteSemantics(table) && column.nullable &&
+                column.typeAcceptsImplicitNull == true && column.defaultExpression == null &&
+                column.identity.isNullOrEmpty() && column.generated.isNullOrEmpty()
+        }
         fun referencesConflict(table: String) = contract.queries.filter {
             queryTarget(it) == table && Regex("\\bON\\s+CONFLICT\\b", RegexOption.IGNORE_CASE).containsMatchIn(it.sql)
         }.map { it.id }
@@ -257,12 +267,17 @@ class CompatibilityEngine {
                 val columnReferences = columnIds(tableName, columnName)
                 if (a == null && b != null) {
                     val inserts = insertIds(tableName).filter { it in validBaselineIds }
-                    if (!opaqueWriteBehavior && old.kind == "table" && new.kind == "table" && !b.nullable && b.defaultExpression == null && b.identity.isNullOrEmpty() && b.generated.isNullOrEmpty() && inserts.isNotEmpty()) {
-                        finding(Verdict.BREAKING, "REQUIRED_COLUMN_OMITTED", objectName, "Old INSERT operations omit a new required column.", "New column is NOT NULL without a default, identity, or generated expression; old explicit INSERT column lists omit it.", inserts, "Introduce the column as nullable or provide a compatible default while old applications run.")
+                    if (!b.nullable && b.defaultExpression == null && b.identity.isNullOrEmpty() && b.generated.isNullOrEmpty() && inserts.isNotEmpty()) {
+                        if (!opaqueWriteBehavior && ordinaryWriteSemantics(old) && ordinaryWriteSemantics(new) && b.typeAcceptsImplicitNull == true) {
+                            finding(Verdict.BREAKING, "REQUIRED_COLUMN_OMITTED", objectName, "Old INSERT operations omit a new required column.",
+                                "New column is NOT NULL without a column or type default, identity, generated expression, or opaque write behavior; the old INSERT omits it.",
+                                inserts, "Introduce the column as nullable or provide a compatible default while old applications run.")
+                        } else {
+                            unknown("NEW_REQUIRED_COLUMN_BEHAVIOR", objectName,
+                                "Old INSERT operations omit a new required column; type-level defaults or write behavior may supply its value.",
+                                "type=${b.type}; typeAcceptsImplicitNull=${b.typeAcceptsImplicitNull}; baseline relation=${old.relationSecurity}; target relation=${new.relationSecurity}. No column default, identity, or generated expression is present.", inserts)
+                        }
                     }
-                    if (opaqueWriteBehavior && !b.nullable && b.defaultExpression == null && b.identity.isNullOrEmpty() && b.generated.isNullOrEmpty() && inserts.isNotEmpty()) unknown(
-                        "NEW_REQUIRED_COLUMN_BEHAVIOR", objectName, "Old INSERT operations omit a new required column; opaque write behavior prevents establishing whether it fills the value.",
-                        "New column is NOT NULL without default/identity; triggers or rules may transform the operation.", inserts)
                     val shapeQueries = contract.queries.filter { tableName in it.tables && !it.explicitColumnList }
                     shapeQueries.forEach { query ->
                         unknown("POSITIONAL_SHAPE_CHANGED", objectName, "A positional operation or result shape may change when a column is added.", query.sql, listOf(query.id))
@@ -277,7 +292,15 @@ class CompatibilityEngine {
                         unknown("NEW_COLUMN_EXPRESSION", objectName, "A new default or generated expression can change write behavior.", "default=${b.defaultExpression}; identity=${b.identity}; generated=${b.generated}", writeIds(tableName))
                     }
                     if (b.nullable && b.defaultExpression == null && b.identity.isNullOrEmpty() && b.generated.isNullOrEmpty() && shapeQueries.isEmpty() && columnReferences.isEmpty()) {
-                        finding(Verdict.SAFE, "NULLABLE_COLUMN_ADDED", objectName, "Nullable column addition preserves explicit-column operations.", "New column accepts NULL, has no default/generation behavior, and is outside the old column dependencies.", tableReferences)
+                        val omissions = omittingInserts(tableName, columnName).filter { it in validBaselineIds }
+                        if (omissions.isNotEmpty() && (!ordinaryWriteSemantics(old) || !omittedValueIsNull(new, columnName))) {
+                            unknown("OMITTED_COLUMN_VALUE_UNPROVEN", objectName,
+                                "The value of a new column omitted by old INSERTs is not established as an accepted NULL.",
+                                "type=${b.type}; typeAcceptsImplicitNull=${b.typeAcceptsImplicitNull}; baseline relation=${old.relationSecurity}; target relation=${new.relationSecurity}. Type-level defaults, domain constraints, or opaque writes require separate proof.", omissions)
+                        } else {
+                            finding(Verdict.SAFE, "NULLABLE_COLUMN_ADDED", objectName, "Nullable column addition preserves explicit-column operations.",
+                                "New column is outside old dependencies; any omitted INSERT value is a catalog-proven NULL with no default, generation, or opaque write behavior.", tableReferences)
+                        }
                     }
                     continue
                 }
@@ -349,10 +372,17 @@ class CompatibilityEngine {
                 val columnRelevant = involvedColumns.isEmpty() || involvedColumns.any { columnIds(tableName, it).isNotEmpty() }
                 if (tableReferences.isEmpty() && b?.type != "f" && a?.type != "f") continue
                 if (a == null && b?.type == "f") {
+                    val inserts = insertIds(tableName).toSet()
+                    val omissions = b.columns.associateWith { omittingInserts(tableName, it).toSet() }
+                    // All-NULL tuples satisfy both MATCH SIMPLE and MATCH FULL. Any other implicit
+                    // value, including a domain default or a generated identifier, needs proof.
+                    val implicitNulls = b.columns.isNotEmpty() && ordinaryWriteSemantics(old) &&
+                        b.columns.all { omittedValueIsNull(new, it) }
                     val localWriters = writeIds(tableName).filter { id ->
-                        id in validBaselineIds && (b.columns.isEmpty() || b.columns.any { id in columnWriters(tableName, it) })
+                        id in validBaselineIds && (b.columns.isEmpty() || b.columns.any { id in columnWriters(tableName, it) } ||
+                            id in inserts && (!implicitNulls || !b.columns.all { id in omissions.getValue(it) }))
                     }
-                    if (localWriters.isNotEmpty()) unknown("CONSTRAINT_CHANGED", "$tableName.$name", "A new foreign key may reject old writes to its referencing columns.", b.definition, localWriters)
+                    if (localWriters.isNotEmpty()) unknown("CONSTRAINT_CHANGED", "$tableName.$name", "A new foreign key may reject explicit or omitted input values from old writes to its referencing columns.", b.definition, localWriters)
                     newForeignKey(tableName, name, b)
                     continue
                 }
@@ -557,6 +587,8 @@ class CompatibilityEngine {
 
         private fun severity(verdict: Verdict) = when (verdict) { Verdict.BREAKING -> 0; Verdict.UNKNOWN -> 1; Verdict.SAFE -> 2 }
         private fun unknownMitigation(rule: String): String = when {
+            rule in setOf("NEW_REQUIRED_COLUMN_BEHAVIOR", "OMITTED_COLUMN_VALUE_UNPROVEN") ->
+                "Establish the omitted value using PostgreSQL type/default and write-behavior facts, or provide an explicit default compatible with the old INSERTs and all domain constraints."
             rule == "RELATION_RENAME_EXPRESSION_UNPROVEN" -> "Preserve relation-name-dependent expression behavior or verify the stored default, CHECK, generated expression, and index behavior with old operations on every affected table."
             rule.contains("COVERAGE") || rule.contains("QUERY") -> "Supply complete SQL templates, parameter/result types, and exhaustive variants for the affected access paths."
             rule.contains("COLLATION") -> "Preserve the old column collation or verify equivalent comparison, ordering, and uniqueness behavior for the declared operations."

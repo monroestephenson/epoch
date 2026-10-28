@@ -12,7 +12,7 @@ class CompatibilityEngineTest {
     private val table = TableSchema(columns = linkedMapOf(
         "id" to ColumnSchema("bigint", false, ordinal = 1),
         "email" to ColumnSchema("text", true, ordinal = 2),
-    ))
+    ), relationSecurity = RelationSecurity("epoch", false, false, false, false))
     private val baseline = SchemaSnapshot(mapOf("public.customers" to table))
     private val entity = EntityContract("Customer", "public.customers", listOf(
         ColumnContract("id", "bigint", false), ColumnContract("email", "text", true),
@@ -27,8 +27,30 @@ class CompatibilityEngineTest {
     }
 
     @Test fun `nullable column preserves explicit mapped CRUD`() {
-        val result = verify(table.copy(columns = table.columns + ("metadata" to ColumnSchema("text", true, ordinal = 3))))
+        val result = verify(table.copy(columns = table.columns + ("metadata" to ColumnSchema("text", true, ordinal = 3,
+            typeAcceptsImplicitNull = true))))
         assertRule(result, Verdict.SAFE, "NULLABLE_COLUMN_ADDED")
+    }
+
+    @Test fun `nullable new column requires type-level NULL acceptance for omitted inputs`() {
+        for (fact in listOf(null, false)) {
+            // A visible custom domain can share a display name with a builtin type.
+            val result = verify(table.copy(columns = table.columns + ("metadata" to ColumnSchema("text", true,
+                typeAcceptsImplicitNull = fact))))
+            assertRule(result, Verdict.UNKNOWN, "OMITTED_COLUMN_VALUE_UNPROVEN")
+        }
+    }
+
+    @Test fun `non-domain extension types can establish nullable omitted inputs from catalog facts`() {
+        val result = verify(table.copy(columns = table.columns + ("metadata" to ColumnSchema("citext", true,
+            typeAcceptsImplicitNull = true))))
+        assertRule(result, Verdict.SAFE, "NULLABLE_COLUMN_ADDED")
+    }
+
+    @Test fun `extension-owned write behavior cannot establish nullable omitted inputs`() {
+        val target = table.copy(columns = table.columns + ("metadata" to ColumnSchema("text", true,
+            typeAcceptsImplicitNull = true)), relationSecurity = table.relationSecurity!!.copy(userTriggers = true))
+        assertRule(verify(target), Verdict.UNKNOWN, "OMITTED_COLUMN_VALUE_UNPROVEN")
     }
 
     @Test fun `dropping mapped column identifies exact dependency`() {
@@ -48,8 +70,22 @@ class CompatibilityEngineTest {
     }
 
     @Test fun `new required column breaks known old insert`() {
-        val result = verify(table.copy(columns = table.columns + ("status" to ColumnSchema("text", false))))
+        val result = verify(table.copy(columns = table.columns + ("status" to ColumnSchema("text", false, typeAcceptsImplicitNull = true))))
         assertRule(result, Verdict.BREAKING, "REQUIRED_COLUMN_OMITTED")
+    }
+
+    @Test fun `new required column cannot fabricate failure without type-default facts`() {
+        for (fact in listOf(null, false)) {
+            val result = verify(table.copy(columns = table.columns + ("status" to ColumnSchema("text", false,
+                typeAcceptsImplicitNull = fact))))
+            assertRule(result, Verdict.UNKNOWN, "NEW_REQUIRED_COLUMN_BEHAVIOR")
+        }
+    }
+
+    @Test fun `extension-owned trigger can supply a new required omitted column`() {
+        val target = table.copy(columns = table.columns + ("status" to ColumnSchema("text", false,
+            typeAcceptsImplicitNull = true)), relationSecurity = table.relationSecurity!!.copy(userTriggers = true))
+        assertRule(verify(target), Verdict.UNKNOWN, "NEW_REQUIRED_COLUMN_BEHAVIOR")
     }
 
     @Test fun `new required column does not invent a breaking read-only operation`() {

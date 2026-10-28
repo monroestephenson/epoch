@@ -42,7 +42,8 @@ class CompatibilityViewsTest {
     }
 
     @Test fun `backing metadata remains authoritative including subsequent pending steps`() {
-        val required = physical.copy(columns = physical.columns + ("required" to ColumnSchema("text", false, ordinal = 3)))
+        val required = physical.copy(columns = physical.columns + ("required" to ColumnSchema("text", false, ordinal = 3,
+            typeAcceptsImplicitNull = true)))
         val facts = viewFacts.copy(updatableColumns = viewFacts.updatableColumns + "required",
             updatableColumnsWithTriggers = viewFacts.updatableColumnsWithTriggers + "required")
         val exposed = view.copy(columns = view.columns + ("required" to ColumnSchema("text", true, ordinal = 3)), view = facts)
