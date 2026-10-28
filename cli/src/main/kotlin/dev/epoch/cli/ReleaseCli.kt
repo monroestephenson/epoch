@@ -40,17 +40,22 @@ class VerifyRelease : Callable<Int> {
     var details = false
     @Option(names = ["--execute-boundaries"], description = ["Run supported counterexample probes; samples never establish SAFE"])
     var executeBoundaries = false
+    @Option(names = ["--table-sizes"], description = ["Versioned table-size estimates JSON for operational severity; metadata only"])
+    var tableSizesPath: Path? = null
+    @Option(names = ["--fail-on-operational"], description = ["Also require operational SAFE; exit 4 after a passing compatibility gate"])
+    var failOnOperational = false
 
     override fun call(): Int {
         val contracts = contractPaths.map { json.readValue<DatabaseContract>(it.toFile()) }
         val newContracts = newContractPaths.map { json.readValue<DatabaseContract>(it.toFile()) }
+        val tableSizes = readTableSizes(tableSizesPath)
         return GitReleaseMigrations.materialize(repository, baseRef, targetRef, migrationPath).use { files ->
             val expectedDirections = verificationDirections(newContracts.isNotEmpty())
             VerificationCheckpoint(reportPath, expectedDirections, files.provenance).use { checkpoint ->
                 try {
                     val options = VerificationOptions(baselineCache = baselineCache, migrationTimeoutSeconds = migrationTimeoutSeconds,
                         globalTimeoutSeconds = globalTimeoutSeconds, executeBoundaries = executeBoundaries,
-                        planningParallelism = planningParallelism, progress = checkpoint::progress)
+                        planningParallelism = planningParallelism, progress = checkpoint::progress, tableSizes = tableSizes)
                     val verifier = PostgresVerifier()
                     val verification: Any
                     val directions: List<Pair<String, CompatibilityReport>>
@@ -67,7 +72,7 @@ class VerifyRelease : Callable<Int> {
                     sarifPath?.let { writeJson(it, sarifReport(directions, migrationPath)) }
                     println("Git migrations: ${files.provenance.baseCommit} -> ${files.provenance.targetCommit}")
                     directions.forEach { (name, report) -> println("Direction: $name\n${renderReport(report, allDetails = details)}") }
-                    verificationExitCode(directions)
+                    verificationExitCode(directions, failOnOperational)
                 } catch (failure: Throwable) {
                     try { checkpoint.fail(failure) } catch (checkpointFailure: Throwable) { failure.addSuppressed(checkpointFailure) }
                     throw failure

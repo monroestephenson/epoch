@@ -219,6 +219,8 @@ data class MigrationReport(
     val reusedQueries: Int? = null,
     /** Effective number of planning workers; transactional DDL is checked on its owning connection. */
     val planningParallelism: Int? = null,
+    /** Actual pending-statement observations; null means no measured assessment is available. */
+    val operational: OperationalAssessment? = null,
 )
 
 data class CompatibilityReport(
@@ -240,6 +242,9 @@ data class CompatibilityReport(
     /** A checkpoint cannot certify all requested migration states. */
     val complete: Boolean = true,
     val incompleteReason: String? = null,
+    /** Independent operational assessment of the executed deployment window only. */
+    val operationalVerdict: OperationalVerdict? = null,
+    val operationalLimitations: List<String> = emptyList(),
 )
 
 /** A baseline fingerprint binds acceptance to the contract, catalog and baseline migration input. */
@@ -283,6 +288,8 @@ data class BidirectionalReport(
     val gateVerdict: Verdict? = null,
     /** New mapped writes assessed against old mapped readers on the final deployment schema. */
     val dataCompatibility: CompatibilityReport? = null,
+    /** The old-on-new deployment assessment; reverse schema/data checks execute no migration. */
+    val operationalVerdict: OperationalVerdict? = null,
 )
 
 enum class AccessPathStatus { STATIC, OBSERVED, DECLARED, UNRESOLVED }

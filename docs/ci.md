@@ -41,9 +41,81 @@ cli/build/install/db-compat/bin/db-compat verify \
 
 Repeated `--contract` inputs share one migrated baseline and pending migration sequence. They must refer to the same database baseline; use separate verification runs for different databases. Findings namespace contract IDs by input position.
 
-Exit codes are `0` for `SAFE`, `1` for `BREAKING`, `2` for `UNKNOWN`, and `3` for invalid input or runtime failure, including unexpected linkage errors. Without acceptance, the exit code follows the overall compatibility verdict. With `--accepted-baseline`, it follows the distinct `gateVerdict`; the report still preserves the overall verdict and justified baseline debt.
+Default exit codes are `0` for compatibility `SAFE`, `1` for `BREAKING`, `2` for `UNKNOWN`, and `3` for invalid input or runtime failure, including unexpected linkage errors. Without acceptance, the exit code follows the overall compatibility verdict. With `--accepted-baseline`, it follows the distinct `gateVerdict`; the report still preserves the overall verdict and justified baseline debt. The optional operational gate below adds exit `4` after a passing compatibility gate.
 
 Preserve the executable's exit status in CI. Upload the JSON report after verification, including nonzero compatibility results. Verification checkpoints are explicitly incomplete until the entire requested run succeeds; incomplete reports return exit 3 when rendered and cannot be used to accept baseline debt. Invalid arguments can still fail before a checkpoint is created, so never reuse an earlier run's report as the current result.
+
+## Operational CI gate
+
+Every forward verification records measured operational findings for pending migrations. Default CI behavior remains compatibility-only. Add the boolean `--fail-on-operational` to require operational `SAFE` as well:
+
+```sh
+db-compat verify \
+  --contract artifacts/old-contract.json \
+  --baseline migrations/baseline --migrations migrations/pending \
+  --table-sizes artifacts/table-sizes.json \
+  --fail-on-operational --report artifacts/compatibility-report.json
+
+db-compat report --input artifacts/compatibility-report.json \
+  --summary --fail-on-operational
+```
+
+`verify-release` accepts the same `--table-sizes` and `--fail-on-operational` options. `report` replays saved grading and can apply the gate without rerunning migrations; it does not regrade with a new size file. The gate requires a measured operational SAFE result regardless of risk severity. A LOW RISKY finding still fails. Baseline acceptance affects compatibility debt only and does not waive operational findings.
+
+| Precedence | Exit |
+| --- | ---: |
+| Invalid input, runtime failure, failed measurement, or incomplete run | 3 |
+| Compatibility gate BREAKING | 1 |
+| Compatibility gate UNKNOWN | 2 |
+| Compatibility gate passes; `--fail-on-operational` is set; operational result is RISKY, UNKNOWN, or unavailable | 4 |
+| Compatibility gate passes and the optional operational requirement is satisfied or disabled | 0 |
+
+An older saved report without operational fields returns 4 under that flag only after its compatibility gate passes. With `--new-contract`, all requested compatibility directions must pass first, while operational assessment comes solely from the actual forward migration sequence. Store JSON checkpoints and reports even on exit 4. `report --summary` shows operational rule counts; `--details` adds every retained statement and finding, timeout changes, held-after locks, and rewrites. JSON also retains before-statement and newly observed lock sets. Current SARIF exports compatibility findings only, so keep JSON for operational review. `lint` remains a separate static advisory command and does not satisfy the measured gate.
+
+## Table-size estimates
+
+`--table-sizes FILE` is optional metadata input for severity, and never supplies a database connection. Export estimates for the original baseline schema using your normal authorized read-only database workflow, then pass only the JSON file to Epoch. Epoch neither queries production nor interprets disposable fixture sizes as production volume.
+
+```json
+{
+  "schemaVersion": 1,
+  "tables": {
+    "public.accounts": { "estimatedRows": 1000000, "totalBytes": 268435456 }
+  }
+}
+```
+
+This PostgreSQL query returns the input JSON using system catalog estimates and relation-size metadata; it does not scan application rows. Save its single output value, without a client header/footer, as `table-sizes.json` (for example using your client's unaligned tuples-only output):
+
+```sql
+SELECT jsonb_pretty(jsonb_build_object(
+  'schemaVersion', 1,
+  'tables', COALESCE(jsonb_object_agg(
+    n.nspname || '.' || c.relname,
+    jsonb_build_object(
+      'estimatedRows', CASE WHEN c.reltuples >= 0
+        THEN ceil(c.reltuples::numeric)::bigint ELSE NULL END,
+      'totalBytes', pg_total_relation_size(c.oid)
+    )
+  ), '{}'::jsonb)
+))
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('r', 'm')
+  AND n.nspname NOT LIKE 'pg_%'
+  AND n.nspname <> 'information_schema'
+  AND c.relname <> 'flyway_schema_history';
+```
+
+The export includes ordinary physical tables, partition leaves, and materialized views; partition parents have no summed estimate here. `reltuples` can be stale or unknown, so negative estimates become JSON null. `totalBytes` includes indexes and TOAST. Review the snapshot's age and chosen schema scope. Use original baseline names even when pending migrations rename tables; names are exact stored catalog identifiers without SQL quoting, and embedded dots are unsupported.
+
+| Severity for an established risk | Required supplied estimates |
+| --- | --- |
+| LOW | Rows ≤ 10,000 **and** total bytes ≤ 16 MiB (16,777,216). |
+| MEDIUM | Otherwise, rows ≤ 1,000,000 **and** total bytes ≤ 1 GiB (1,073,741,824). |
+| HIGH | Either medium limit exceeded, either estimate missing, table missing, or baseline identity unavailable. |
+
+Both estimates must be nonnegative integers to lower severity; explicit zero is valid, but missing is not zero. Duplicate keys, normalized-name collisions, invalid numbers, and unsupported schema versions fail with exit 3. Grading is deterministic and advisory: it changes severity, never RISKY to SAFE, and does not estimate migration duration. Findings retain the supplied values and baseline lookup name without embedding the local input path.
 
 ## Review existing baseline debt
 
@@ -130,4 +202,4 @@ Existing SQL and `.sql.conf` files must be unchanged between refs. Flyway determ
 
 `verify --sarif build/epoch.sarif --migration-source-prefix src/main/resources/db/migration` and `report --sarif ...` also export SARIF 2.1.0. Upload that file through your CI provider's normal code-scanning integration. Baseline findings have no pending-file location. Catalog findings use line 1 as a migration-wide anchor, not an invented exact source line.
 
-`lint --migrations db/pending --report build/operations.json` is optional and separate. Its hints do not affect the compatibility exit code. Configure `--migration-timeout-seconds` and `--global-timeout-seconds` for your runner; a failed migration or infrastructure failure exits 3. No PostgreSQL NOTICE or library stack trace is emitted in default CLI logging; `--verbose` enables library diagnostics.
+`lint --migrations db/pending --report build/operations.json` remains optional static review. Its hints are separate from the measured operational assessment and do not affect the compatibility exit code. Configure `--migration-timeout-seconds` and `--global-timeout-seconds` for your runner; a failed migration or infrastructure failure exits 3. No PostgreSQL NOTICE or library stack trace is emitted in default CLI logging; `--verbose` enables library diagnostics.

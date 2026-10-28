@@ -56,6 +56,7 @@ Verification starts its own PostgreSQL container. There is no target JDBC URL op
 | `BREAKING` | 1 |
 | `UNKNOWN` | 2 |
 | Invalid arguments or runtime failure | 3 |
+| Passing compatibility gate, but operational `RISKY`, `UNKNOWN`, or unavailable with `--fail-on-operational` | 4 |
 
 `report` returns the verdict's exit code too. By default, `UNKNOWN` is a failing CI gate. With an explicitly reviewed accepted-baseline file, `verify` and `report` use the separate `gateVerdict` for their exit code; the overall compatibility verdict remains unchanged. Migration execution/validation failures, lost database connections, and verification timeouts return runtime exit `3` with their stage and migration; they are not completed compatibility verdicts. Extraction success means a contract was written; inspect `coverage` and `unresolvedQueries` before treating it as complete.
 
@@ -96,7 +97,22 @@ Existing migration files and their Flyway sidecars must remain unchanged. Contra
 
 Verification has per-migration and global deadlines (`--migration-timeout-seconds`, default 120; `--global-timeout-seconds`, default 1800). `CREATE INDEX CONCURRENTLY` uses Flyway’s session-level advisory lock and requires `executeInTransaction=false` in the migration’s `.sql.conf` sidecar. Reports expose reused/replanned query counts and baseline cache rebuild reasons.
 
-`--execute-boundaries` optionally tries supported rolled-back INSERT counterexamples. A value accepted before a migration and rejected afterward proves a break; successful samples never establish safety. `lint --migrations DIR --report lint.json` provides separate operational review hints without changing compatibility verdicts.
+`--execute-boundaries` optionally tries supported rolled-back INSERT counterexamples. A value accepted before a migration and rejected afterward proves a break; successful samples never establish safety.
+
+## Operational migration report
+
+Verification also reports a separate operational `SAFE`, `RISKY`, or `UNKNOWN` result for pending migrations. It observes Flyway's actual statements, held relation locks, storage rewrites, and lock-timeout settings in the disposable database. The supported model identifies scans that block ordinary writes and rewrites of existing storage. Operational `SAFE` does not promise production latency, no locks, or sufficient I/O capacity; compatibility verdicts remain independent.
+
+```sh
+db-compat verify --contract contract.json \
+  --baseline migrations/baseline --migrations migrations/pending \
+  --table-sizes table-sizes.json --fail-on-operational \
+  --report compatibility-report.json
+```
+
+Both flags are optional. Caller-supplied [table-size estimates](docs/ci.md#table-size-estimates) grade known risks; small estimates never turn `RISKY` into `SAFE`. Without `--fail-on-operational`, exit codes follow compatibility. With it, a passing compatibility gate additionally requires measured operational `SAFE`; other operational outcomes return `4`. Runtime/incomplete `3` and compatibility `1`/`2` retain precedence. `verify-release` and saved `report` replay support the same gate; legacy reports without operational evidence fail that optional gate.
+
+See [operational proof boundaries and rules](docs/verification.md#operational-migration-assessment) for supported concurrent-index and split-transaction validation patterns. Only forward deployment migrations contribute to this result. Operational details are in JSON and terminal reports; SARIF currently exports compatibility findings only. The separate `lint` command remains unchanged and provides static review hints.
 
 ## Run the examples
 

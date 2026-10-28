@@ -24,6 +24,8 @@ data class VerificationOptions(
     val planningParallelism: Int = 4,
     /** Immutable incomplete snapshots after baseline and each migration; final results are returned normally. */
     val progress: ((String, CompatibilityReport) -> Unit)? = null,
+    /** Optional metadata-only target estimates; verification never connects to the target environment. */
+    val tableSizes: TableSizes? = null,
 )
 
 /** The only public verification target is a newly created, disposable PostgreSQL container. */
@@ -55,6 +57,7 @@ class PostgresVerifier {
         val backward = requireNotNull(reverse)
         val dataCompatibility = requireNotNull(data)
         return BidirectionalReport(oldOnNew = forward, newOnOld = backward, dataCompatibility = dataCompatibility,
+            operationalVerdict = forward.operationalVerdict,
             verdict = CompatibilityEngine.aggregate(listOf(forward.verdict, backward.verdict, dataCompatibility.verdict)),
             gateVerdict = forward.gateVerdict?.let {
                 CompatibilityEngine.aggregate(listOf(it, backward.verdict, dataCompatibility.verdict))
@@ -73,6 +76,7 @@ class PostgresVerifier {
         require(options.migrationTimeoutSeconds in 1..86400) { "migrationTimeoutSeconds must be between 1 and 86400" }
         require(options.globalTimeoutSeconds in 1..604800) { "globalTimeoutSeconds must be between 1 and 604800" }
         require(options.planningParallelism in 1..32) { "planningParallelism must be between 1 and 32" }
+        val tableSizes = OperationalSizes.validateAndNormalize(options.tableSizes)
         require(Files.isDirectory(baselineDirectory)) { "Baseline migration directory does not exist: $baselineDirectory" }
         require(Files.isDirectory(migrationsDirectory)) { "Pending migration directory does not exist: $migrationsDirectory" }
         validateDirectoryIsolation(baselineDirectory, migrationsDirectory, options.baselineCache)
@@ -107,6 +111,8 @@ class PostgresVerifier {
                         .validateOnMigrate(true)
                         .placeholderReplacement(false)
                         .skipDefaultCallbacks(true)
+                        .group(false)
+                        .batch(false)
                         .lockRetryCount(10)
                         .loggers("slf4j")
 
@@ -162,8 +168,9 @@ class PostgresVerifier {
                         val migration = MigrationInfo("callback", filename)
                         MigrationReport(migration, Verdict.UNKNOWN, listOf(callbackFinding(filename, migration)))
                     }.toMutableList()
+                    val operational = PostgresOperationalMonitor(baseline, tableSizes)
                     if (options.progress != null) publishProgress(options, "old-on-new",
-                        engine.report(contract, steps.toList(), baselineHealth, options.acceptedBaseline))
+                        withOperational(engine.report(contract, steps.toList(), baselineHealth, options.acceptedBaseline)))
                     var priorSchema = baseline
                     var currentPlans = baselinePlans
                     MigrationDeadline(options.migrationTimeoutSeconds).use { deadline ->
@@ -189,22 +196,22 @@ class PostgresVerifier {
                                 steps += engine.verifyStep(contract, baseline, after, migration,
                                     baselineHealth.findings + effects + planning.findings + witnesses)
                                     .copy(replannedQueries = planning.replannedQueries, reusedQueries = planning.reusedQueries,
-                                        planningParallelism = planning.planningParallelism)
+                                        planningParallelism = planning.planningParallelism, operational = operational.snapshot(migration))
                                 priorSchema = after
                                 currentPlans = planning.plans
                                 if (options.progress != null) publishProgress(options, "old-on-new",
-                                    engine.report(contract, steps.toList(), baselineHealth, options.acceptedBaseline))
+                                    withOperational(engine.report(contract, steps.toList(), baselineHealth, options.acceptedBaseline)))
                             }
                         }
                         try {
-                            configuration().locations(baselineLocation, pendingLocation).callbacks(deadline, callback).load().migrate()
+                            configuration().locations(baselineLocation, pendingLocation).callbacks(deadline, callback, operational).load().migrate()
                             deadline.checkExpired()
                         } catch (failure: Throwable) {
                             deadline.checkExpired()
                             throw executionFailure("MIGRATION_EXECUTION_FAILED", deadline.activeMigration, failure)
                         }
                     }
-                    val forward = engine.report(contract, steps, baselineHealth, options.acceptedBaseline).let { report ->
+                    val forward = withOperational(engine.report(contract, steps, baselineHealth, options.acceptedBaseline)).let { report ->
                         if (boundaryBaseline == null) report else report.copy(limitations = report.limitations + boundaryBaseline.summary +
                             boundaryBaseline.skipped.entries.groupBy { it.value }.map { (reason, entries) ->
                                 "Boundary execution skipped ${entries.size} INSERT templates: $reason"
@@ -247,6 +254,20 @@ class PostgresVerifier {
         }
     }
 
+    /** Only the forward deployment executes pending SQL; reverse/data assessments have no operational evidence. */
+    private fun withOperational(report: CompatibilityReport): CompatibilityReport {
+        val verdicts = report.migrations.map { it.operational?.verdict ?: OperationalVerdict.UNKNOWN }
+        return report.copy(
+            operationalVerdict = OperationalAssessmentRules.aggregateVerdicts(verdicts),
+            operationalLimitations = (report.migrations.flatMap { it.operational?.limitations.orEmpty() } +
+                when {
+                    report.migrations.isEmpty() -> listOf("No pending migrations were executed in the requested deployment window.")
+                    report.migrations.any { it.operational == null } -> listOf("Some declared steps have no measured operational assessment.")
+                    else -> emptyList()
+                }).distinct().sorted(),
+        )
+    }
+
     private fun publishProgress(options: VerificationOptions, direction: String, report: CompatibilityReport) {
         val snapshot = report.copy(
             migrations = report.migrations.map { it.copy(findings = it.findings.toList()) },
@@ -254,6 +275,9 @@ class PostgresVerifier {
             incompleteReason = "Verification has not completed all requested migration states.",
             verdict = if (report.verdict == Verdict.BREAKING) Verdict.BREAKING else Verdict.UNKNOWN,
             gateVerdict = report.gateVerdict?.let { if (it == Verdict.BREAKING) it else Verdict.UNKNOWN },
+            operationalVerdict = report.operationalVerdict?.let {
+                if (it == OperationalVerdict.RISKY) it else OperationalVerdict.UNKNOWN
+            },
         )
         try { options.progress?.invoke(direction, snapshot) }
         catch (failure: Exception) {

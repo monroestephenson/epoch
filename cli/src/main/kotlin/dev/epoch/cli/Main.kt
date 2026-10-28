@@ -94,6 +94,10 @@ class Verify : Callable<Int> {
     var migrationSourcePrefix = ""
     @Option(names = ["--execute-boundaries"], description = ["Try supported rolled-back INSERT boundary witnesses; successful samples never prove SAFE"])
     var executeBoundaries = false
+    @Option(names = ["--table-sizes"], description = ["Versioned table-size estimates JSON for operational severity; metadata only"])
+    var tableSizesPath: Path? = null
+    @Option(names = ["--fail-on-operational"], description = ["Also require operational SAFE; exit 4 after a passing compatibility gate"])
+    var failOnOperational = false
 
     override fun call(): Int {
         val contracts = contractPaths.map { json.readValue<DatabaseContract>(it.toFile()) }
@@ -101,11 +105,12 @@ class Verify : Callable<Int> {
         require(Files.isDirectory(migrations)) { "Migration directory does not exist: $migrations" }
         val accepted = acceptedBaseline?.let { json.readValue<AcceptedBaseline>(it.toFile()) }
         val newContracts = newContractPaths.map { json.readValue<DatabaseContract>(it.toFile()) }
+        val tableSizes = readTableSizes(tableSizesPath)
         val expectedDirections = verificationDirections(newContracts.isNotEmpty())
         return VerificationCheckpoint(reportPath, expectedDirections).use { checkpoint ->
             try {
                 val options = VerificationOptions(baselineCache, accepted, migrationTimeoutSeconds, globalTimeoutSeconds,
-                    executeBoundaries, planningParallelism = planningParallelism, progress = checkpoint::progress)
+                    executeBoundaries, planningParallelism = planningParallelism, progress = checkpoint::progress, tableSizes = tableSizes)
                 val verifier = PostgresVerifier()
                 if (newContracts.isNotEmpty()) {
                     val report = verifier.verifyBidirectional(contracts, newContracts, baseline, migrations, options)
@@ -113,13 +118,13 @@ class Verify : Callable<Int> {
                     val directions = report.directionReports()
                     sarifPath?.let { writeJson(it, sarifReport(directions, migrationSourcePrefix)) }
                     directions.forEach { (name, result) -> println("Direction: $name\n${renderReport(result, allDetails = details)}") }
-                    verificationExitCode(directions)
+                    verificationExitCode(directions, failOnOperational)
                 } else {
                     val report = verifier.verify(contracts, baseline, migrations, options)
                     checkpoint.complete(report)
                     sarifPath?.let { writeJson(it, sarifReport(listOf("old-on-new" to report), migrationSourcePrefix)) }
                     println(renderReport(report, allDetails = details))
-                    exitCode(report.gateVerdict ?: report.verdict)
+                    verificationExitCode(listOf("old-on-new" to report), failOnOperational)
                 }
             } catch (failure: Throwable) {
                 try { checkpoint.fail(failure) } catch (checkpointFailure: Throwable) { failure.addSuppressed(checkpointFailure) }
@@ -146,6 +151,8 @@ class Report : Callable<Int> {
     var sarifPath: Path? = null
     @Option(names = ["--migration-source-prefix"], description = ["Repository-relative migration path for SARIF locations"])
     var migrationSourcePrefix = ""
+    @Option(names = ["--fail-on-operational"], description = ["Also require measured operational SAFE; exit 4 after a passing compatibility gate"])
+    var failOnOperational = false
 
     override fun call(): Int {
         require(!(summaryOnly && details)) { "Choose either --summary or --details" }
@@ -182,7 +189,7 @@ class Report : Callable<Int> {
             sarifPath?.let { writeJson(it, sarifReport(directions, sourcePrefix)) }
             if (directions.any { !it.second.complete } || payload.path("complete").let { it.isBoolean && !it.asBoolean() } ||
                 tree.path("complete").let { it.isBoolean && !it.asBoolean() }) return 3
-            return verificationExitCode(directions)
+            return verificationExitCode(directions, failOnOperational)
         }
         val report = json.treeToValue(payload, CompatibilityReport::class.java)
         require(report.schemaVersion == 1) { "Unsupported report schemaVersion: ${report.schemaVersion}" }
@@ -197,10 +204,10 @@ class Report : Callable<Int> {
                 "--justification is required with --write-accepted-baseline"
             }))
             println("Wrote baseline acceptance to $it; migration findings are never suppressed by this file.")
-            return 0
+            return operationalExitCode(0, report.operationalVerdict, failOnOperational)
         }
         require(justification == null) { "--justification requires --write-accepted-baseline" }
-        return exitCode(report.gateVerdict ?: report.verdict)
+        return verificationExitCode(listOf("old-on-new" to report), failOnOperational)
     }
 }
 
@@ -222,9 +229,12 @@ private fun directionReports(oldOnNew: CompatibilityReport, newOnOld: Compatibil
     dataCompatibility?.let { add("new-writes-old-reads" to it) }
 }
 
-internal fun verificationExitCode(directions: List<Pair<String, CompatibilityReport>>): Int =
-    if (directions.any { !it.second.complete }) 3
-    else exitCode(CompatibilityEngine.aggregate(directions.map { it.second.gateVerdict ?: it.second.verdict }))
+internal fun verificationExitCode(directions: List<Pair<String, CompatibilityReport>>, failOnOperational: Boolean = false): Int {
+    if (directions.any { !it.second.complete }) return 3
+    val compatibility = exitCode(CompatibilityEngine.aggregate(directions.map { it.second.gateVerdict ?: it.second.verdict }))
+    val operational = directions.firstOrNull { it.first == "old-on-new" }?.second?.operationalVerdict
+    return operationalExitCode(compatibility, operational, failOnOperational)
+}
 
 fun exitCode(verdict: Verdict) = when (verdict) {
     Verdict.SAFE -> 0
@@ -289,6 +299,7 @@ fun renderReport(report: CompatibilityReport, summaryOnly: Boolean = false, allD
     appendLine(if (report.complete) "Result: ${report.verdict}" else "Partial evidence: ${report.verdict} (verification incomplete; exit 3)")
     report.gateVerdict?.let { appendLine("Migration gate with accepted baseline: $it (not a whole-contract safety proof)") }
     report.limitations.forEach { appendLine("Scope limitation: $it") }
+    renderOperational(report, summaryOnly, allDetails).takeIf { it.isNotEmpty() }?.let { appendLine(); appendLine(it) }
 }.trimEnd()
 
 /** Covers LinkageError, NoClassDefFoundError and other non-Exception failures as well as CLI errors. */

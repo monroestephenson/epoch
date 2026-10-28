@@ -7,7 +7,7 @@ Epoch asks a bounded question: do the old SQL and mappings in this explicit cont
 1. Start a disposable PostgreSQL 16.8 container.
 2. Construct the baseline using Flyway, or restore a validated baseline cache into the fresh container.
 3. Inspect baseline health once, including old SQL validity; retain preexisting findings without pending-migration attribution.
-4. Apply pending versioned migrations in Flyway version order, taking a catalog snapshot and checking the old contract at every step.
+4. Apply pending versioned migrations in Flyway version order, observe each actual SQL statement's operational facts, and take a catalog snapshot/check the old contract at every step.
 5. Compare every step to the original baseline, remove duplicated baseline findings from migration results, and aggregate compatibility and any explicitly accepted-baseline gate.
 
 Catalog inspection provides the actual schema after PostgreSQL executes a migration. SQL parsing is a conservative classifier for unsupported migration effects; it is not a replacement for executing the migration. The SQL planner uses PostgreSQL `PREPARE` and `EXPLAIN` with baseline-resolved parameter types and null argument values. It does not use `EXPLAIN ANALYZE`. Optional `--execute-boundaries` separately executes supported INSERT witnesses inside rolled-back transactions; samples can prove failures but cannot establish safety. PostgreSQL protocol Describe also checks declared result labels and types without executing the operation. Successful planning does not establish accepted values or result semantics.
@@ -112,6 +112,61 @@ Comparison uses the backing table's actual defaults, nullability, generated iden
 
 `VIEW_WRITE_UNSUPPORTED` identifies an old write that the replacement view cannot perform, using `pg_relation_is_updatable` with trigger support included and a baseline-valid contract entry. Column capability checks use `pg_column_is_updatable`; `VIEW_COLUMN_WRITE_UNPROVEN` remains `UNKNOWN` because an unsupported column flag alone does not prove failure for an explicit `DEFAULT` assignment. Successful planning alone does not prove equivalence for filtered, computed, trigger-backed, or otherwise opaque views, which remain `UNKNOWN` where no concrete failure is established. Preserve the original relation and a direct compatible projection during the rollout, or provide separate behavioral evidence for unsupported view logic.
 
+## Operational migration assessment
+
+The measured operational result is independent of compatibility: `SAFE`, `RISKY`, or `UNKNOWN` within a PostgreSQL model of scans that block ordinary writes and rewrites of preexisting storage. A structurally compatible migration can be operationally RISKY. Known risk dominates UNKNOWN, which dominates SAFE. This does not predict production duration, lock waits, workload interference, permissions, storage capacity, or every deployment hazard.
+
+For each pending statement, Flyway callbacks retain the exact SQL and a one-based statement ordinal within its migration. Epoch samples the same migration connection's autocommit state, granted relation locks before/after execution, newly observed locks, and `lock_timeout`. Catalog identity establishes whether surviving physical storage was rewritten and whether a relation existed at baseline, including through renames. SQL recognition must be corroborated by actual catalog/session observations; an empty diff or lock sample is never sufficient for SAFE. Flyway batching is disabled so samples correspond to individual executed statements. OIDs, storage identifiers, process IDs, timestamps, and durations stay outside the portable operational report.
+
+After an autocommit statement, its locks may already be released. Ordinary index builds still have known write-blocking scan semantics. Index locks remain distinct from table locks. Before-statement `ShareLock`, `ShareRowExclusiveLock`, `ExclusiveLock`, and `AccessExclusiveLock` on old tables can remain held from earlier statements while a later scan runs. Epoch checks these retained locks across the migration session, including locks on other old relations; inspecting only newly acquired locks would miss that risk.
+
+Only `old-on-new` executes the deployment sequence and contributes operational evidence. Reverse schema checks and the new-writes/old-reads assessment do not execute deployment or down migrations. Baseline construction is outside the pending operational window. A completed, known-empty pending window is operational SAFE with an explicit scope note; an older report with missing measurements is unavailable. Failed SQL, broken observation callbacks, lost connections, and interrupted runs remain execution failures (exit 3), with only completed checkpoint evidence retained.
+
+### Operational rules
+
+Every operational finding includes migration identity, statement ordinal, object, rule, evidence, and a mitigation when applicable. RISKY findings also include size-based severity. These rules do not alter structural or data-compatibility findings.
+
+| Rule | Evidence and response |
+| --- | --- |
+| `OP_TABLE_REWRITE` | RISKY: the same preexisting physical relation has changed storage identity. Use expand/backfill/contract or an explicit rewrite maintenance plan. |
+| `OP_NOT_NULL_SCAN` | RISKY: a previously nullable column has no supported prior validated non-null CHECK, so SET NOT NULL validates rows under AccessExclusiveLock. Install a supported CHECK NOT VALID, release strong locks, validate, then set NOT NULL. |
+| `OP_INDEX_BUILD_BLOCKS_WRITES` | RISKY: a catalog-confirmed ordinary index build scans old data while blocking writes, even when autocommit leaves no sampled lock afterward. Use supported CREATE INDEX CONCURRENTLY in a nontransactional migration. |
+| `OP_CONSTRAINT_VALIDATION_BLOCKS_WRITES` | RISKY: immediate CHECK/FK validation affects old data or referenced relations under its write-blocking validation locks. Separate installation with NOT VALID from later validation. |
+| `OP_VALIDATION_UNDER_COMPOUND_LOCK` | RISKY: a recognized scan shares one compound ALTER with a confirmed subcommand requiring a strong table lock. PostgreSQL acquires the strongest required lock before its subcommands; split the work across committed transactions. |
+| `OP_VALIDATION_UNDER_RETAINED_LOCK` | RISKY: an old table is already held under a write-blocking lock when a recognized scan/build runs. Release that lock before the scan, usually through separate transactions. This also matters when the scan's target is new. |
+| `OP_ONLINE_INDEX_BUILD` | SAFE: a supported concurrent build actually ran nontransactionally, produced a valid/ready index, and had no retained old-table blocking lock. Preserve that execution mode; long-transaction waits and I/O still need production planning. |
+| `OP_DEFERRED_CONSTRAINT_VALIDATION` | SAFE: supported NOT VALID installation is catalog-confirmed to skip the initial validation scan. Schedule its later validation separately; this does not assert compatibility with old writers. |
+| `OP_NONBLOCKING_VALIDATION` | SAFE: a supported previously unvalidated constraint became valid under normal validation semantics, without an old-table blocking lock held before the scan. Preserve the transaction boundary that made this possible. |
+| `OP_VALIDATED_NOT_NULL` | SAFE: a prior supported validated scalar non-null CHECK establishes that SET NOT NULL needs no validation scan. Establish that proof before the statement; a composite-row predicate is insufficient. |
+| `OP_NEW_RELATION_OPERATION` | SAFE: a supported operation affects new-window storage, with relevant existing-relation and retained-lock effects accounted for. Do not apply this exemption to opaque SQL merely because its named target is new. |
+| `OP_METADATA_ONLY` | SAFE: a supported catalog change, literal lock-timeout setting, or positively established no-op needs no scan/build within the model. Retain the exact supported form; a measured rewrite still makes the statement RISKY. |
+| `OP_STATEMENT_UNSUPPORTED` | UNKNOWN: SQL meaning, physical identity, catalog corroboration, or a required scan/effect proof is incomplete. Review the specific gap or add supported evidence; no observed rewrite alone does not prove no scan. |
+| `OP_DATABASE_CALLBACK_UNPROVEN` | UNKNOWN: enabled event triggers applicable to this command can execute unmodeled procedural work. Review those callbacks separately; unrelated command-tag restrictions do not automatically contaminate every statement. |
+
+Supported metadata changes include ordinary renames, nullable built-in column additions with no default or a supported constant default, supported constant-default changes, DROP DEFAULT, and DROP NOT NULL. Known no-ops are corroborated by prior and resulting catalogs. Supported index/constraint proofs exclude unmodeled expressions, custom types/operators, and other unsupported effects. Procedural `DO`, arbitrary DML, transaction-control SQL, and other unrecognized operations remain UNKNOWN unless measured rewrite/blocking evidence establishes RISKY. Existing-table type changes without a heap rewrite remain UNKNOWN when possible validation or index work is unproven. Partition/inheritance and opaque callback paths retain their limits.
+
+A positive staged pattern uses distinct committed migrations:
+
+```sql
+-- V201__install_check.sql
+ALTER TABLE accounts ADD CONSTRAINT accounts_email_nn
+  CHECK (email IS NOT NULL) NOT VALID;
+
+-- V202__validate_check.sql: runs after V201 commits and releases its lock
+ALTER TABLE accounts VALIDATE CONSTRAINT accounts_email_nn;
+
+-- V203__set_not_null.sql: the validated CHECK now supplies the scan-skip proof
+ALTER TABLE accounts ALTER COLUMN email SET NOT NULL;
+```
+
+Validation must succeed against the supplied baseline data. Combining installation and validation in one transaction retains the installation's strong lock and is operationally RISKY. A single compound ALTER combining validation with another strong-lock subcommand is also RISKY: PostgreSQL acquires the strongest required lock before running the subcommands. These statements still receive independent compatibility checks, which may reject tighter old-writer inputs. For concurrent indexes, keep `executeInTransaction=false` in the migration's `.sql.conf` sidecar; Epoch uses Flyway's session-level advisory lock so its own lock transaction does not obstruct the build.
+
+### Timeout evidence and size grading
+
+Timeout facts record milliseconds, PostgreSQL's reported source, and origin: `VERIFIER`, `MIGRATION_SESSION`, `MIGRATION_LOCAL`, or `UNKNOWN`. A recognized literal SET/SET LOCAL can establish authored scope; zero means no lock timeout. The disposable connection's injected timeout is a test-harness safeguard, not evidence that deployment migrations configure one. Outer observations cannot establish an opaque procedure's internal settings. A timeout never downgrades a known blocking scan or rewrite to SAFE.
+
+Optional [table-size metadata](ci.md#table-size-estimates) grades RISKY findings as LOW, MEDIUM, or HIGH. Both row and byte estimates are required to lower severity; missing estimates default to HIGH. Renamed old relations use their original baseline names for lookup. Fixture sizes are never substituted for production estimates, and grading does not predict duration or change the verdict. `--fail-on-operational` optionally requires operational SAFE after the compatibility gate passes; see [CI policy](ci.md#operational-ci-gate).
+
 ## Unsupported or conservative areas
 
 - **Native SQL:** supported fixed explicit-column templates use SQL aliases for physical dependencies and explicit types or unambiguous PostgreSQL inference. Unknown types freeze only after PostgreSQL resolves them at baseline. Wildcards, nested scopes, ambiguous aliases, positional inserts, conflict-update variants, and opaque function/sequence calls remain unresolved; simplify or explicitly enumerate those access paths instead of changing completeness flags. `POSTGRES_SQL_REJECTED` supplies `BREAKING` evidence only when PostgreSQL accepted the same contract SQL at baseline. Successful planning does not prove arbitrary native hydration or behavior.
@@ -125,7 +180,7 @@ Comparison uses the backing table's actual defaults, nullability, generated iden
 - **Type and hydration semantics:** successful SQL preparation does not prove every bound value is accepted, every row can be hydrated, or every application expectation is preserved.
 - **Nullability evidence:** contracts distinguish `declaredNonNull` from raw `hibernateNullable`. Kotlin metadata and explicit Java bytecode annotations describe the mapped logical member; unknown Java/generic declarations remain unknown, and container or association nullability is not copied onto JDBC leaf columns. These facts do not prove arbitrary converter output or replace the actual baseline's accepted-input constraints.
 - **Enum and converter evidence:** ordered constants, recognized enum encodings, aligned database values, and converter class/fingerprint facts are recorded separately. Hibernate 7 explicit enum codes are not assumed to be Java names or declaration ordinals. Arbitrary converter semantics remain unsupported; a class-byte fingerprint alone proves neither equivalent behavior nor a breaking format change.
-- **Operational migration safety:** production lock duration, concurrency, permissions, storage pressure, and down-migration behavior are outside compatibility proof. A separate optional `lint` command emits operational hints. Verification deadlines and session-level advisory locking keep the disposable run bounded, including supported concurrent index migrations.
+- **Operational migration safety:** the separate measured assessment above covers supported write-blocking scans and storage rewrites. Production lock duration, workload concurrency, permissions, storage pressure, and down-migration behavior remain outside that proof. The optional static `lint` command is unchanged; its hints are separate from measured findings. Verification deadlines bound the disposable run and do not establish a production timeout policy.
 - **Application coverage:** no whole-application guarantee follows from entity discovery or a test run. Additional JDBC paths, application authorization assumptions, and custom query-generation code must be accounted for separately.
 
 Repository discovery is enabled by default and records recognized DAO/repository call sites, individually unresolved dynamic paths, and observed test statements. Per-class percentages cover only the discovered method inventory. See [repository coverage](repository-coverage.md) for scan scope, framework subsets, and variant boundaries.

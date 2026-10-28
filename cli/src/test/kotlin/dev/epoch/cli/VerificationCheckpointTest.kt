@@ -85,4 +85,18 @@ class VerificationCheckpointTest {
         }
         assertEquals(Files.readString(a), Files.readString(b))
     }
+
+    @Test fun `incomplete checkpoints retain measured risk but never certify remaining operational work`() {
+        for (verdict in OperationalVerdict.entries) {
+            val output = directory.resolve("operational-$verdict.json")
+            VerificationCheckpoint(output, listOf("old-on-new")).use { checkpoint ->
+                checkpoint.progress("old-on-new", report().copy(operationalVerdict = verdict))
+                checkpoint.fail(VerificationException("MIGRATION_TIMEOUT", message = "Timeout"))
+            }
+            val retained = json.readTree(output.toFile())["reports"]["old-on-new"]
+            assertEquals(if (verdict == OperationalVerdict.RISKY) "RISKY" else "UNKNOWN",
+                retained["operationalVerdict"].asText())
+            assertEquals(3, runCli(arrayOf("report", "--input", output.toString(), "--fail-on-operational", "--summary")))
+        }
+    }
 }

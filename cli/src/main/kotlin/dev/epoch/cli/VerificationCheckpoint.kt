@@ -1,6 +1,7 @@
 package dev.epoch.cli
 
 import dev.epoch.core.CompatibilityReport
+import dev.epoch.core.OperationalVerdict
 import dev.epoch.core.Verdict
 import dev.epoch.postgres.VerificationException
 import java.nio.file.Files
@@ -30,6 +31,9 @@ internal class VerificationCheckpoint(
         reports[direction] = report.copy(
             verdict = if (report.verdict == Verdict.BREAKING) Verdict.BREAKING else Verdict.UNKNOWN,
             gateVerdict = report.gateVerdict?.let { if (it == Verdict.BREAKING) Verdict.BREAKING else Verdict.UNKNOWN },
+            operationalVerdict = report.operationalVerdict?.let {
+                if (it == OperationalVerdict.RISKY) it else OperationalVerdict.UNKNOWN
+            },
             complete = false,
             incompleteReason = "Verification has not completed all requested migration states.")
         publishPartial("IN_PROGRESS")

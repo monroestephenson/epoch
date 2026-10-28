@@ -157,3 +157,34 @@ The overall `verdict` includes baseline health. Explicit baseline acceptance add
 An acceptance file has `schemaVersion: 1`, `baselineFingerprint`, and `findings`, each with a finding `fingerprint` and a required nonblank `justification`. The fingerprint binds acceptance to the contract, baseline files/settings, catalog, and baseline evidence. Stale, unknown, duplicated, or unjustified entries are rejected. Pending-migration findings cannot be accepted through this file. See [CI usage](ci.md) for the generation and review workflow.
 
 With `--new-contract`, the envelope contains `oldOnNew`, `newOnOld`, and `dataCompatibility`, plus their aggregate `verdict` and optional `gateVerdict`. The data assessment uses `<old-vs-new-contract>` attribution and no baseline waiver. JSON replay, terminal output, SARIF, and incomplete checkpoints retain the `new-writes-old-reads` direction. SARIF marks contract evidence without inventing a migration file or line. See [data verification boundaries](verification.md#new-writes-and-old-readers).
+
+## Measured operational report fields
+
+Operational evidence is additive to report schema version 1 and does not change the SQL contract or compatibility verdict. `MigrationReport.operational` is nullable for older/unmeasured reports. A forward `CompatibilityReport` adds `operationalVerdict` (`SAFE`, `RISKY`, or `UNKNOWN`) and `operationalLimitations`. The bidirectional envelope's operational verdict comes only from `oldOnNew`; reverse schema and data directions supply no deployment execution evidence.
+
+| Field | Meaning |
+| --- | --- |
+| `operational.verdict` | Aggregate within the supported blocking-scan/storage-rewrite model; RISKY takes precedence over UNKNOWN, then SAFE. |
+| `operational.statements` | Actual Flyway execution order, with `migration`, one-based `ordinal`, exact `sql`, `autoCommit`, and statement `verdict`. Ordinals reset for each migration and are not source line numbers. |
+| `lockTimeoutBefore`, `lockTimeoutAfter` | Observed `milliseconds`, `postgresSource`, and `origin`: `VERIFIER`, `MIGRATION_SESSION`, `MIGRATION_LOCAL`, or `UNKNOWN`. Zero means disabled; verifier settings do not establish deployment protection. |
+| `heldLocksBefore`, `heldLocksAfter`, `newlyObservedLocks` | Relation name, `relationKind`, lock `mode`, and optional owning `table` facts. Index locks remain identified as index locks. |
+| `rewrittenTables` | Stable `beforeName`/`afterName` and `table` facts for observed storage rewrites; internal OIDs/filenodes are omitted. |
+| Relation facts | `name`, `kind`, `preExisting` (`true`, `false`, or unknown `null`), and original `baselineName`. Baseline names survive renames and key supplied size estimates. |
+| Statement `findings` and assessment `findings` | Findings at the statement level and their flat assessment view. Each includes `ruleId`, `verdict`, `objectName`, `message`, `evidence`, `migration`, `statementOrdinal`, optional `severity`, and optional `mitigation`. |
+| `operational.limitations` | Explicit scope limits; missing estimates, absent measurements, and unsupported behavior are not implied safety. |
+
+Risk severity is `LOW`, `MEDIUM`, or `HIGH` and is distinct from verdict. Caller-supplied size metadata is a separate versioned input, not production data embedded in an extraction descriptor:
+
+```json
+{
+  "schemaVersion": 1,
+  "tables": {
+    "public.accounts": { "estimatedRows": 1000000, "totalBytes": 268435456 },
+    "public.events": { "estimatedRows": null, "totalBytes": 536870912 }
+  }
+}
+```
+
+Keys use exact stored schema/table names as `schema.table`, without SQL identifier quotes; embedded dots are unsupported. Names follow PostgreSQL's 63-byte identifier boundary. Estimates are nonnegative 64-bit integers or null/missing. Duplicate JSON keys, normalization collisions, negative/fractional values, and unsupported versions are rejected. Missing estimates remain unknown; they are not zero. See [export SQL and grading thresholds](ci.md#table-size-estimates).
+
+A completed known-empty pending window may have operational SAFE. Absent/null fields in a legacy report mean unavailable and cannot satisfy `--fail-on-operational`. Incomplete checkpoints keep completed statement facts but cannot certify the remaining deployment and replay with exit 3. JSON and terminal reports retain operational details; current SARIF output contains compatibility findings only. The separate static-lint report format is unchanged.
