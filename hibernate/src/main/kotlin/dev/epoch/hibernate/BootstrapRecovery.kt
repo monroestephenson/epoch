@@ -3,7 +3,7 @@ package dev.epoch.hibernate
 import dev.epoch.core.*
 import java.lang.reflect.*
 
-/** Bounded divide-and-conquer over complete association/inheritance components. */
+/** Bounded association pruning, followed by isolation of complete dependency components. */
 internal object BootstrapRecovery {
     fun recover(classes: List<Class<*>>, request: ExtractionRequest, initialFailure: Throwable,
                 bootstrap: (List<Class<*>>) -> DatabaseContract,
@@ -68,63 +68,111 @@ internal object BootstrapRecovery {
                                    bootstrap: (List<Class<*>>, Map<String, Set<String>>) -> DatabaseContract): DatabaseContract? {
         var budget = 32
         val attempted = mutableSetOf<Set<String>>()
-        fun referencedTypes(type: Type): Set<Class<*>> = when (type) {
-            is Class<*> -> setOf(type)
-            is ParameterizedType -> type.actualTypeArguments.flatMap { referencedTypes(it) }.toSet()
-            is WildcardType -> (type.upperBounds + type.lowerBounds).flatMap { referencedTypes(it) }.toSet()
-            else -> emptySet()
-        }
-        fun prune(remaining: List<Class<*>>, removed: Set<Class<*>>): Map<String, Set<String>> {
-            val result = linkedMapOf<String, Set<String>>()
-            for (entity in remaining) {
-                val attributes = linkedSetOf<String>()
-                for (field in entity.declaredFields) if (field.annotations.any { it.annotationClass.java.name in ASSOCIATIONS } &&
-                    referencedTypes(field.genericType).any { it in removed }) attributes += field.name
-                for (method in entity.declaredMethods) if (method.parameterCount == 0 &&
-                    method.annotations.any { it.annotationClass.java.name in ASSOCIATIONS } &&
-                    referencedTypes(method.genericReturnType).any { it in removed }) {
-                    val name = method.name.removePrefix("get").removePrefix("is").replaceFirstChar { it.lowercase() }
-                    attributes += name
-                }
-                if (attributes.isNotEmpty()) result[entity.name] = attributes
-            }
-            return result
-        }
-        fun tryWithout(removed: Set<Class<*>>, previous: Throwable): DatabaseContract? {
-            if (budget <= 0 || removed.size >= classes.size || removed.size > 8) return null
+        val pending = ArrayDeque<Pair<Set<Class<*>>, Throwable>>()
+        pending.add(emptySet<Class<*>>() to failure)
+        while (pending.isNotEmpty() && budget > 0) {
+            val (removed, previous) = pending.removeFirst()
+            if (removed.size >= classes.size || removed.size > 8) continue
             val messages = generateSequence(previous) { it.cause }.take(12).mapNotNull { it.message }.joinToString("; ")
             val remaining = classes.filter { it !in removed }
-            val named = remaining.filter { messages.contains(it.name) }.sortedBy { it.name }
+            val named = remaining.filter {
+                Regex("(?<![\\p{javaJavaIdentifierPart}.])${Regex.escape(it.name)}(?![\\p{javaJavaIdentifierPart}])")
+                    .containsMatchIn(messages)
+            }.sortedBy { it.name }
             val candidates = named.ifEmpty { if (removed.isEmpty()) remaining.sortedBy { it.name } else emptyList() }
             for (candidate in candidates) {
                 if (budget-- <= 0) break
                 // Inheritance cannot be detached safely by making an association transient.
                 val omitted = removed + classes.filter { candidate.isAssignableFrom(it) }
+                if (omitted.size > 8) continue
                 if (!attempted.add(omitted.map { it.name }.toSet())) continue
                 val retained = classes.filter { it !in omitted }
                 if (retained.isEmpty()) continue
                 try {
-                    val associations = prune(retained, omitted)
-                    val contract = bootstrap(retained, associations)
+                    val associations = prune(retained, omitted) ?: continue
+                    val contract = bootstrap(retained, associations.overrides)
                     val issues = omitted.sortedBy { it.name }.map { UnresolvedQuery(it.name,
                         "Entity excluded after failed bootstrap: ${describe(previous)}") } +
-                        associations.toSortedMap().flatMap { (owner, properties) -> properties.sorted().map { property ->
-                            UnresolvedQuery("$owner.$property", "Association to an excluded entity was omitted only in partial extraction; its SQL and behavior remain unresolved")
-                        } }
+                        associations.paths.map { path -> UnresolvedQuery("${path.owner.name}.${path.property}",
+                            "Association declared by ${path.declaring.name}.${path.property} targets excluded entities ${path.targets.filter { it in omitted }.map { it.name }.sorted()}; omitted only in partial extraction, so its SQL and behavior remain unresolved") }
                     return contract.copy(coverage = contract.coverage.copy(complete = false,
                         notes = contract.coverage.notes + "Partial graph extraction: excluded entities and association XML overrides are explicitly unresolved; original application classes were not modified."),
                         unresolvedQueries = (contract.unresolvedQueries + issues).distinct().sortedWith(compareBy({ it.id }, { it.reason })))
                 } catch (next: Throwable) {
                     rethrowFatal(next)
-                    tryWithout(omitted, next)?.let { return it }
+                    // Try all single exclusions before combinations; a diagnostic may name healthy callers too.
+                    pending.add(omitted to next)
                 }
             }
-            return null
         }
-        return tryWithout(emptySet(), failure)
+        return null
+    }
+
+    private data class AssociationPath(val owner: Class<*>, val declaring: Class<*>, val property: String,
+                                       val targets: Set<Class<*>>)
+    private data class AssociationPruning(val overrides: Map<String, Set<String>>, val paths: List<AssociationPath>)
+
+    /** A mapped-superclass override applies to all its retained descendants, not just one concrete owner. */
+    private fun prune(remaining: List<Class<*>>, removed: Set<Class<*>>): AssociationPruning? {
+        val paths = remaining.sortedBy { it.name }.flatMap(::associationPaths)
+        val cut = paths.filter { path -> path.targets.any { it in removed } }
+        val overrides = cut.groupBy { it.declaring.name }.mapValues { (_, entries) -> entries.map { it.property }.toSortedSet() }.toSortedMap()
+        if (paths.any { path -> path.property in overrides[path.declaring.name].orEmpty() &&
+                (path.targets.isEmpty() || path.targets.any { it !in removed }) }) return null
+        return AssociationPruning(overrides, cut.distinct().sortedWith(compareBy({ it.owner.name }, { it.property }, { it.declaring.name })))
+    }
+
+    private fun associationPaths(owner: Class<*>): List<AssociationPath> = buildList {
+        var current: Class<*>? = owner
+        val bindings = mutableMapOf<TypeVariable<*>, Type>()
+        fun targets(type: Type, visited: Set<Type> = emptySet()): Set<Class<*>> {
+            if (type in visited) return emptySet()
+            val seen = visited + type
+            return when (type) {
+                is Class<*> -> setOf(type)
+                is ParameterizedType -> type.actualTypeArguments.flatMap { targets(it, seen) }.toSet()
+                is WildcardType -> (type.upperBounds + type.lowerBounds).flatMap { targets(it, seen) }.toSet()
+                is GenericArrayType -> targets(type.genericComponentType, seen)
+                is TypeVariable<*> -> bindings[type]?.let { targets(it, seen) } ?: emptySet()
+                else -> emptySet()
+            }
+        }
+        fun addAssociation(declaring: Class<*>, property: String, member: AnnotatedElement, type: Type) {
+            val annotations = member.annotations.filter { it.annotationClass.java.name in ASSOCIATIONS }
+            if (annotations.isEmpty()) return
+            val explicit = annotations.mapNotNull { annotation ->
+                (annotation.annotationClass.java.getMethod("targetEntity").invoke(annotation) as? Class<*>)
+                    ?.takeUnless { it == Void.TYPE || it == Void::class.java }
+            }.toSet()
+            add(AssociationPath(owner, declaring, property, explicit.ifEmpty { targets(type) }))
+        }
+        while (current != null && current != Any::class.java) {
+            val declaring = current
+            if (declaring.annotations.any { it.annotationClass.java.name in MAPPED_TYPES }) {
+                declaring.declaredFields.sortedBy { it.name }.forEach { field ->
+                    addAssociation(declaring, field.name, field, field.genericType)
+                }
+                declaring.declaredMethods.filter { it.parameterCount == 0 && !it.isBridge && !it.isSynthetic }
+                    .sortedBy { it.name }.forEach { method ->
+                        val stem = when {
+                            method.name.startsWith("get") -> method.name.removePrefix("get")
+                            method.name.startsWith("is") -> method.name.removePrefix("is")
+                            else -> return@forEach
+                        }
+                        addAssociation(declaring, java.beans.Introspector.decapitalize(stem), method, method.genericReturnType)
+                    }
+            }
+            val parent = declaring.genericSuperclass
+            if (parent is ParameterizedType) {
+                val raw = parent.rawType as? Class<*>
+                raw?.typeParameters?.zip(parent.actualTypeArguments)?.forEach { (variable, value) -> bindings[variable] = value }
+            }
+            current = declaring.superclass
+        }
     }
 
     private val ASSOCIATIONS = setOf("jakarta.persistence.ManyToOne", "jakarta.persistence.OneToOne", "jakarta.persistence.OneToMany", "jakarta.persistence.ManyToMany")
+    private val MAPPED_TYPES = setOf("jakarta.persistence.Entity", "jakarta.persistence.MappedSuperclass")
 
     private fun components(classes: List<Class<*>>): List<List<Class<*>>> {
         val byName = classes.associateBy { it.name }

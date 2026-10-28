@@ -37,7 +37,7 @@ class Extract : Callable<Int> {
     lateinit var descriptor: Path
     @Option(names = ["--output"], required = true, description = ["Versioned contract JSON destination"])
     lateinit var output: Path
-    @Option(names = ["--keep-going"], description = ["Record failed mapping groups as unresolved and continue independent groups"])
+    @Option(names = ["--keep-going"], description = ["Continue supported mappings after bootstrap failures; record excluded entities and associations"])
     var keepGoing = false
     @Option(names = ["--runtime-sql"], description = ["Captured SqlCollector JSONL input; repeat to merge test observations"])
     var runtimeSqlPaths: List<Path> = emptyList()

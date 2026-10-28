@@ -107,7 +107,7 @@ Initial setup downloads Gradle, dependencies, and Docker images. Once all depend
 | Exit `3` with `NoClassDefFoundError` | Inspect the reported missing dependency and descriptor classpath. Bean Validation is disabled during extraction. |
 | Hibernate runtime/classpath mismatch | Include the application's actual Hibernate 6.6/7.x runtime and all dependencies. Epoch isolates that runtime; tested versions are 6.6.13, 7.0.10, 7.1.4, and 7.4.9. Incomplete runtimes and unsupported SPI paths fail clearly instead of falling back to bundled Hibernate. |
 | Entity list too large | Use `scanPackages` over compiled class directories/JARs. |
-| A mapping group fails bootstrap | Use `--keep-going` to preserve independent results; failed groups remain unresolved. |
+| A mapping fails bootstrap | Use `--keep-going` to retain healthy entities where recovery is supported; excluded entities and association paths remain unresolved. |
 | Container or Ryuk cannot start | Read the cause chain, check Docker access, both required images, and runner cleanup/permission requirements. |
 | Baseline debt dominates output | Read `baseline` and rule summaries; use reviewed baseline acceptance if a migration-only gate is appropriate. |
 | Cache repeatedly rebuilds | Check file permissions, archive integrity, and catalog differences after restoration. |

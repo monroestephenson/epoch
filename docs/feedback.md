@@ -19,7 +19,7 @@ This table maps the reported issues to the implementation and documents the limi
 | 11 | `hibernateProperties` supplies application type/schema and other settings. | Offline connection, schema-generation, validation, and dialect safeguards remain enforced. |
 | 12 | Repeated `verify --contract` verifies several persistence units with one baseline application. | Inputs must share the same database baseline; IDs are namespaced in input order. |
 | 13 | `scanPackages` discovers annotated entities from compiled class directories and JARs. | Package scanning does not discover arbitrary runtime database-access paths. |
-| 14 | `--keep-going` retains independent mapping components and records failures. | Recovery is bounded; partial extraction is always incomplete. |
+| 14 | `--keep-going` isolates failed entities and their incoming associations, including inherited and explicit-target mappings. | Recovery is bounded; unsupported splits and every omission remain unresolved, and partial extraction is always incomplete. |
 | 15 | Entity overrides support operation sets, result-mapping-only classes, and exclusion; immutable mappings default to reads. | Overrides narrow the declared scope and do not prove absence of omitted application operations. |
 | 16 | `nativeQueryParameterTypes` supplies types for explicit and named native queries. | Preparation does not establish full native-query dependencies or behavioral safety. |
 | 17 | Verification help describes contract/report paths and the new options. | Use each command's `--help` for exact syntax. |

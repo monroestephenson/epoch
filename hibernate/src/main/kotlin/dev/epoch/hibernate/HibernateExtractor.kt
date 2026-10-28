@@ -149,17 +149,54 @@ class HibernateExtractor {
             classes.forEach(sources::addAnnotatedClass)
             if (prunedAssociations.isNotEmpty()) {
                 fun xml(value: String) = value.replace("&", "&amp;").replace("<", "&lt;").replace("\"", "&quot;")
+                val overrides = prunedAssociations.map { (name, properties) ->
+                    val declaring = Class.forName(name, false, Thread.currentThread().contextClassLoader)
+                    val element = if (declaring.annotations.any { it.annotationClass.java.name == "jakarta.persistence.MappedSuperclass" })
+                        "mapped-superclass" else "entity"
+                    if (element == "mapped-superclass") sources.addAnnotatedClass(declaring)
+                    val access = recoveryMappingAccess(declaring, classes, properties)
+                    Triple(element, name, access to properties)
+                }.sortedWith(compareBy({ if (it.first == "mapped-superclass") 0 else 1 }, { it.second }))
                 val mappings = "<entity-mappings xmlns=\"https://jakarta.ee/xml/ns/persistence/orm\" version=\"3.1\">" +
-                    prunedAssociations.toSortedMap().entries.joinToString("") { (name, properties) ->
-                        "<entity class=\"${xml(name)}\"><attributes>" + properties.sorted().joinToString("") { property ->
+                    overrides.joinToString("") { (element, name, attributeMapping) ->
+                        val (access, properties) = attributeMapping
+                        "<$element class=\"${xml(name)}\" access=\"$access\"><attributes>" + properties.sorted().joinToString("") { property ->
                             "<transient name=\"${xml(property)}\"/>"
-                        } + "</attributes></entity>"
+                        } + "</attributes></$element>"
                     } + "</entity-mappings>"
                 sources.addInputStream(mappings.byteInputStream())
             }
             val factory = sources.buildMetadata().buildSessionFactory() as SessionFactoryImplementor
             try { return extractFactory(factory, request) } finally { factory.close() }
         } finally { StandardServiceRegistryBuilder.destroy(registry) }
+    }
+
+    /** Sparse transient XML must retain the annotation mapping's access strategy, including Hibernate 7's model lookup. */
+    private fun recoveryMappingAccess(declaring: Class<*>, classes: List<Class<*>>, properties: Set<String>): String {
+        val explicit = declaring.annotations.singleOrNull { it.annotationClass.java.name == "jakarta.persistence.Access" }
+            ?.let { it.annotationClass.java.getMethod("value").invoke(it).toString() }
+        val identifiers = setOf("jakarta.persistence.Id", "jakarta.persistence.EmbeddedId")
+        val mappedTypes = classes.filter { declaring.isAssignableFrom(it) }.flatMap { owner ->
+            generateSequence(owner) { it.superclass }.filter { type ->
+                type.annotations.any { it.annotationClass.java.name in setOf("jakarta.persistence.Entity", "jakarta.persistence.MappedSuperclass") }
+            }.toList()
+        }.distinct()
+        val access = explicit ?: mappedTypes.flatMap { type ->
+            type.declaredFields.filter { field -> field.annotations.any { it.annotationClass.java.name in identifiers } }.map { "FIELD" } +
+                type.declaredMethods.filter { method -> method.annotations.any { it.annotationClass.java.name in identifiers } }.map { "PROPERTY" }
+        }.distinct().singleOrNull()
+        require(access in setOf("FIELD", "PROPERTY")) { "Cannot determine annotation access for partial mapping ${declaring.name}" }
+        val associations = setOf("jakarta.persistence.ManyToOne", "jakarta.persistence.OneToOne", "jakarta.persistence.OneToMany", "jakarta.persistence.ManyToMany")
+        properties.forEach { property ->
+            val fieldAccess = declaring.declaredFields.any { it.name == property && it.annotations.any { a -> a.annotationClass.java.name in associations } }
+            val methodAccess = declaring.declaredMethods.any { method -> method.parameterCount == 0 &&
+                java.beans.Introspector.decapitalize(method.name.removePrefix("get").removePrefix("is")) == property &&
+                method.annotations.any { a -> a.annotationClass.java.name in associations } }
+            require(if (access == "FIELD") fieldAccess && !methodAccess else methodAccess && !fieldAccess) {
+                "Partial mapping cannot change member-specific access for ${declaring.name}.$property"
+            }
+        }
+        return requireNotNull(access)
     }
 
     /** For tests/adapters already bootstrapping Hibernate with all application-specific settings. */
