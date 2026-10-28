@@ -6,9 +6,9 @@ import jakarta.persistence.EntityManager
 class VariantDiagnosticsRepository(private val entityManager: EntityManager) {
     fun first(fail: Boolean) = entityManager.createQuery(if (fail)
         "select r.missingLabel from QueryIsolationRecord r" else
-        "select r.label from QueryIsolationRecord r")
+        "select r.label from QueryIsolationRecord r").resultList
 
     fun second(fail: Boolean) = entityManager.createQuery(if (fail)
         "select r.missingLabel from QueryIsolationRecord r" else
-        "select r.id from QueryIsolationRecord r")
+        "select r.id from QueryIsolationRecord r").resultList
 }

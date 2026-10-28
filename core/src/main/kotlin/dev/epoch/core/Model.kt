@@ -13,6 +13,7 @@ data class DatabaseContract(
     val coverage: Coverage = Coverage(),
     val unresolvedQueries: List<UnresolvedQuery> = emptyList(),
     val accessPaths: List<AccessPathCoverage> = emptyList(),
+    val apiInventory: DatabaseApiInventory? = null,
 )
 
 enum class VerificationScope { STRUCTURAL_CONTRACT, WHOLE_APPLICATION }
@@ -262,6 +263,7 @@ data class CompatibilityReport(
     /** Independent operational assessment of the executed deployment window only. */
     val operationalVerdict: OperationalVerdict? = null,
     val operationalLimitations: List<String> = emptyList(),
+    val apiInventory: DatabaseApiInventory? = null,
 )
 
 /** A baseline fingerprint binds acceptance to the contract, catalog and baseline migration input. */

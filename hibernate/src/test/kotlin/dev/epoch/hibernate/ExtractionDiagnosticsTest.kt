@@ -53,11 +53,11 @@ class ExtractionDiagnosticsTest {
             entityClasses = listOf(QueryIsolationRecord::class.java.name), classpath = listOf(root.toString()),
             repositoryPackages = listOf(VariantDiagnosticsRepository::class.java.packageName)))
         val paths = contract.accessPaths
-        assertEquals(2, paths.size, contract.toString())
+        assertEquals(4, paths.size, contract.toString())
         assertTrue(paths.all { it.status == AccessPathStatus.UNRESOLVED && it.queryIds.size == 2 }, paths.toString())
         val group = contract.unresolvedQueries.single()
         assertTrue(group.affectedIds.containsAll(paths.map { it.id }), group.toString())
-        assertEquals(4, group.affectedIds.size, "Two failed variants and their two method paths share one cause")
+        assertEquals(6, group.affectedIds.size, "Two failed variants and their four factory/execution paths share one cause")
         assertTrue(paths.all { it.reason == "Extraction diagnostic ${group.id}" }, paths.toString())
         assertEquals(2, contract.queries.count { query -> paths.any { query.id in it.queryIds } })
         assertFalse(contract.coverage.complete)

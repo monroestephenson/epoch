@@ -18,6 +18,8 @@ data class DiscoveredQueries(
     val unresolved: List<UnresolvedQuery> = emptyList(),
     val accessPaths: List<AccessPathCoverage> = emptyList(),
     val notes: List<String> = emptyList(),
+    val apiInventory: DatabaseApiInventory? = null,
+    val hqlQueryPagination: Map<String, QueryPagination> = emptyMap(),
 )
 
 /** Bounded bytecode data flow retains only established constants or finite string alternatives. */
@@ -29,11 +31,17 @@ object RepositoryDiscovery {
         val failedClasses = sortedSetOf<String>()
         val failedArchives = sortedSetOf<String>()
         var failedMethods = 0
+        val failedMethodSources = sortedSetOf<String>()
         var inspectedInvocations = 0
         var recognizedInvocations = 0
         val notes = mutableListOf<String>()
         val paths = mutableListOf<AccessPathCoverage>()
+        val apiInvocations = mutableListOf<DatabaseApiInvocation>()
+        val methodReferenceIds = sortedSetOf<String>()
+        val ownerGaps = sortedMapOf<String, MutableSet<String>>()
+        val ownerGapReasons = sortedMapOf<String, MutableSet<String>>()
         val hql = sortedMapOf<String, String>()
+        val hqlPagination = sortedMapOf<String, QueryPagination>()
         val native = sortedMapOf<String, String>()
         val prefixes = packages.distinct().sorted().map { name ->
             require(name.matches(Regex("[A-Za-z_$][A-Za-z0-9_$]*(\\.[A-Za-z_$][A-Za-z0-9_$]*)*"))) { "Invalid repository package: $name" }
@@ -93,13 +101,26 @@ object RepositoryDiscovery {
             field.value?.takeIf { field.access and (Opcodes.ACC_STATIC or Opcodes.ACC_FINAL) == (Opcodes.ACC_STATIC or Opcodes.ACC_FINAL) }
                 ?.let { "${owner.name}.${field.name}:${field.desc}" to it }
         } }.toMap()
-        val metadata = MetadataInventory(nodes, loader, diagnostics)
+        val headers = RepositoryHeaders(nodes, classpath.map { Path.of(it) }, loader, IsolatedHibernateRuntime::sharedClass, failure = { source, reason, error ->
+            if (error != null) diagnostics.capture(source, reason, error)
+            else unresolved += UnresolvedQuery(source, reason)
+        })
+        val classifier = DatabaseApiClassifier(headers)
+        val domains = RepositoryDomains(headers)
+        val metadata = MetadataInventory(nodes, loader, diagnostics, headers)
         val namedQueries = metadata.namedQueries(entityClasses)
         val propertyQueries = metadata.namedQueryProperties()
         val xmlMappingsPresent = loader.getResources("META-INF/orm.xml").hasMoreElements()
         for (owner in nodes.values) {
             val className = owner.name.replace('/', '.')
-            val repository = isSpringRepository(owner, nodes, loader)
+            val hierarchy = headers.hierarchy(owner.name)
+            if (hierarchy.gaps.isNotEmpty()) {
+                ownerGaps.getOrPut(owner.name) { sortedSetOf() } += "$className#<hierarchy>"
+                ownerGapReasons.getOrPut(owner.name) { sortedSetOf() }.addAll(hierarchy.gaps)
+            }
+            val repository = hierarchy.nodes.values.any { node ->
+                node.name == "org/springframework/data/repository/Repository" || "org/springframework/data/repository/Repository" in node.interfaces
+            }
             for (method in owner.methods.sortedWith(compareBy({ it.name }, { it.desc }))) {
                 val methodName = method.name + method.desc
                 val annotations = method.visibleAnnotations.orEmpty() + method.invisibleAnnotations.orEmpty()
@@ -157,7 +178,9 @@ object RepositoryDiscovery {
                         reason = "Stored procedures, composed/unreadable query annotations, or conflicting query annotations require framework-specific resolution; derived-method inference cannot substitute for them")
                 } else if (repository && method.access and Opcodes.ACC_ABSTRACT != 0 && method.name !in setOf("<init>", "<clinit>")) {
                     val id = "$className#$methodName:derived"
-                    val entity = repositoryEntity(owner, nodes, loader)
+                    val entity = runCatching { domains.resolve(RepositoryType.ClassType(owner.name)).className
+                        ?.let { Class.forName(it.replace('/', '.'), false, loader) }?.takeIf { type -> type.annotations.any {
+                            it.annotationClass.java.name in setOf("jakarta.persistence.Entity", "javax.persistence.Entity") } } }.getOrNull()
                     val defaultName = entity?.let { "${it.simpleName}.${method.name}" }
                     val entityNamed = entity?.let { metadata.namedQueries(listOf(it.name)) }.orEmpty()
                     if (defaultName != null && defaultName in propertyQueries) {
@@ -207,24 +230,111 @@ object RepositoryDiscovery {
                         reason = "Base query extraction does not enumerate ${modifiers.joinToString()}; supply explicit finite variants or runtime observations (observations remain non-exhaustive)")
                 }
                 if (method.instructions.size() == 0) continue
+                // A direct API method reference hides its future invocation in a bootstrap handle.
+                // Inventory it as a located unexpanded access path, not as an ordinary executed call.
+                var methodReferenceLine: Int? = null
+                method.instructions.toArray().forEachIndexed { index, instruction ->
+                    if (instruction is LineNumberNode) methodReferenceLine = instruction.line
+                    if (instruction is InvokeDynamicInsnNode && instruction.bsm.owner == "java/lang/invoke/LambdaMetafactory") {
+                        instruction.bsmArgs.forEachIndexed handles@{ handleIndex, argument ->
+                            val handle = argument as? org.objectweb.asm.Handle ?: return@handles
+                            val opcode = when (handle.tag) {
+                                Opcodes.H_INVOKESTATIC -> Opcodes.INVOKESTATIC
+                                Opcodes.H_INVOKEVIRTUAL -> Opcodes.INVOKEVIRTUAL
+                                Opcodes.H_INVOKEINTERFACE -> Opcodes.INVOKEINTERFACE
+                                Opcodes.H_INVOKESPECIAL, Opcodes.H_NEWINVOKESPECIAL -> Opcodes.INVOKESPECIAL
+                                else -> return@handles
+                            }
+                            val id = "$className#$methodName:method-reference:$index:$handleIndex"
+                            val resolved = try { classifier.classify(MethodInsnNode(opcode, handle.owner, handle.name, handle.desc, handle.isInterface)) }
+                            catch (failure: Throwable) {
+                                val reason = diagnostics.capture(id, "Database API method reference could not be classified", failure)
+                                ApiResolution(null, listOf(reason))
+                            }
+                            if (resolved.call?.queryCapable == true || resolved.ancestryGaps.isNotEmpty()) {
+                                methodReferenceIds += id
+                                val reason = "Database API method reference ${handle.owner.replace('/', '.')}.${handle.name}${handle.desc} has no resolved invocation arguments or execution paths"
+                                record(id, null, "DATABASE_METHOD_REFERENCE", reason = reason, line = methodReferenceLine)
+                                ownerGaps.getOrPut(handle.owner) { sortedSetOf() } += id
+                                ownerGapReasons.getOrPut(handle.owner) { sortedSetOf() }.addAll(resolved.ancestryGaps + reason)
+                            }
+                        }
+                    }
+                }
+                val sites = InvocationSites.index(owner.name, method)
+                val calls = mutableMapOf<MethodInsnNode, DatabaseCall>()
+                fun classify(instruction: MethodInsnNode, receiver: ConstantValue? = null): DatabaseCall? {
+                    val id = sites.getValue(instruction).id
+                    val resolution = try { classifier.classifyReceivers(instruction, receiver?.referenceTypes) }
+                    catch (failure: Throwable) {
+                        val reason = diagnostics.capture(id, "Database API owner could not be classified", failure)
+                        ApiResolution(null, listOf(reason))
+                    }
+                    if (resolution.ancestryGaps.isNotEmpty()) {
+                        ownerGaps.getOrPut(instruction.owner) { sortedSetOf() } += id
+                        ownerGapReasons.getOrPut(instruction.owner) { sortedSetOf() }.addAll(resolution.ancestryGaps)
+                    }
+                    return resolution.call
+                }
+                sites.keys.sortedBy { sites.getValue(it).ordinal }.forEach { instruction -> classify(instruction)?.let { calls[instruction] = it } }
+                val linearControlFlow = method.tryCatchBlocks.isEmpty() && method.instructions.toArray().none {
+                    it is JumpInsnNode || it is LookupSwitchInsnNode || it is TableSwitchInsnNode }
+                val origins = QueryOrigins(sites, calls, linearControlFlow)
                 var analysisFailure: String? = null
-                val frames = try { Analyzer(ConstantInterpreter(constants)).analyze(owner.name, method) }
+                val frames = try { Analyzer(ConstantInterpreter(constants, owner.name, method, headers, classifier, origins, sites)).analyze(owner.name, method) }
                 catch (failure: Throwable) {
                     analysisFailure = diagnostics.capture("$className#$methodName:analysis", "Bytecode data flow could not be analyzed", failure)
                     failedMethods++
+                    failedMethodSources += "$className#$methodName:analysis"
                     null
                 }
-                var callIndex = 0
-                var sourceLine: Int? = null
-                val panacheModifiers = method.instructions.toArray().filterIsInstance<MethodInsnNode>()
-                    .any { mechanism(it, nodes) == "PANACHE_VARIANTS" }
+                fun receiver(frame: Frame<ConstantValue>?, instruction: MethodInsnNode): ConstantValue? {
+                    if (instruction.opcode == Opcodes.INVOKESTATIC) return null
+                    val count = Type.getArgumentTypes(instruction.desc).size
+                    return frame?.takeIf { it.stackSize > count }?.getStack(frame.stackSize - count - 1)
+                }
+                val neutralBindings = mutableSetOf<MethodInsnNode>()
                 method.instructions.toArray().forEachIndexed { index, instruction ->
-                    if (instruction is LineNumberNode) sourceLine = instruction.line
-                    if (instruction !is MethodInsnNode) return@forEachIndexed
+                    val frame = frames?.get(index) ?: return@forEachIndexed
+                    if (instruction is MethodInsnNode) {
+                        val value = receiver(frame, instruction)
+                        classify(instruction, value)?.let { calls[instruction] = it }
+                        val count = Type.getArgumentTypes(instruction.desc).size
+                        val values = (0 until count).mapNotNull { n -> frame.takeIf { it.stackSize >= count }?.getStack(frame.stackSize - count + n) }
+                        val neutral = calls[instruction]?.role == DatabaseApiRole.BINDING &&
+                            scalarBinding(instruction, values, calls[instruction]?.family)
+                        if (neutral) neutralBindings += instruction
+                        origins.observeCall(instruction, value?.origins, values.map { it.origins }, neutral,
+                            values.singleOrNull()?.constant as? Int)
+                    } else if (instruction is InvokeDynamicInsnNode) {
+                        val count = Type.getArgumentTypes(instruction.desc).size
+                        if (frame.stackSize >= count) (0 until count).forEach { position ->
+                            origins.escape(frame.getStack(frame.stackSize - count + position).origins,
+                                "$className#$methodName:dynamic-escape:$index",
+                                "Query is captured by an invokedynamic call whose alias effects are not tracked")
+                        }
+                    } else if (instruction.opcode in setOf(Opcodes.PUTFIELD, Opcodes.PUTSTATIC, Opcodes.AASTORE, Opcodes.ARETURN) && frame.stackSize > 0) {
+                        origins.escape(frame.getStack(frame.stackSize - 1).origins, "$className#$methodName:escape:$index",
+                            "Query leaves local analysis through a field assignment, array store or method return")
+                    }
+                }
+                // Factories publish first so a terminal may refer to any incoming finite origin, including loop back-edges.
+                val instructions = sites.keys.sortedWith(compareBy<MethodInsnNode>(
+                    { if (calls[it]?.role == DatabaseApiRole.FACTORY) 0 else 1 }, { sites.getValue(it).ordinal }))
+                for (instruction in instructions) {
                     inspectedInvocations++
-                    val mechanism = mechanism(instruction, nodes) ?: return@forEachIndexed
+                    val site = sites.getValue(instruction)
+                    val index = site.instructionIndex
+                    val sourceLine = site.line
+                    val id = site.id
+                    val call = calls[instruction] ?: continue
                     recognizedInvocations++
-                    val id = "$className#$methodName:${callIndex++}"
+                    val neutralBinding = instruction in neutralBindings
+                    apiInvocations += DatabaseApiInvocation(id, className, methodName, site.ordinal, sourceLine,
+                        instruction.owner.replace('/', '.'), instruction.name, instruction.desc, call.family, call.role,
+                        call.queryCapable && !neutralBinding, unresolvedReason = call.reason)
+                    if (call.role == DatabaseApiRole.LIFECYCLE_OR_METADATA || neutralBinding) continue
+                    val mechanism = call.translation ?: "${call.family}_${call.role}"
                     val arguments = Type.getArgumentTypes(instruction.desc)
                     val stringArgument = arguments.indexOfFirst { it.className == "java.lang.String" }
                     val frame = frames?.get(index)
@@ -233,9 +343,47 @@ object RepositoryDiscovery {
                         if (position >= 0) frame.getStack(position) else null
                     } else null
                     val queries = queryValue?.constants?.takeIf { it.all { value -> value is String } }?.map { it as String }?.sorted()
-                    val queryFailure = analysisFailure ?: queryValue?.unresolvedReason
+                    val receiverValue = receiver(frame, instruction)
+                    val effectFailure = origins.limitations(id).takeIf { it.isNotEmpty() }?.joinToString("; ") { "${it.siteId}: ${it.reason}" }
+                    val queryFailure = analysisFailure ?: call.reason ?: effectFailure ?: queryValue?.unresolvedReason
                     when (mechanism) {
-                        "JPA_HQL" -> recordVariants(id, queries, mechanism, reason = queryFailure, line = sourceLine)
+                        "PANACHE_TERMINAL", "QUERY_TERMINAL" -> {
+                            val producerQueries = paths.associate { it.id to if (it.status != AccessPathStatus.UNRESOLVED) it.queryIds else emptyList() }
+                            val linked = origins.terminal(receiverValue?.origins, producerQueries,
+                                if (mechanism == "PANACHE_TERMINAL") "PANACHE_QUERY" else "ORM_QUERY")
+                            if (queryFailure == null && linked.unresolved.isEmpty())
+                                paths += AccessPathCoverage(id, className, methodName, AccessPathStatus.STATIC,
+                                    linked.sourceQueryIds, mechanism = mechanism, line = sourceLine)
+                            else record(id, null, mechanism, reason = queryFailure ?: linked.unresolved.joinToString("; "), line = sourceLine)
+                        }
+                        "JPA_HQL" -> {
+                            recordVariants(id, queries, mechanism, reason = queryFailure, line = sourceLine)
+                            val position = paths.indexOfLast { it.id == id }
+                            val path = paths[position]
+                            val states = origins.paginationVariants(id)
+                            if (path.status == AccessPathStatus.STATIC && states.any { !it.isEmpty() }) {
+                                val variants = path.queryIds.flatMap { sourceId ->
+                                    val hqlText = hql.remove(sourceId) ?: error("Missing HQL source $sourceId")
+                                    states.map { state ->
+                                        val variantId = if (state.isEmpty()) sourceId else sourceId + state.suffix()
+                                        hql[variantId] = hqlText
+                                        if (!state.isEmpty()) hqlPagination[variantId] = state
+                                        variantId
+                                    }
+                                }.distinct().sorted()
+                                paths[position] = path.copy(queryIds = variants,
+                                    reason = "Enumerated ${states.size} fixed pagination states at local executions through Hibernate QueryOptions")
+                            }
+                        }
+                        "QUERY_PAGINATION" -> {
+                            val producerQueries = paths.associate { it.id to if (it.status != AccessPathStatus.UNRESOLVED) it.queryIds else emptyList() }
+                            val linked = origins.terminal(receiverValue?.origins, producerQueries, "ORM_QUERY")
+                            if (queryFailure == null && origins.supportsPagination(id) && linked.unresolved.isEmpty())
+                                paths += AccessPathCoverage(id, className, methodName, AccessPathStatus.STATIC,
+                                    linked.sourceQueryIds, mechanism = mechanism, line = sourceLine)
+                            else record(id, null, mechanism, reason = queryFailure ?: linked.unresolved.joinToString("; ")
+                                .ifBlank { "Pagination is outside the supported fixed local HQL model" }, line = sourceLine)
+                        }
                         "JPA_NAMED" -> if (queries != null && queries.all(String::isNotBlank) && queryFailure == null) {
                             paths += AccessPathCoverage(id, className, methodName, AccessPathStatus.DECLARED, queries, mechanism = mechanism, line = sourceLine)
                         } else record(id, null, mechanism, reason = queryFailure, line = sourceLine)
@@ -244,22 +392,27 @@ object RepositoryDiscovery {
                             val receiver = frame?.takeIf { it.stackSize > arguments.size }
                                 ?.let { it.getStack(it.stackSize - arguments.size - 1).constants }
                                 ?.takeIf { it.all { value -> value is PreparedSql } }?.map { it as PreparedSql }
-                            val sources = receiver?.map { sql -> native.entries.firstOrNull {
-                                it.key.startsWith("$className#$methodName:") && it.value == sql.sql
-                            }?.key }
-                            if (!sources.isNullOrEmpty() && sources.all { it != null }) paths += AccessPathCoverage(id, className, methodName, AccessPathStatus.STATIC,
-                                sources.filterNotNull().distinct().sorted(), mechanism = mechanism, line = sourceLine)
+                            val sources = receiver?.map { sql -> paths.firstOrNull { it.id == sql.originId }
+                                ?.queryIds.orEmpty().filter { native[it] == sql.sql } }
+                            if (!sources.isNullOrEmpty() && sources.all { it.isNotEmpty() }) paths += AccessPathCoverage(id, className, methodName, AccessPathStatus.STATIC,
+                                sources.flatten().distinct().sorted(), mechanism = mechanism, line = sourceLine)
                             else record(id, null, mechanism, reason = "Prepared statement execution has no locally established constant SQL source; declare its producer's complete SQL variants", line = sourceLine)
                         }
                         "PANACHE" -> {
                             val dynamicSort = arguments.any { it.className == "io.quarkus.panache.common.Sort" }
-                            if (dynamicSort || panacheModifiers) {
+                            if (dynamicSort || effectFailure != null || call.reason != null) {
                                 record(id, null, "PANACHE_VARIANTS", reason = if (dynamicSort)
                                     "Panache Sort arguments generate ordering/column dependencies that have not been enumerated; the unsorted base is not asserted as an executed query variant"
-                                else "This method applies Panache projection, paging, filtering or locking modifiers; the unmodified query is not asserted as an executed variant", line = sourceLine)
-                                return@forEachIndexed
+                                else call.reason ?: effectFailure ?: "Panache variants are unresolved", line = sourceLine)
+                                continue
                             }
-                            val entity = panacheEntity(owner, instruction.owner, nodes, loader)
+                            val entity = runCatching {
+                                val called = headers.read(instruction.owner).node
+                                val entityOwner = called?.takeIf { node -> (node.visibleAnnotations.orEmpty() + node.invisibleAnnotations.orEmpty())
+                                    .any { it.desc in setOf("Ljakarta/persistence/Entity;", "Ljavax/persistence/Entity;") } }?.name
+                                val domain = entityOwner ?: receiverValue?.referenceTypes?.singleOrNull()?.let { domains.resolve(it).className }
+                                domain?.let { Class.forName(it.replace('/', '.'), false, loader) }
+                            }.getOrElse { error -> diagnostics.capture(id, "Panache domain resolution failed", error); null }
                             val fixed = queries ?: listOf("").takeIf { arguments.isEmpty() && instruction.name in setOf("findAll", "listAll", "deleteAll", "count") }
                             val expanded = if (fixed == null) Result.failure(IllegalArgumentException("Panache query is not a compile-time constant"))
                                 else if (entity == null) Result.failure(IllegalArgumentException("Panache entity type cannot be resolved from the compiled repository/entity hierarchy"))
@@ -267,42 +420,29 @@ object RepositoryDiscovery {
                             recordVariants(id, expanded.getOrNull(), mechanism,
                                 reason = queryFailure ?: expanded.exceptionOrNull()?.let { diagnostics.capture(id, "Panache query expansion unavailable", it) }, line = sourceLine)
                         }
-                        else -> record(id, null, mechanism, reason = "$mechanism database-access call ${instruction.owner.replace('/', '.')}.${instruction.name} is not exhaustively translated; declare finite SQL/HQL variants or instrument runtime SQL", line = sourceLine)
+                        else -> record(id, null, mechanism, reason = queryFailure ?: "$mechanism database-access call ${instruction.owner.replace('/', '.')}.${instruction.name} is not exhaustively translated; declare finite SQL/HQL variants or instrument runtime SQL", line = sourceLine)
                     }
                 }
             }
         }
+        ownerGaps.forEach { (owner, ids) -> unresolved += UnresolvedQuery("repository-owner:${owner.replace('/', '.')}",
+            "Database API ancestry could not be established: " + ownerGapReasons[owner].orEmpty().joinToString("; "), affectedIds = ids.toList()) }
+        val pathsById = paths.associateBy { it.id }
+        val invocationIds = apiInvocations.map { it.id }.toSet()
         notes += "Repository scan inventory: ${nodes.size} readable classes, ${failedClasses.size} unreadable class sources, ${failedArchives.size} unreadable archives, $failedMethods methods with failed data flow; inspected $inspectedInvocations method-call instructions and recognized $recognizedInvocations database API call sites."
-        notes += "Recognized API calls are not a complete database-access denominator: unrecognized inherited owners, helper APIs, reflection, and unreadable bytecode remain outside this count; method percentages describe only discovered access paths."
+        notes += "API inventory includes inherited owners and known unsupported API methods; raw invocation, query-capable path and declaration counts remain distinct. Missing ancestors, reflection and unscanned bodies prevent whole-application completeness."
         return DiscoveredQueries(hql, native, (unresolved + diagnostics.unresolved()).distinct().sortedBy { it.id },
-            paths.map { it.copy(reason = diagnostics.resolve(it.reason)) }.sortedBy { it.id }, notes.distinct())
-    }
-
-    private fun mechanism(call: MethodInsnNode, nodes: Map<String, ClassNode>): String? {
-        val owner = call.owner
-        if (call.name == "createNamedQuery" && (owner.startsWith("jakarta/persistence/") || owner.startsWith("javax/persistence/") || owner.startsWith("org/hibernate/"))) return "JPA_NAMED"
-        if (call.name in setOf("createStoredProcedureQuery", "createNamedStoredProcedureQuery") &&
-            (owner.startsWith("jakarta/persistence/") || owner.startsWith("javax/persistence/"))) return "JPA_PROCEDURE"
-        if (call.name in setOf("createQuery", "createSelectionQuery", "createMutationQuery") &&
-            (owner.startsWith("jakarta/persistence/") || owner.startsWith("javax/persistence/") || owner.startsWith("org/hibernate/")))
-            return if (Type.getArgumentTypes(call.desc).firstOrNull()?.className == "java.lang.String") "JPA_HQL" else "CRITERIA"
-        if (call.name in setOf("createNativeQuery", "createSQLQuery") &&
-            (owner.startsWith("jakarta/persistence/") || owner.startsWith("javax/persistence/") || owner.startsWith("org/hibernate/"))) return "JPA_NATIVE"
-        if ((owner.startsWith("jakarta/persistence/") || owner.startsWith("javax/persistence/") || owner.startsWith("org/hibernate/")) &&
-            call.name in setOf("setFirstResult", "setMaxResults", "setLockMode", "setHint", "setEntityGraph", "applyGraph", "setFetchSize", "enableFilter", "setParameterList")) return "QUERY_VARIANTS"
-        if (owner == "java/sql/Connection" && call.name == "prepareCall") return "JDBC_PROCEDURE"
-        if (owner in setOf("java/sql/PreparedStatement", "java/sql/CallableStatement") && call.name.startsWith("execute")) return "JDBC_PREPARED_EXECUTION"
-        if ((owner == "java/sql/Connection" && call.name == "prepareStatement") ||
-            (owner.startsWith("java/sql/Statement") && call.name.startsWith("execute")) ||
-            (owner.startsWith("org/springframework/jdbc/core/") && call.name in setOf("query", "queryForList", "queryForObject", "queryForMap", "queryForRowSet", "queryForStream", "update", "batchUpdate", "execute"))) return "JDBC_SQL"
-        if ((owner.startsWith("io/quarkus/hibernate/orm/panache/") || hasPanacheHierarchy(nodes[owner], nodes)) &&
-            call.name in setOf("project", "page", "range", "filter", "withLock", "withHint", "withCountQuery", "enableFilter", "disableFilter")) return "PANACHE_VARIANTS"
-        if ((owner.startsWith("io/quarkus/hibernate/orm/panache/") || hasPanacheHierarchy(nodes[owner], nodes)) &&
-            call.name in setOf("find", "list", "stream", "count", "update", "delete", "findAll", "listAll", "deleteAll")) return "PANACHE"
-        if ((owner.startsWith("jakarta/persistence/criteria/") || owner.startsWith("javax/persistence/criteria/")) && call.name in setOf("createQuery", "createCriteriaUpdate", "createCriteriaDelete")) return "CRITERIA"
-        if (owner.startsWith("com/querydsl/") && call.name in setOf("fetch", "fetchOne", "fetchFirst", "fetchResults", "fetchCount", "execute", "iterate")) return "QUERYDSL"
-        if (owner.startsWith("org/jooq/") && (call.name.startsWith("fetch") || call.name in setOf("execute", "batch", "query", "resultQuery"))) return "JOOQ"
-        return null
+            paths.map { it.copy(reason = diagnostics.resolve(it.reason)) }.sortedBy { it.id }, notes.distinct(),
+            DatabaseApiInventory(invocations = apiInvocations.map { invocation -> invocation.copy(
+                accessPathIds = listOfNotNull(pathsById[invocation.id]?.id),
+                unresolvedReason = pathsById[invocation.id]?.takeIf { it.status == AccessPathStatus.UNRESOLVED }?.reason ?: invocation.unresolvedReason,
+            ) }.sortedBy { it.id }, selectedPackages = packages.distinct().sorted(), scannedClasses = nodes.keys.map { it.replace('/', '.') },
+                failedSources = (failedClasses + failedArchives + failedMethodSources).toList(), inspectedMethodInvocations = inspectedInvocations,
+                declarationAccessPathIds = paths.filter { it.id !in invocationIds && it.id !in methodReferenceIds }.map { it.id }.sorted(),
+                methodReferenceAccessPathIds = methodReferenceIds.toList(),
+                ownerGaps = ownerGaps.map { (owner, ids) -> DatabaseApiOwnerGap(owner.replace('/', '.'), ids.toList(), ownerGapReasons[owner].orEmpty().joinToString("; ")) },
+                completeWithinDeclaredScope = scannedRoots > 0 && unscopedJars == 0 && failedClasses.isEmpty() && failedArchives.isEmpty() && failedMethods == 0 && ownerGaps.isEmpty(),
+                limitations = listOf("Counts cover selected compiled bodies and known database API families; reflective/generated access and external unscanned bodies remain outside this inventory.")), hqlPagination)
     }
 
     private fun annotationValues(annotation: AnnotationNode): Map<String, Any?> = annotation.values.orEmpty().chunked(2).associate { it[0] as String to it[1] }
@@ -312,18 +452,9 @@ object RepositoryDiscovery {
 
     /** Read annotation and entity metadata from the effective application loader without initializing classes. */
     private class MetadataInventory(private val scanned: Map<String, ClassNode>, private val loader: ClassLoader,
-                                    private val diagnostics: ExtractionDiagnostics) {
-        private val external = mutableMapOf<String, ClassNode?>()
-        private fun node(name: String): ClassNode? = scanned[name] ?: external.getOrPut(name) {
-            try {
-                loader.getResourceAsStream("$name.class")?.use { input ->
-                    ClassNode().also { ClassReader(input).accept(it, ClassReader.SKIP_CODE or ClassReader.SKIP_DEBUG or ClassReader.SKIP_FRAMES) }
-                }
-            } catch (error: Throwable) {
-                diagnostics.capture("repository-header:${name.replace('/', '.')}", "Cannot inspect repository metadata header", error)
-                null
-            }
-        }
+                                    private val diagnostics: ExtractionDiagnostics, private val headers: RepositoryHeaders) {
+        private fun node(name: String): ClassNode? = headers.read(name).node
+
         fun annotationDefaults(descriptor: String): Map<String, Any?>? =
             node(descriptor.removePrefix("L").removeSuffix(";"))?.methods?.filter { it.annotationDefault != null }
                 ?.associate { it.name to it.annotationDefault }
@@ -369,37 +500,16 @@ object RepositoryDiscovery {
         }
     }
 
-    private fun isSpringRepository(node: ClassNode, nodes: Map<String, ClassNode>, loader: ClassLoader, seen: MutableSet<String> = mutableSetOf()): Boolean {
-        if (!seen.add(node.name)) return false
-        if (node.interfaces.any { it.startsWith("org/springframework/data/") && it.endsWith("Repository") }) return true
-        return node.interfaces.any { parent -> nodes[parent]?.let { isSpringRepository(it, nodes, loader, seen) } ?: runCatching {
-            Class.forName("org.springframework.data.repository.Repository", false, loader).isAssignableFrom(Class.forName(parent.replace('/', '.'), false, loader))
-        }.getOrDefault(false) }
-    }
-
-    private fun repositoryEntity(node: ClassNode, nodes: Map<String, ClassNode>, loader: ClassLoader): Class<*>? =
-        genericEntity(node, loader) ?: node.interfaces.firstNotNullOfOrNull { nodes[it]?.let { parent -> genericEntity(parent, loader) } }
-
-    /** Concrete first generic arguments only; type-variable substitution remains explicitly unresolved. */
-    private fun genericEntity(node: ClassNode, loader: ClassLoader): Class<*>? {
-        val signature = node.signature ?: return null
-        val names = Regex("<(?:\\+)?L([^;<]+);").findAll(signature).map { it.groupValues[1] }
-        return names.firstNotNullOfOrNull { name -> runCatching { Class.forName(name.replace('/', '.'), false, loader) }.getOrNull()
-            ?.takeIf { type -> type.annotations.any { it.annotationClass.java.name in setOf("jakarta.persistence.Entity", "javax.persistence.Entity") } } }
-    }
-
-    private fun hasPanacheHierarchy(node: ClassNode?, nodes: Map<String, ClassNode>, seen: MutableSet<String> = mutableSetOf()): Boolean {
-        if (node == null || !seen.add(node.name)) return false
-        return (node.interfaces + listOfNotNull(node.superName)).any {
-            it.startsWith("io/quarkus/hibernate/orm/panache/") || hasPanacheHierarchy(nodes[it], nodes, seen)
-        }
-    }
-
-    private fun panacheEntity(caller: ClassNode, calledOwner: String, nodes: Map<String, ClassNode>, loader: ClassLoader): Class<*>? {
-        val target = nodes[calledOwner]
-        if (target != null && (target.visibleAnnotations.orEmpty() + target.invisibleAnnotations.orEmpty()).any { it.desc == "Ljakarta/persistence/Entity;" })
-            return runCatching { Class.forName(target.name.replace('/', '.'), false, loader) }.getOrNull()
-        return genericEntity(caller, loader)
+    /** Only established scalar bindings preserve a fixed query shape; collection/type-specific overloads remain unresolved. */
+    private fun scalarBinding(call: MethodInsnNode, values: List<ConstantValue>, family: String?): Boolean {
+        val arguments = Type.getArgumentTypes(call.desc)
+        if (family == "JDBC" && call.name.startsWith("set") && arguments.size >= 2 && arguments.first().sort == Type.INT) return true
+        if (call.name != "setParameter" || values.size != 2 || Type.getArgumentTypes(call.desc).size != 2) return false
+        val value = values.last()
+        if (value.basic.type?.sort in setOf(Type.BOOLEAN, Type.BYTE, Type.CHAR, Type.SHORT, Type.INT, Type.LONG, Type.FLOAT, Type.DOUBLE)) return true
+        return value.referenceTypes?.takeIf { it.isNotEmpty() }?.all { it.name in setOf("java/lang/String", "java/lang/Boolean", "java/lang/Byte",
+            "java/lang/Character", "java/lang/Short", "java/lang/Integer", "java/lang/Long", "java/lang/Float", "java/lang/Double",
+            "java/math/BigDecimal", "java/math/BigInteger", "java/util/UUID") } == true
     }
 
     private fun expandPanache(method: String, entity: Class<*>, query: String, loader: ClassLoader): Result<String> = runCatching {
@@ -494,16 +604,33 @@ object RepositoryDiscovery {
     }
 }
 
-private data class ConstantValue(val basic: BasicValue, val constants: Set<Any>? = null, val unresolvedReason: String? = null) : Value {
+private data class ConstantValue(val basic: BasicValue, val constants: Set<Any>? = null, val unresolvedReason: String? = null,
+                                 val origins: Set<QueryOrigin>? = null,
+                                 val referenceTypes: Set<RepositoryType.ClassType>? = RepositoryDomains.descriptor(basic.type)) : Value {
     val constant: Any? get() = constants?.singleOrNull()
     override fun getSize() = basic.size
 }
 
-private data class PreparedSql(val sql: String)
+private data class PreparedSql(val sql: String, val originId: String)
 
-private class ConstantInterpreter(private val fields: Map<String, Any>) : Interpreter<ConstantValue>(Opcodes.ASM9) {
+private class ConstantInterpreter(private val fields: Map<String, Any>, private val owner: String, private val method: MethodNode,
+                                  private val headers: RepositoryHeaders, private val classifier: DatabaseApiClassifier,
+                                  private val origins: QueryOrigins, private val sites: Map<MethodInsnNode, InvocationSite>) : Interpreter<ConstantValue>(Opcodes.ASM9) {
     private val base = object : BasicInterpreter(Opcodes.ASM9) {}
-    override fun newValue(type: Type?) = base.newValue(type)?.let { ConstantValue(it) }
+    override fun newValue(type: Type?) = base.newValue(type)?.let { ConstantValue(it, referenceTypes = RepositoryDomains.descriptor(type)) }
+    override fun newParameterValue(isInstanceMethod: Boolean, local: Int, type: Type): ConstantValue {
+        if (isInstanceMethod && local == 0) return ConstantValue(requireNotNull(base.newValue(type)), referenceTypes = setOf(RepositoryType.ClassType(owner)))
+        val arguments = Type.getArgumentTypes(method.desc)
+        var position = if (isInstanceMethod) 1 else 0
+        val index = arguments.indices.firstOrNull { index -> val matches = position == local; position += arguments[index].size; matches }
+        val declared = index?.let { RepositoryDomains.parameterTypes(method.signature)?.getOrNull(it) }
+        val references = when (declared) { is RepositoryType.ClassType -> setOf(declared); null -> RepositoryDomains.descriptor(type); else -> null }
+        return ConstantValue(requireNotNull(base.newValue(type)), referenceTypes = references)
+    }
+    private fun fieldTypes(instruction: FieldInsnNode): Set<RepositoryType.ClassType>? {
+        val declaration = headers.fieldDeclaration(instruction.owner, instruction.name, instruction.desc)
+        return RepositoryDomains.fieldType(declaration?.signature, instruction.desc)
+    }
     override fun newOperation(instruction: AbstractInsnNode): ConstantValue {
         val constant: Any? = when (instruction) {
             is LdcInsnNode -> instruction.cst.takeIf { it is String || it is Number }
@@ -516,22 +643,49 @@ private class ConstantInterpreter(private val fields: Map<String, Any>) : Interp
                 else -> null
             }
         }
-        return ConstantValue(base.newOperation(instruction), constant?.let(::setOf))
+        val basic = base.newOperation(instruction)
+        val types = when (instruction) {
+            is FieldInsnNode -> fieldTypes(instruction)
+            is TypeInsnNode -> RepositoryDomains.descriptor(Type.getObjectType(instruction.desc))
+            is LdcInsnNode -> if (instruction.cst is String) setOf(RepositoryType.ClassType("java/lang/String")) else RepositoryDomains.descriptor(basic.type)
+            else -> RepositoryDomains.descriptor(basic.type)
+        }
+        return ConstantValue(basic, constant?.let(::setOf), referenceTypes = types)
     }
     override fun copyOperation(instruction: AbstractInsnNode, value: ConstantValue) = value
     override fun unaryOperation(instruction: AbstractInsnNode, value: ConstantValue) =
         base.unaryOperation(instruction, value.basic)?.let {
-            if (instruction.opcode == Opcodes.CHECKCAST) ConstantValue(it, value.constants, value.unresolvedReason) else ConstantValue(it)
+            when {
+                instruction.opcode == Opcodes.CHECKCAST -> ConstantValue(it, value.constants, value.unresolvedReason, value.origins,
+                    castTypes(value, (instruction as TypeInsnNode).desc))
+                instruction is FieldInsnNode && instruction.opcode == Opcodes.GETFIELD -> ConstantValue(it, referenceTypes = fieldTypes(instruction))
+                else -> ConstantValue(it)
+            }
         }
+    private fun castTypes(value: ConstantValue, target: String): Set<RepositoryType.ClassType>? {
+        val known = value.referenceTypes
+        return if (!known.isNullOrEmpty() && known.all { type -> headers.hierarchy(type.name).let { it.complete && target in it.nodes } }) known
+        else RepositoryDomains.descriptor(Type.getObjectType(target))
+    }
     override fun binaryOperation(instruction: AbstractInsnNode, left: ConstantValue, right: ConstantValue) =
         base.binaryOperation(instruction, left.basic, right.basic)?.let { ConstantValue(it) }
     override fun ternaryOperation(instruction: AbstractInsnNode, a: ConstantValue, b: ConstantValue, c: ConstantValue) =
         base.ternaryOperation(instruction, a.basic, b.basic, c.basic)?.let { ConstantValue(it) }
     override fun naryOperation(instruction: AbstractInsnNode, values: MutableList<out ConstantValue>): ConstantValue? {
         val basic = base.naryOperation(instruction, values.map { it.basic }) ?: return null
+        val called = (instruction as? MethodInsnNode)?.let { call -> classifier.classifyReceivers(call,
+            values.firstOrNull()?.takeIf { call.opcode != Opcodes.INVOKESTATIC }?.referenceTypes).call }
+        val produced = (instruction as? MethodInsnNode)?.let { origins.factory(it, called) }
+        val references = when (instruction) {
+            is MethodInsnNode -> RepositoryDomains.descriptor(Type.getReturnType(instruction.desc))
+            is InvokeDynamicInsnNode -> RepositoryDomains.descriptor(Type.getReturnType(instruction.desc))
+            else -> RepositoryDomains.descriptor(basic.type)
+        }
+        val queryOrigins = produced?.let(::setOf) ?: (instruction as? MethodInsnNode)
+            ?.takeIf { origins.returnsReceiver(it) }?.let { values.firstOrNull()?.origins }
         val evaluated: Evaluation = when {
-            instruction is MethodInsnNode && instruction.owner == "java/sql/Connection" && instruction.name == "prepareStatement" ->
-                evaluate(values.drop(1).take(1)) { (it.singleOrNull() as? String)?.let(::PreparedSql) }
+            instruction is MethodInsnNode && called?.translation == "JDBC_SQL" && instruction.name == "prepareStatement" ->
+                evaluate(values.drop(1).take(1)) { (it.singleOrNull() as? String)?.let { sql -> PreparedSql(sql, sites.getValue(instruction).id) } }
             instruction is InvokeDynamicInsnNode && instruction.bsm.owner == "java/lang/invoke/StringConcatFactory" ->
                 evaluate(values) { concatenate(instruction, it) }
             instruction is MethodInsnNode && instruction.owner == "java/lang/String" && instruction.name == "concat" && values.size == 2 ->
@@ -546,17 +700,18 @@ private class ConstantInterpreter(private val fields: Map<String, Any>) : Interp
                 normalizeKotlin(instruction, values)
             else -> Evaluation()
         }
-        return ConstantValue(basic, evaluated.constants, evaluated.reason)
+        return ConstantValue(basic, evaluated.constants, evaluated.reason, queryOrigins, references)
     }
     override fun returnOperation(instruction: AbstractInsnNode, value: ConstantValue, expected: ConstantValue) = base.returnOperation(instruction, value.basic, expected.basic)
     override fun merge(left: ConstantValue, right: ConstantValue): ConstantValue {
         if (left == right) return left
         val basic = base.merge(left.basic, right.basic)
-        if (left.constants == null || right.constants == null)
-            return ConstantValue(basic, unresolvedReason = listOfNotNull(left.unresolvedReason, right.unresolvedReason).sorted().firstOrNull())
-        val combined = left.constants + right.constants
-        return if (combined.size <= MAX_VARIANTS) ConstantValue(basic, combined)
-        else ConstantValue(basic, unresolvedReason = "Query string alternatives exceed the $MAX_VARIANTS-variant bytecode bound")
+        val constants = if (left.constants == null || right.constants == null) null else (left.constants + right.constants).takeIf { it.size <= MAX_VARIANTS }
+        val origins = if (left.origins == null || right.origins == null) null else (left.origins + right.origins).takeIf { it.size <= MAX_VARIANTS }
+        val types = if (left.referenceTypes == null || right.referenceTypes == null) null else (left.referenceTypes + right.referenceTypes).takeIf { it.size <= MAX_VARIANTS }
+        val exceeded = left.constants != null && right.constants != null && constants == null
+        return ConstantValue(basic, constants, if (exceeded) "Query string alternatives exceed the $MAX_VARIANTS-variant bytecode bound"
+            else listOfNotNull(left.unresolvedReason, right.unresolvedReason).sorted().firstOrNull(), origins, types)
     }
 
     private data class Evaluation(val constants: Set<Any>? = null, val reason: String? = null)

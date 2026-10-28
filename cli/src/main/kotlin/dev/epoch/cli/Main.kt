@@ -258,7 +258,8 @@ fun renderReport(report: CompatibilityReport, summaryOnly: Boolean = false, allD
     appendLine("Application: ${report.applicationVersion}")
     appendLine("Scope: ${report.scope}")
     if (!report.complete) appendLine("INCOMPLETE: ${report.incompleteReason ?: "Verification did not finish."}")
-    if (report.accessPaths.isNotEmpty()) appendLine(renderCoverage(report.accessPaths, details = allDetails,
+    if (report.accessPaths.isNotEmpty() || report.apiInventory != null) appendLine(renderCoverage(report.accessPaths, details = allDetails,
+        inventory = report.apiInventory,
         maxClasses = if (allDetails) Int.MAX_VALUE else 20))
     report.baseline?.let { baseline ->
         appendLine("Baseline health: ${baseline.verdict} (${baseline.findings.size} findings)")

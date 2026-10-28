@@ -72,7 +72,9 @@ internal object SqlDependencies {
                     }
                     if (!select.groupBy?.groupingSets.isNullOrEmpty()) complete = false
                     select.distinct?.onSelectItems.orEmpty().forEach { visitClause(it.expression, false) }
-                    if (select.limit != null || select.limitBy != null || select.offset != null || select.fetch != null ||
+                    // Literal counts and JDBC pagination binders cannot conceal relation/column
+                    // dependencies. Expression-bearing limits still require a separate model.
+                    if (!SqlPaginationDependencies.independent(select) || select.limitBy != null ||
                         !select.windowDefinitions.isNullOrEmpty() || select.qualify != null) complete = false
                     return result
                 }

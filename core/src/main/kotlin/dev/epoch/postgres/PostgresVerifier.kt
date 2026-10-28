@@ -377,7 +377,8 @@ class PostgresVerifier {
                 ) },
                 unresolvedQueries = item.unresolvedQueries.map { it.copy(id = prefix + it.id,
                     affectedIds = it.affectedIds.map { source -> prefix + source }) },
-                accessPaths = item.accessPaths.map { path -> path.copy(id = prefix + path.id,
+                apiInventory = item.apiInventory?.prefixed(prefix),
+                accessPaths = item.accessPaths.map { path -> path.copy(id = prefix + path.id, className = prefix + path.className,
                     queryIds = path.queryIds.map { query -> prefix + query },
                     reason = path.reason?.let { diagnosticReferences[it] ?: it }) },
             )
@@ -397,6 +398,7 @@ class PostgresVerifier {
             ),
             unresolvedQueries = prefixed.flatMap { it.unresolvedQueries },
             accessPaths = prefixed.flatMap { it.accessPaths },
+            apiInventory = DatabaseApiInventory.merge(prefixed.map { it.apiInventory }),
         )
     }
 

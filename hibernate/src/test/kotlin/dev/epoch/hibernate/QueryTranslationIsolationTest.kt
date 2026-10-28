@@ -50,12 +50,16 @@ class QueryTranslationIsolationTest {
                 repositoryPackages = listOf(QueryIsolationRepository::class.java.packageName),
                 keepGoing = true,
             ))
-            val failed = contract.accessPaths.single { it.method.startsWith("malformed(") }
-            val healthy = contract.accessPaths.single { it.method.startsWith("healthy(") }
+            val failedPaths = contract.accessPaths.filter { it.method.startsWith("malformed(") }
+            val healthyPaths = contract.accessPaths.filter { it.method.startsWith("healthy(") }
+            val failed = failedPaths.single { it.mechanism == "JPA_HQL" }
+            val healthy = healthyPaths.single { it.mechanism == "JPA_HQL" }
+            assertTrue(failedPaths.all { it.status == AccessPathStatus.UNRESOLVED }, failedPaths.toString())
+            assertTrue(healthyPaths.all { it.status == AccessPathStatus.STATIC && it.queryIds == healthy.queryIds }, healthyPaths.toString())
             assertEquals(AccessPathStatus.UNRESOLVED, failed.status, failed.toString())
             assertEquals(QueryIsolationRepository::class.java.name, failed.className)
             assertTrue(failed.line != null && failed.line!! > 0, failed.toString())
-            assertTrue(contract.unresolvedQueries.any { it.id == failed.id && it.reason.contains("labelThatDoesNotExist") },
+            assertTrue(contract.unresolvedQueries.any { (it.id == failed.id || failed.id in it.affectedIds) && it.reason.contains("labelThatDoesNotExist") },
                 contract.unresolvedQueries.toString())
             assertEquals(AccessPathStatus.STATIC, healthy.status, healthy.toString())
             assertTrue(healthy.queryIds.all { id -> contract.queries.any { it.id == id && it.dependenciesComplete } }, contract.toString())

@@ -73,7 +73,10 @@ class RepositoryFailureAggregationTest {
         assertTrue(paths.all { it.reason == "Extraction diagnostic ${shared.id}" }, paths.toString())
         assertTrue(shared.reason.contains("AnalyzerException"), shared.toString())
         assertTrue(result.notes.any { "recognized 3 database API call sites" in it }, result.notes.toString())
-        assertTrue(result.notes.any { "not a complete database-access denominator" in it }, result.notes.toString())
+        val inventory = assertNotNull(result.apiInventory)
+        assertFalse(inventory.completeWithinDeclaredScope, inventory.toString())
+        assertEquals(2, inventory.failedSources.size, inventory.toString())
+        assertEquals(3, inventory.invocations.size, inventory.toString())
     }
 
     private fun healthyClass(): ByteArray = ClassWriter(0).apply {

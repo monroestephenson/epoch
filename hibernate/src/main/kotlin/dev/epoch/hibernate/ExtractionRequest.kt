@@ -25,6 +25,8 @@ data class ExtractionRequest(
     val discoverRepositories: Boolean = true,
     /** JSONL files written by SqlCollector during application integration tests. */
     val runtimeSqlFiles: List<String> = emptyList(),
+    /** Fixed local JPA/Hibernate pagination, rendered by the supplied Hibernate runtime. */
+    val hqlQueryPagination: Map<String, QueryPagination> = emptyMap(),
 )
 
 data class EntityOverride(
@@ -34,3 +36,13 @@ data class EntityOverride(
     /** Remove this class from bootstrap; references from retained mappings remain errors/unresolved, never silently pruned. */
     val exclude: Boolean = false,
 )
+
+/** Values are compile-time constants at a supported local query execution; no SQL is appended by Epoch. */
+data class QueryPagination(val firstResult: Int? = null, val maxResults: Int? = null) {
+    init {
+        require(firstResult == null || firstResult >= 0) { "firstResult must be nonnegative" }
+        require(maxResults == null || maxResults >= 0) { "maxResults must be nonnegative" }
+    }
+    internal fun suffix(): String = ".pagination.offset${firstResult ?: "none"}.limit${maxResults ?: "none"}"
+    internal fun isEmpty() = firstResult == null && maxResults == null
+}

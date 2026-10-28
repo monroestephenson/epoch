@@ -35,17 +35,45 @@ internal fun renderAffectedIds(affectedIds: List<String>, allDetails: Boolean): 
 
 /** Percentages describe only the inventory's discovered methods, never all application access. */
 fun renderCoverage(contract: DatabaseContract, details: Boolean = false): String =
-    renderCoverage(contract.accessPaths, details = details, maxClasses = if (details) Int.MAX_VALUE else 20)
+    renderCoverage(contract.accessPaths, details = details, maxClasses = if (details) Int.MAX_VALUE else 20, inventory = contract.apiInventory)
 
-fun renderCoverage(accessPaths: List<AccessPathCoverage>, details: Boolean = true, maxClasses: Int = 20): String = buildString {
+fun renderCoverage(accessPaths: List<AccessPathCoverage>, details: Boolean = true, maxClasses: Int = 20,
+                   inventory: DatabaseApiInventory? = null): String = buildString {
+    if (inventory != null) {
+        appendLine("Compiled database API inventory (declared scan scope; known API families):")
+        appendLine("  ${inventory.inspectedMethodInvocations} method-call instructions inspected; ${inventory.invocations.size} database API invocations")
+        appendLine("  " + DatabaseApiRole.entries.joinToString(", ") { role -> "${role.name.lowercase()}=${inventory.invocations.count { it.role == role }}" })
+        val byId = accessPaths.associateBy { it.id }
+        val queryCalls = inventory.invocations.filter { it.queryCapable }
+        val covered = queryCalls.count { invocation -> invocation.accessPathIds.isNotEmpty() &&
+            invocation.accessPathIds.all { byId[it]?.status in setOf(AccessPathStatus.STATIC, AccessPathStatus.DECLARED) } }
+        appendLine("  Query-capable invocation paths: $covered/${queryCalls.size} statically extracted or linked; ${queryCalls.size - covered} unresolved")
+        appendLine("  Unexpanded database API method references: ${inventory.methodReferenceAccessPathIds.size} (separate potential access paths)")
+        appendLine("  Repository/annotation declarations: ${inventory.declarationAccessPathIds.size}; runtime observations are separate")
+        appendLine("  Inventory extent: ${if (inventory.completeWithinDeclaredScope) "complete within declared known-API scope" else "incomplete; unavailable bytecode, ancestry or unexpanded references mean the full denominator is unknown"}")
+        appendLine("  Unreadable sources=${inventory.failedSources.size}; unresolved owner groups=${inventory.ownerGaps.size}")
+        if (details) inventory.ownerGaps.forEach { gap -> appendLine("    ${gap.owner}: ${gap.reason}; affected=${gap.callSiteIds.joinToString()}") }
+    }
     appendLine("Repository coverage (discovered methods in the declared scan scope):")
-    if (accessPaths.isEmpty()) {
+    if (accessPaths.isEmpty() && inventory?.invocations.isNullOrEmpty()) {
         append("  No repository method inventory is available; entity SQL is not repository coverage.")
         return@buildString
     }
-    val classes = accessPaths.groupBy { it.className }.toSortedMap()
-    for ((className, paths) in classes.entries.take(maxClasses)) {
+    val discovered = accessPaths.groupBy { it.className }
+    val callsByClass = inventory?.invocations.orEmpty().groupBy { it.className }
+    val classes = (discovered.keys + callsByClass.keys).sorted()
+    for (className in classes.take(maxClasses)) {
+        val paths = discovered[className].orEmpty()
+        if (inventory != null) {
+            val calls = callsByClass[className].orEmpty()
+            val queryCalls = calls.filter { it.queryCapable }
+            val byId = paths.associateBy { it.id }
+            val covered = queryCalls.count { call -> call.accessPathIds.isNotEmpty() && call.accessPathIds.all {
+                byId[it]?.status in setOf(AccessPathStatus.STATIC, AccessPathStatus.DECLARED) } }
+            appendLine("  $className: ${calls.size} raw API invocations; $covered/${queryCalls.size} query-capable sites extracted or linked")
+        }
         val methods = paths.groupBy { it.method }
+        if (methods.isEmpty()) { appendLine("    No query-access paths in the inspected calls."); continue }
         val totals = methods.values.groupingBy { methodPaths ->
             when {
                 methodPaths.any { it.status == AccessPathStatus.UNRESOLVED } -> AccessPathStatus.UNRESOLVED

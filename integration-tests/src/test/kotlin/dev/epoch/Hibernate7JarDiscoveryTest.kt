@@ -58,14 +58,18 @@ class Hibernate7JarDiscoveryTest {
         assertFalse(contract.unresolvedQueries.any { it.reason.contains("Cannot inspect compiled class") },
             contract.unresolvedQueries.toString())
         for (method in listOf("byEmail", "legacyNote")) {
-            val path = contract.accessPaths.single { it.method.startsWith("$method(") }
+            val paths = contract.accessPaths.filter { it.method.startsWith("$method(") }
+            val path = paths.single { it.mechanism in setOf("JPA_HQL", "JPA_NATIVE") }
+            assertTrue(paths.all { it.status == AccessPathStatus.STATIC && it.queryIds == path.queryIds }, paths.toString())
             assertEquals(AccessPathStatus.STATIC, path.status, path.toString())
             assertTrue(requireNotNull(path.line) > 0)
             val query = contract.queries.single { it.id == path.queryIds.single() }
             assertTrue(query.dependenciesComplete, query.toString())
             assertEquals(listOf("public.jar_customers"), query.tables)
         }
-        val dynamic = contract.accessPaths.single { it.method.startsWith("dynamic(") }
+        val dynamicPaths = contract.accessPaths.filter { it.method.startsWith("dynamic(") }
+        val dynamic = dynamicPaths.single { it.mechanism == "JPA_NATIVE" }
+        assertTrue(dynamicPaths.all { it.status == AccessPathStatus.UNRESOLVED }, dynamicPaths.toString())
         assertEquals(AccessPathStatus.UNRESOLVED, dynamic.status)
         assertEquals("dev.epoch.jarfixture.repository.JarCustomerDao", dynamic.className)
         assertTrue(requireNotNull(dynamic.line) > 0)

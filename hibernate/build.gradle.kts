@@ -17,6 +17,7 @@ val hibernate70Runtime by configurations.creating
 val hibernate749Runtime by configurations.creating
 val applicationJacksonRuntime by configurations.creating
 val panacheRuntime by configurations.creating { isTransitive = false }
+val panache749Runtime by configurations.creating { isTransitive = false }
 // Compile application fixtures independently of main/test, whose Hibernate API is 6.6.
 val hibernate7Fixtures by sourceSets.creating
 // Actual independent application artifacts exercise normal multi-module runtime classpaths.
@@ -44,6 +45,12 @@ dependencies {
     applicationJacksonRuntime("com.fasterxml.jackson.datatype:jackson-datatype-jdk8:2.21.7")
     panacheRuntime("io.quarkus:quarkus-panache-hibernate-common:3.15.4")
     panacheRuntime("io.quarkus:quarkus-panache-common:3.15.4")
+    panacheRuntime("io.quarkus:quarkus-hibernate-orm-panache:3.15.4")
+    panache749Runtime("io.quarkus:quarkus-panache-hibernate-common:3.40.1")
+    panache749Runtime("io.quarkus:quarkus-panache-common:3.40.1")
+    panache749Runtime("io.quarkus:quarkus-hibernate-orm-panache:3.40.1")
+    // Referenced by the public PanacheJpaUtil method signatures in Quarkus 3.40.1.
+    panache749Runtime("jakarta.data:jakarta.data-api:1.0.1")
     add(hibernate7Fixtures.implementationConfigurationName, "org.hibernate.orm:hibernate-core:7.4.9.Final")
 }
 tasks.test {
@@ -53,6 +60,7 @@ tasks.test {
     systemProperty("epoch.hibernate749.classpath", hibernate749Runtime.asPath)
     systemProperty("epoch.application.jackson.classpath", applicationJacksonRuntime.asPath)
     systemProperty("epoch.panache.classpath", panacheRuntime.asPath)
+    systemProperty("epoch.panache749.classpath", panache749Runtime.asPath)
     systemProperty("epoch.hibernate7.fixture.classpath", hibernate7Fixtures.output.classesDirs.asPath)
     systemProperty("epoch.hibernate7.fixture.compile.classpath", hibernate7Fixtures.compileClasspath.asPath)
 }

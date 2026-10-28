@@ -29,7 +29,7 @@ The project targets Kotlin/JVM, Hibernate **6.6 and 7 (including 7.4.9)**, Flywa
 
 ## Check an old application release
 
-Build the **old** application's entity classes first. Supply those compiled classes and their mapping dependencies to an extraction descriptor. Classpath entries are directories or JARs, resolved relative to the descriptor file. Use `scanPackages` to discover entities in compiled artifacts instead of listing every class. Repository and DAO bytecode discovery is enabled by default. Set `repositoryPackages` to your application’s repository/DAO packages. The descriptor also supports Hibernate properties, entity overrides, and native-query parameter declarations or PostgreSQL inference. [Repository coverage](docs/repository-coverage.md) explains the method inventory and unresolved variants.
+Build the **old** application's entity classes first. Supply those compiled classes and their mapping dependencies to an extraction descriptor. Classpath entries are directories or JARs, resolved relative to the descriptor file. Use `scanPackages` to discover entities in compiled artifacts instead of listing every class. Repository and DAO bytecode discovery is enabled by default. Set `repositoryPackages` to your application’s repository/DAO packages. The descriptor also supports Hibernate properties, entity overrides, and native-query parameter declarations or PostgreSQL inference. [Repository coverage](docs/repository-coverage.md) explains inherited API owners, query origins and unresolved variants. The optional [API inventory](docs/repository-api-inventory.md) separates raw known-family calls from extracted query paths and makes missing-bytecode or ancestry gaps explicit.
 
 ```sh
 cli/build/install/db-compat/bin/db-compat extract \

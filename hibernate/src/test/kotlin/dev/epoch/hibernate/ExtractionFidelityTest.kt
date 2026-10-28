@@ -27,7 +27,11 @@ class ExtractionFidelityTest {
         // Hibernate uses MERGE for optional secondary-table updates; the supported SQL model records it unresolved.
         assertTrue(contract.queries.filterNot { it.sql.startsWith("merge ", ignoreCase = true) }.all { it.dependenciesComplete })
         assertFalse(contract.coverage.complete)
-        assertTrue(contract.unresolvedQueries.any { it.reason.contains("dependency") })
+        val merges = contract.queries.filter { it.sql.startsWith("merge ", ignoreCase = true) }
+        assertTrue(merges.isNotEmpty(), contract.toString())
+        assertTrue(merges.all { query -> !query.dependenciesComplete && contract.unresolvedQueries.any {
+            (it.id == query.id || query.id in it.affectedIds) && it.reason.isNotBlank()
+        } }, contract.toString())
     }
 
     @Test fun `identity and nonpooled sequence dependencies no longer make mappings unresolved`() {

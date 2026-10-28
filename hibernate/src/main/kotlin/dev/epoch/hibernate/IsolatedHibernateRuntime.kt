@@ -44,6 +44,13 @@ internal object IsolatedHibernateRuntime {
         }
     }
 
+    internal fun sharedClass(name: String): Boolean = name.startsWith("java.") || name.startsWith("javax.") || name.startsWith("jdk.") || name.startsWith("sun.") ||
+        name.startsWith("kotlin.") || name.startsWith("dev.epoch.core.") || name.startsWith("org.slf4j.") ||
+        // The adapter owns ASM as a complete family. An app may supply only asm-core;
+        // mixing its ClassVisitor with the parent's asm-tree ClassNode breaks every scan.
+        name.startsWith("org.objectweb.asm.") ||
+        name == ExtractionRequest::class.java.name || name == EntityOverride::class.java.name || name == QueryPagination::class.java.name
+
     private class ApplicationLoader(urls: Array<URL>, parent: ClassLoader) : URLClassLoader(urls, parent) {
         /** A provider must implement the same service API identity selected by loadClass. */
         override fun getResources(name: String): Enumeration<URL> =
@@ -61,12 +68,7 @@ internal object IsolatedHibernateRuntime {
 
         override fun loadClass(name: String, resolve: Boolean): Class<*> = synchronized(getClassLoadingLock(name)) {
             findLoadedClass(name)?.let { return@synchronized it }
-            val shared = name.startsWith("java.") || name.startsWith("javax.") || name.startsWith("jdk.") || name.startsWith("sun.") ||
-                name.startsWith("kotlin.") || name.startsWith("dev.epoch.core.") || name.startsWith("org.slf4j.") ||
-                // The adapter owns ASM as a complete family. An app may supply only asm-core;
-                // mixing its ClassVisitor with the parent's asm-tree ClassNode breaks every scan.
-                name.startsWith("org.objectweb.asm.") ||
-                name == ExtractionRequest::class.java.name || name == EntityOverride::class.java.name
+            val shared = sharedClass(name)
             val type = if (shared) super.loadClass(name, false) else try { findClass(name) }
                 catch (missing: ClassNotFoundException) {
                     // Never mix classes from bundled Hibernate/JPA into an incomplete application runtime.

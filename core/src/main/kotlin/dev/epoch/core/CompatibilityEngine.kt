@@ -824,6 +824,7 @@ class CompatibilityEngine {
             baseline = baseline,
             ruleSummary = summarizeFindings(baseline, deltas).sortedWith(compareBy({ severity(it.verdict) }, { it.ruleId })),
             accessPaths = contract.accessPaths,
+            apiInventory = contract.apiInventory,
         )
         return if (acceptedBaseline == null) report else BaselineAcceptance.apply(report, acceptedBaseline)
     }

@@ -53,7 +53,10 @@ class PanacheDiscoveryTest {
         val output = directory.resolve("$owner.class")
         Files.createDirectories(output.parent)
         Files.write(output, writer.toByteArray())
-        val result = RepositoryDiscovery.discover(listOf(directory.toString()), listOf("dev.epoch.panachefixture"), javaClass.classLoader)
+        val runtime = requireNotNull(System.getProperty("epoch.panache.classpath")).split(File.pathSeparator)
+        val result = URLClassLoader((runtime.map { Path.of(it).toUri().toURL() } + directory.toUri().toURL()).toTypedArray(), javaClass.classLoader).use { loader ->
+            RepositoryDiscovery.discover(runtime + directory.toString(), listOf("dev.epoch.panachefixture"), loader)
+        }
         assertTrue(result.hqlQueries.isEmpty(), result.toString())
         for (name in listOf("sorted", "project", "page", "withLock")) {
             val paths = result.accessPaths.filter { it.method.startsWith("$name(") }
@@ -81,9 +84,9 @@ class PanacheDiscoveryTest {
             method.visitInsn(Opcodes.ICONST_0)
             method.visitLdcInsn("example@example.test")
             method.visitInsn(Opcodes.AASTORE)
-            val returns = if (name == "list") "Ljava/util/List;" else "J"
+            val returns = when (name) { "list" -> "Ljava/util/List;"; "update" -> "I"; else -> "J" }
             method.visitMethodInsn(Opcodes.INVOKEINTERFACE, framework, name, "(Ljava/lang/String;[Ljava/lang/Object;)$returns", true)
-            method.visitInsn(if (name == "list") Opcodes.POP else Opcodes.POP2)
+            method.visitInsn(if (returns == "J") Opcodes.POP2 else Opcodes.POP)
             method.visitInsn(Opcodes.RETURN)
             method.visitMaxs(0, 0)
             method.visitEnd()
@@ -100,10 +103,20 @@ class PanacheDiscoveryTest {
         val output = directory.resolve("$owner.class")
         Files.createDirectories(output.parent)
         Files.write(output, writer.toByteArray())
+        // The helper really exists and has no persistence ancestry; a missing owner
+        // cannot establish that an otherwise unrecognized API call is unrelated.
+        val helper = ClassWriter(ClassWriter.COMPUTE_MAXS).apply {
+            visit(Opcodes.V21, Opcodes.ACC_PUBLIC, "dev/epoch/panachefixture/UnrelatedHelper", null, "java/lang/Object", null)
+            visitMethod(Opcodes.ACC_PUBLIC or Opcodes.ACC_STATIC, "list", "(Ljava/lang/String;)Ljava/util/List;", null, null).apply {
+                visitCode(); visitInsn(Opcodes.ACONST_NULL); visitInsn(Opcodes.ARETURN); visitMaxs(0, 0); visitEnd()
+            }
+            visitEnd()
+        }
+        Files.write(output.parent.resolve("UnrelatedHelper.class"), helper.toByteArray())
         val frameworkClasspath = requireNotNull(System.getProperty("epoch.panache.classpath")) { "Panache helper test runtime must be configured" }
         val urls = frameworkClasspath.split(File.pathSeparator).map { Path.of(it).toUri().toURL() }.toTypedArray()
         URLClassLoader(urls, javaClass.classLoader).use { loader ->
-            val result = RepositoryDiscovery.discover(listOf(directory.toString()), listOf("dev.epoch.panachefixture"), loader)
+            val result = RepositoryDiscovery.discover(frameworkClasspath.split(File.pathSeparator) + directory.toString(), listOf("dev.epoch.panachefixture"), loader)
             assertTrue(result.unresolved.isEmpty(), result.toString())
             assertEquals(4, result.hqlQueries.size, result.toString())
             assertTrue(result.hqlQueries.values.all { it.contains("RepositoryCustomer") && it.contains("email = ?1") }, result.toString())

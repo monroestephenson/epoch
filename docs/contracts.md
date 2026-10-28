@@ -51,6 +51,7 @@ Replace the illustrative classes and paths with your application's artifacts. Cl
 | `nativeQueries` | Stable query ID to fixed native SQL. Supported explicit-column templates retain complete physical dependencies; unsupported forms remain incomplete. |
 | `nativeQueryParameterTypes` | Query ID or registered named-native-query name to ordered PostgreSQL/JDBC parameter type names. |
 | `finiteHqlVariants` | Source ID to a finite list of fixed HQL alternatives. Exhaustiveness is the caller's assertion. |
+| `hqlQueryPagination` | Fixed HQL entry ID to `{firstResult, maxResults}` with optional nonnegative integer constants. `maxResults=0` is recorded unresolved because Hibernate can skip SQL execution. Applied through the supplied Hibernate query/SQL translator; no LIMIT/OFFSET text is appended by Epoch. Explicit declarations do not establish exhaustive application pagination variants. |
 | `unresolvedDynamicQueries` | Source ID to the reason its query variants cannot be enumerated. |
 | `keepGoing` | Isolate failed entities and recover supported associations within mapping graphs; record every omission as unresolved; defaults to `false`. The CLI's `--keep-going` enables it too. |
 
@@ -161,6 +162,8 @@ Run application integration tests with `-Depoch.sql.capture=/tmp/epoch-observed.
 ## Report and accepted-baseline schemas
 
 A report also preserves `accessPaths` and provides per-method discovery counts. A report contains `schemaVersion`, `applicationVersion`, `scope`, `verdict`, `baseline`, ordered `migrations`, `ruleSummary`, and `limitations`. `baseline` contains health `verdict`, `findings`, a deterministic `fingerprint`, and optional `cacheStatus`/`cacheKey`. Baseline findings have `migration: null`; they appear once and are not attributed to pending migrations. With no pending migrations, `migrations` is empty and the overall verdict reflects baseline health.
+
+Contracts and reports may also contain `apiInventory` (inventory schema version 1). It records raw known-family invocations and roles, query-capable path links, declaration IDs, separate unresolved method-reference paths, selected packages/classes, failed sources and unresolved owner groups. `completeWithinDeclaredScope` describes inventory extent only; unreadable code, failed data flow or unresolved ancestry cannot be counted as zero calls or complete coverage. Legacy contracts without this field retain discovered-method reporting. See [the inventory guide](repository-api-inventory.md) for denominators and the call-site ID migration.
 
 Each migration contains its version/filename, delta verdict, and findings. Each finding has `ruleId`, `objectName`, `message`, `evidence`, `affectedContractIds`, optional migration attribution, and optional mitigation. `ruleSummary` groups counts by rule and verdict: `baselineCount`, `migrationCount`, and `acceptedBaselineCount`.
 

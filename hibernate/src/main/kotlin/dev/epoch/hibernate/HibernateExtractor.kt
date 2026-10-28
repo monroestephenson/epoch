@@ -55,7 +55,8 @@ class HibernateExtractor {
             val discovery = if (request.discoverRepositories) RepositoryDiscovery.discover(request.classpath,
                 request.repositoryPackages.ifEmpty { request.scanPackages }, loader, classes.map { it.name }) else null
             val discoveredRequest = request.copy(hqlQueries = discovery?.hqlQueries.orEmpty() + request.hqlQueries,
-                nativeQueries = discovery?.nativeQueries.orEmpty() + request.nativeQueries)
+                nativeQueries = discovery?.nativeQueries.orEmpty() + request.nativeQueries,
+                hqlQueryPagination = discovery?.hqlQueryPagination.orEmpty().filterKeys { it !in request.hqlQueries } + request.hqlQueryPagination)
             val result = try { bootstrap(classes, discoveredRequest) }
             catch (error: Throwable) {
                 BootstrapRecovery.rethrowFatal(error)
@@ -134,7 +135,9 @@ class HibernateExtractor {
             return result.copy(unresolvedQueries = allUnresolved, queries = (result.queries.map { query ->
                 query.copy(accessPathIds = links[query.id].orEmpty().distinct().sorted())
             } + observedQueries).sortedBy { it.id }, accessPaths = (linkedPaths + runtimePaths).sortedBy { it.id },
-                coverage = result.coverage.copy(complete = result.coverage.complete && allUnresolved.isEmpty() && observations.isEmpty(), notes = notes))
+                apiInventory = discovery?.apiInventory,
+                coverage = result.coverage.copy(complete = result.coverage.complete && allUnresolved.isEmpty() && observations.isEmpty() &&
+                    discovery?.apiInventory?.completeWithinDeclaredScope != false, notes = notes))
         } finally {
             Thread.currentThread().contextClassLoader = previousLoader
             loader.close()
@@ -513,9 +516,19 @@ class HibernateExtractor {
             fun hql(id: String, text: String, source: QuerySource, variant: String? = null) {
                 QueryExtraction.record(id, "Hibernate fixed HQL translation failed", queries, unresolved, diagnostics) {
                     val q = session.createQuery(text)
+                    val pagination = request.hqlQueryPagination[id]
+                    require(pagination?.maxResults != 0) {
+                        "maxResults=0 can skip SQL execution in Hibernate; no executable SQL template is asserted for this pagination state"
+                    }
+                    pagination?.firstResult?.let { value -> q.javaClass.getMethod("setFirstResult", Int::class.javaPrimitiveType).invoke(q, value) }
+                    pagination?.maxResults?.let { value -> q.javaClass.getMethod("setMaxResults", Int::class.javaPrimitiveType).invoke(q, value) }
                     // QuerySqmImpl was renamed in 7; bridge the stable runtime accessors without binding to its implementation class.
                     fun property(name: String): Any = q.javaClass.getMethod(name).invoke(q)
                     val sqm = property("getSqmStatement")
+                    if (pagination != null) {
+                        require(sqm is SqmSelectStatement<*>) { "Pagination on mutation HQL has no supported SQL execution" }
+                        require(!sqm.containsCollectionFetches()) { "Pagination with a collection fetch can execute in memory; its runtime SQL variant is not established" }
+                    }
                     val options = property("getQueryOptions") as org.hibernate.query.spi.QueryOptions
                     val parameters = property("getParameterBindings") as org.hibernate.query.spi.QueryParameterBindings
                     val xref = property("getDomainParameterXref") as org.hibernate.query.sqm.internal.DomainParameterXref
@@ -539,7 +552,7 @@ class HibernateExtractor {
                     val query = QueryContract(id, SqlOperationClassifier.operation(jdbc.sqlString), jdbc.sqlString,
                         tables = deps.tables, columns = deps.columns, writeColumns = deps.writes,
                         parameterTypes = parameterTypes(jdbc.parameterBinders), source = source,
-                        dependenciesComplete = complete, variant = variant, targetTable = deps.target)
+                        dependenciesComplete = complete, variant = pagination?.let { "firstResult=${it.firstResult};maxResults=${it.maxResults}" } ?: variant, targetTable = deps.target)
                     val limitations = mutableListOf<UnresolvedQuery>()
                     if (!complete) limitations += UnresolvedQuery(id, deps.failureReason ?:
                         astDependencies.limitations.takeIf { it.isNotEmpty() }?.joinToString("; ") ?:
@@ -582,7 +595,7 @@ class HibernateExtractor {
             queries = queries.sortedBy { it.id }, coverage = Coverage(complete = allUnresolved.isEmpty(),
                 mechanisms = listOf("Hibernate ${org.hibernate.Version.getVersionString()} runtime mapping metamodel", "Hibernate static mutation plans", "Hibernate single-id loader SQL", "Hibernate SQM/SQL AST translation"),
                 notes = listOf("Scoped to extracted entity operations, supplied query definitions, and inventoried access paths; unsupported or unenumerated paths are unresolved. This does not prove whole-application behavior.",
-                    "Generated SQL covers the default single-id loader and static entity mutations only; entity graphs, alternate lock modes, batch loaders, pagination, and repository CRUD query variants are not enumerated.",
+                    "Generated SQL covers the default single-id loader and static entity mutations only; entity graphs, alternate lock modes, batch loaders and undeclared repository CRUD variants are not enumerated. Literal local HQL pagination is rendered through Hibernate; dynamic/branch-dependent, named/native and Panache pagination remain unresolved.",
                     "Finite variants are user-declared exhaustive sets, not inferred application coverage.",
                     "Identity/serial and non-pooled physical sequence dependencies are checked; pooled/custom allocation, dynamic mutations, filters, custom SQL, formulas and native semantics remain unsupported when present.") + scopeNotes),
             unresolvedQueries = allUnresolved)

@@ -79,8 +79,6 @@ class NativeDependenciesTest {
             for (sql in listOf("select a.id from public.accounts a natural join public.badges b",
                 "select a.id from public.accounts a join public.badges b using (id)",
                 "select id from public.accounts limit (select n from public.settings)",
-                "select id from public.accounts limit 10 offset 2",
-                "select id from public.accounts fetch first 10 rows only",
                 "select sum(id) over w from public.accounts window w as (order by legacy)",
                 "select sum(id) over (order by legacy) from public.accounts")) {
                 assertFalse(SqlDependencies.inspect(sql, nativeSql = native).complete, sql)
