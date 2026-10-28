@@ -54,6 +54,10 @@ data class ColumnContract(
     val enumValues: List<String> = emptyList(),
     val logicalJavaType: String? = null,
     val inputDomainComplete: Boolean = true,
+    /** Logical mapped member's declared type; null means unavailable, ambiguous, or unsupported. */
+    val declaredNonNull: Boolean? = null,
+    /** Raw Hibernate selectable nullability, independent of Kotlin/Java declaration facts. */
+    val hibernateNullable: Boolean? = null,
 )
 
 data class ColumnReference(val table: String, val column: String)

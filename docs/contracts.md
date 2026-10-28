@@ -84,6 +84,16 @@ The JSON model is defined by [`Model.kt`](../core/src/main/kotlin/dev/epoch/core
 
 Entity entries contain a unique `id`, a schema-qualified `table`, `columns`, and an operation set. A column records its physical `name`, optional `typeName` and `nullable`, and `insertable`, `updatable`, and `generated` flags. Columns also retain Hibernate's `length`, `precision`, `scale`, finite relational `enumValues`, `logicalJavaType`, and `inputDomainComplete` when available. DDL bounds alone are not proof of a logical input domain: a VARCHAR-backed UUID is not an arbitrary string. Custom converters/JDBC types or unknown logical domains set `inputDomainComplete=false`; rules requiring those domains remain `UNKNOWN`. This does not invalidate an otherwise complete, unchanged structural SQL contract. Primitive properties do not claim nullable application inputs. `generatedIdentifier` records the strategy; `identifierSequence` and `identifierAllocationSize` retain actual sequence dependencies. Identity/serial generation and physical sequences with allocationSize 1 are checked against PostgreSQL. Pooled and custom identifier allocation remain unresolved; a preassigned sequence value remains an explicit INSERT column.
 
+Nullability has distinct sources:
+
+| Column field | Evidence |
+| --- | --- |
+| `declaredNonNull` | `true` for an established non-null Java/Kotlin member, `false` for an explicitly nullable member, and `null` when unknown. Kotlin metadata is matched by JVM signature to Hibernate's actual field/getter; Java declaration annotations are read from bytecode, including CLASS retention. |
+| `hibernateNullable` | Hibernate's raw physical selectable nullability, independently of the source language. |
+| `nullable` | The retained legacy mapping flag, including its primitive-property adjustment. Existing contracts may omit the newer facts. |
+
+For example, Kotlin `var x: String` can have `declaredNonNull=true` and `hibernateNullable=true`, while `var y: String?` can have `declaredNonNull=false` even if `@Column(nullable=false)` makes `hibernateNullable=false`. Unannotated Java references, ambiguous metadata, and unresolved generic types do not imply nullable inputs. Declared facts attach to supported basic attributes and basic identifiers; the nullability of an association, component, or collection object does not establish each underlying JDBC column's nullability. A declared member fact also does not prove an arbitrary converter's SQL output. Missing nullability evidence does not by itself invalidate complete SQL extraction.
+
 Query entries record:
 
 - `id`, `operation`, and `sql` with JDBC `?` placeholders rather than captured parameter values.

@@ -6,6 +6,7 @@ dependencies {
     implementation("io.smallrye:jandex:3.2.0")
     implementation("org.ow2.asm:asm-tree:9.7.1")
     implementation("org.ow2.asm:asm-analysis:9.7.1")
+    implementation("org.jetbrains.kotlin:kotlin-metadata-jvm:2.1.21")
     testImplementation("org.springframework.data:spring-data-jpa:3.4.5")
 }
 

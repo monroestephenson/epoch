@@ -9,6 +9,8 @@ import org.hibernate.engine.spi.SessionFactoryImplementor
 import org.hibernate.loader.ast.internal.SingleIdEntityLoaderStandardImpl
 import org.hibernate.metamodel.mapping.SelectableMapping
 import org.hibernate.metamodel.mapping.SelectableMappings
+import org.hibernate.metamodel.mapping.AttributeMapping
+import org.hibernate.metamodel.mapping.BasicValuedModelPart
 import org.hibernate.persister.entity.AbstractEntityPersister
 import org.hibernate.query.sqm.tree.select.SqmSelectStatement
 import org.hibernate.query.sql.internal.ParameterParser
@@ -244,7 +246,21 @@ class HibernateExtractor {
                 }
             }
             val primitiveColumns = mutableSetOf<Pair<String, String>>()
+            val declaredNullability = mutableMapOf<Pair<String, String>, MutableSet<Boolean?>>()
+            fun recordDeclaration(attribute: AttributeMapping) {
+                // A component/container/association declaration does not describe every JDBC leaf.
+                val value = if (attribute is BasicValuedModelPart)
+                    DeclaredNullability.of(attribute.propertyAccess?.getter?.member) else null
+                attribute.forEachSelectable { _, selectable ->
+                    if (!selectable.isFormula) {
+                        val key = qualified(p.physicalTableNameForMutation(selectable)) to identifier(selectable.selectionExpression)
+                        declaredNullability.getOrPut(key) { linkedSetOf() } += value
+                    }
+                }
+            }
+            (p.identifierMapping as? AttributeMapping)?.let(::recordDeclaration)
             p.visitAttributeMappings { attribute ->
+                recordDeclaration(attribute)
                 if (attribute.propertyAccess?.getter?.returnTypeClass?.isPrimitive == true) attribute.forEachSelectable { _, selectable ->
                     if (!selectable.isFormula) primitiveColumns += qualified(p.physicalTableNameForMutation(selectable)) to identifier(selectable.selectionExpression)
                 }
@@ -281,6 +297,8 @@ class HibernateExtractor {
                         enumValues = enumValues(s.jdbcMapping),
                         logicalJavaType = logicalType(s.jdbcMapping).name,
                         inputDomainComplete = inputDomainComplete(s.jdbcMapping),
+                        declaredNonNull = declaredNullability[key]?.singleOrNull(),
+                        hibernateNullable = s.isNullable,
                     ) }.sortedBy { it.name },
                     operations = operations,
                     generatedIdentifier = generatedId,
@@ -489,7 +507,8 @@ class HibernateExtractor {
             entities += EntityContract("$role@collection", table, selectables.map { (name, s) ->
                 ColumnContract(name, jdbcName(s.jdbcMapping), s.isNullable, s.isInsertable, s.isUpdateable,
                     length = s.length, precision = s.precision, scale = s.scale, enumValues = enumValues(s.jdbcMapping),
-                    logicalJavaType = logicalType(s.jdbcMapping).name, inputDomainComplete = inputDomainComplete(s.jdbcMapping))
+                    logicalJavaType = logicalType(s.jdbcMapping).name, inputDomainComplete = inputDomainComplete(s.jdbcMapping),
+                    hibernateNullable = s.isNullable)
             }.sortedBy { it.name }, collectionQueries.map { it.operation }.toSet().ifEmpty { setOf(Operation.SELECT) })
         }
     }
